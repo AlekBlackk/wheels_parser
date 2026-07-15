@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""WheelsParser: monitor public Telegram channels for BetBoom freestream links."""
+
+from __future__ import annotations
+
+import html
+import json
+import logging
+import os
+import random
+import re
+import signal
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    from colorama import Fore, Style, just_fix_windows_console
+
+    just_fix_windows_console()
+    HAS_COLOR = True
+except ImportError:
+    HAS_COLOR = False
+
+try:
+    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+CHANNELS_FILE = BASE_DIR / "channels.txt"
+OUTPUT_FILE = BASE_DIR / "freebets.json"
+SEEN_FILE = BASE_DIR / "seen_ids.json"
+LOG_FILE = BASE_DIR / "parser.log"
+LOCK_FILE = BASE_DIR / "wheelsparser.lock"
+
+DEFAULT_CHANNELS = [
+    "amam0610", "aunkereEZ", "risenhaha", "zaykapoehali", "AdamStaya",
+    "mugretnug", "mugretnugbet", "PAPAdota2", "NeretCast", "YBNFedor",
+    "hoochcs2", "solo322berezin", "KRATtv", "dayneZz", "jestercast",
+    "obshakstaya", "meowbettt", "mechanogun", "Vophets", "GShikaryan",
+    "acoolbazarit",
+]
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_channels() -> list[str]:
+    raw = os.getenv("WHEELSPARSER_CHANNELS", "")
+    if raw.strip():
+        channels = [item.strip().lstrip("@") for item in raw.split(",") if item.strip()]
+        return list(dict.fromkeys(channels))
+
+    if CHANNELS_FILE.exists():
+        channels = []
+        for line in CHANNELS_FILE.read_text(encoding="utf-8").splitlines():
+            value = line.split("#", 1)[0].strip().lstrip("@")
+            if value:
+                channels.append(value)
+        if channels:
+            return list(dict.fromkeys(channels))
+
+    return DEFAULT_CHANNELS.copy()
+
+
+CHANNELS = load_channels()
+CHANNELS_LOCK = threading.RLock()
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
+MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
+MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
+WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
+ALERT_ON_FIRST_RUN = env_bool("ALERT_ON_FIRST_RUN", False)
+USE_COLORS = env_bool("USE_COLORS", True)
+USE_ICONS = env_bool("USE_ICONS", True)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BOT_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+
+FREESTREAM_RE = re.compile(
+    r"https?://(?:www\.)?betboom\.ru/freestream/[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-]+",
+    re.IGNORECASE,
+)
+TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+
+ICONS = {
+    "start": "\U0001f3a1",
+    "ok": "\u2705",
+    "warn": "\u26a0\ufe0f",
+    "link": "\U0001f381",
+    "stop": "\U0001f6d1",
+    "bell": "\U0001f514",
+}
+ASCII_ICONS = {
+    "start": "[*]",
+    "ok": "[OK]",
+    "warn": "[!]",
+    "link": "[NEW]",
+    "stop": "[x]",
+    "bell": "[i]",
+}
+
+
+def icon(name: str) -> str:
+    return (ICONS if USE_ICONS else ASCII_ICONS)[name]
+
+
+class RedactTokenFilter(logging.Filter):
+    """Маскирует токен бота в сообщениях лога.
+
+    Ошибки requests содержат полный URL вида
+    https://api.telegram.org/bot<TOKEN>/... — без фильтра токен
+    попадает в parser.log (например, при 409 Conflict).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if TELEGRAM_BOT_TOKEN:
+            message = record.getMessage()
+            if TELEGRAM_BOT_TOKEN in message:
+                record.msg = message.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+                record.args = None
+        return True
+
+
+class ConsoleFormatter(logging.Formatter):
+    """Цвета для консоли: предупреждения жёлтые, ошибки красные, новые ссылки зелёные."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if not (HAS_COLOR and USE_COLORS):
+            return message
+        if getattr(record, "highlight", False):
+            return f"{Style.BRIGHT}{Fore.GREEN}{message}{Style.RESET_ALL}"
+        if record.levelno >= logging.ERROR:
+            return f"{Style.BRIGHT}{Fore.RED}{message}{Style.RESET_ALL}"
+        if record.levelno == logging.WARNING:
+            return f"{Fore.YELLOW}{message}{Style.RESET_ALL}"
+        return message
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("wheelsparser")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console = logging.StreamHandler()
+    console.setFormatter(
+        ConsoleFormatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    )
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addFilter(RedactTokenFilter())
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    return logger
+
+
+log = setup_logging()
+
+
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+SESSION = build_session()  # только main-поток: парсинг и уведомления
+BOT_SESSION = build_session()  # только поток бота: getUpdates, ответы, /active
+STOP_EVENT = threading.Event()  # потокобезопасный флаг остановки
+
+
+def request_stop(_signum: int, _frame: Any) -> None:
+    STOP_EVENT.set()
+    log.info("Получен сигнал остановки; завершаю текущий цикл")
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        log.warning("Не удалось прочитать %s: %s", path.name, error)
+        return default
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def load_seen() -> tuple[dict[str, set[str]], bool]:
+    existed = SEEN_FILE.exists()
+    raw = read_json(SEEN_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    seen = {
+        channel: set(value if isinstance(value, list) else [])
+        for channel, value in raw.items()
+    }
+    with CHANNELS_LOCK:
+        for channel in CHANNELS:
+            seen.setdefault(channel, set())
+    has_state = existed and any(seen.values())
+    return seen, has_state
+
+
+def message_id_sort_key(message_id: str) -> int:
+    """Числовой суффикс из data-post вида 'channel/12345'.
+
+    Лексикографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
+    и при обрезке лимита свежие ID вылетали бы вместо старых.
+    """
+    try:
+        return int(message_id.rsplit("/", 1)[-1])
+    except ValueError:
+        return 0  # нестандартный ID уйдёт в начало и обрежется первым
+
+
+def save_seen(seen: dict[str, set[str]]) -> None:
+    serializable = {
+        channel: sorted(ids, key=message_id_sort_key)[-MAX_SEEN_PER_CHANNEL:]
+        for channel, ids in seen.items()
+    }
+    atomic_write_json(SEEN_FILE, serializable)
+
+
+def load_results() -> list[dict[str, Any]]:
+    data = read_json(OUTPUT_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def normalize_url(url: str) -> str:
+    cleaned = url.strip().rstrip(TRAILING_PUNCTUATION)
+    parts = urlsplit(cleaned)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if netloc == "www.betboom.ru":
+        netloc = "betboom.ru"
+    return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+
+
+def find_urls(message: Any, text: str) -> list[str]:
+    candidates = [link.get("href", "") for link in message.find_all("a", href=True)]
+    candidates.extend(FREESTREAM_RE.findall(text))
+    urls: list[str] = []
+    for candidate in candidates:
+        match = FREESTREAM_RE.match(candidate)
+        if not match:
+            continue
+        normalized = normalize_url(match.group(0))
+        if normalized not in urls:
+            urls.append(normalized)
+    return urls
+
+
+def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
+    url = f"https://t.me/s/{channel}"
+    try:
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            log.warning("[%s] канал не найден или приватный (404)", channel)
+            return None
+        response.raise_for_status()
+    except requests.RequestException as error:
+        log.warning("[%s] ошибка запроса: %s", channel, error)
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    messages = soup.select(".tgme_widget_message_wrap")[-MESSAGES_PER_CHANNEL:]
+    results: list[dict[str, Any]] = []
+    for message in messages:
+        bubble = message.select_one(".tgme_widget_message")
+        if not bubble:
+            continue
+        message_id = str(bubble.get("data-post", "")).strip()
+        if not message_id:
+            continue
+        text_element = message.select_one(".tgme_widget_message_text")
+        text = text_element.get_text(" ", strip=True) if text_element else ""
+        results.append({
+            "id": message_id,
+            "text": text,
+            "urls": find_urls(message, text),
+            "message_url": f"https://t.me/{message_id}",
+        })
+    return results
+
+
+def send_telegram_notification(entry: dict[str, Any]) -> bool:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    text = (
+        f"{icon('start')} Новая ссылка WheelsParser\n"
+        f"Канал: @{entry['channel']}\n"
+        f"Найдено: {entry['found_at']}\n"
+        f"Ссылка: {entry['url']}\n"
+        f"Пост: {entry['message_url']}"
+    )
+    endpoint = f"{BOT_API}/sendMessage"
+    try:
+        response = SESSION.post(
+            endpoint,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        log.error("Не удалось отправить Telegram-уведомление: %s", error)
+        return False
+
+
+# ----------------------------------------------------------------------------
+# Бот: команды /start /help /wheels /channels /add /remove
+# ----------------------------------------------------------------------------
+
+BOT_COMMANDS = [
+    {"command": "start", "description": "О боте"},
+    {"command": "wheels", "description": f"Колёса за последние {WHEELS_WINDOW_MINUTES} мин"},
+    {"command": "active", "description": "Проверить все колёса — показать только живые"},
+    {"command": "status", "description": "Статистика: всего / за сегодня / последняя"},
+    {"command": "channels", "description": "Список каналов"},
+    {"command": "add", "description": "Добавить канал: /add @channel"},
+    {"command": "remove", "description": "Убрать канал: /remove @channel"},
+    {"command": "help", "description": "Справка"},
+]
+
+
+# Маркеры состояния колеса — ищем их в отрендеренном HTML (Playwright)
+_ACTIVE_MARKERS = ("До розыгрыша",)
+_EXPIRED_MARKERS = ("Пока ждёшь следующий запуск", "Пока ждешь следующий запуск")
+_SOON_MARKERS = ("Акция скоро начнётся", "Акция скоро начнется")
+_ALL_MARKERS = _ACTIVE_MARKERS + _EXPIRED_MARKERS + _SOON_MARKERS
+
+# JS-предикат для wait_for_function — ждём появления любого из маркеров
+_WAIT_JS = """
+() => {
+    const t = document.body ? document.body.innerText : "";
+    return t.includes("До розыгрыша") ||
+           t.includes("Пока ждёшь") ||
+           t.includes("Пока ждешь") ||
+           t.includes("Акция скоро начнётся") ||
+           t.includes("Акция скоро начнется");
+}
+"""
+
+
+def _text_to_status(text: str) -> str:
+    if any(m in text for m in _ACTIVE_MARKERS):
+        return "active"
+    if any(m in text for m in _EXPIRED_MARKERS):
+        return "expired"
+    if any(m in text for m in _SOON_MARKERS):
+        return "soon"
+    return "unknown"
+
+
+def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Проверяет список колёс и возвращает только активные.
+    Если Playwright установлен — открывает один headless-браузер на весь список.
+    """
+    if HAS_PLAYWRIGHT:
+        return _get_active_playwright(items)
+    return _get_active_requests(items)
+
+
+def _get_active_playwright(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
+                locale="ru-RU",
+            )
+            for item in items:
+                url = str(item.get("url", ""))
+                if not url:
+                    continue
+                try:
+                    page = context.new_page()
+                    page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_function(_WAIT_JS, timeout=20_000)
+                    except PlaywrightTimeout:
+                        log.debug("Playwright: таймаут ожидания маркера на %s", url)
+                    text = page.inner_text("body")
+                    page.close()
+                    status = _text_to_status(text)
+                    log.debug("active-check [playwright]: %s → %s", url, status)
+                    if status == "active":
+                        active.append(item)
+                    elif status == "soon":
+                        active.append(item)  # скоро начнётся — тоже показываем
+                except Exception as error:
+                    log.debug("Playwright: ошибка %s: %s", url, error)
+            context.close()
+            browser.close()
+    except Exception as error:
+        log.error("Playwright: запуск браузера не удался: %s", error)
+    return active
+
+
+def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Fallback через requests — работает только если сайт делает SSR.
+    Для BetBoom (чистый CSR) практически не работает, но оставляем как запасной вариант.
+    """
+    active: list[dict[str, Any]] = []
+    for item in items:
+        url = str(item.get("url", ""))
+        if not url:
+            continue
+        try:
+            # Вызывается из потока бота (/active) — используем BOT_SESSION,
+            # чтобы не делить requests.Session между потоками.
+            response = BOT_SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                status = _text_to_status(response.text)
+                log.debug("active-check [requests]: %s → %s", url, status)
+                if status in ("active", "soon"):
+                    active.append(item)
+        except requests.RequestException as error:
+            log.debug("active-check requests ошибка %s: %s", url, error)
+        time.sleep(0.5)
+    return active
+
+
+def help_text() -> str:
+    with CHANNELS_LOCK:
+        total = len(CHANNELS)
+    return (
+        "<b>Команды:</b>\n"
+        f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
+        "/active — проверить все колёса, показать только живые\n"
+        "/status — статистика найденных ссылок\n"
+        "/channels — список отслеживаемых каналов\n"
+        "/add @channel — добавить канал\n"
+        "/remove @channel — убрать канал\n"
+        "/help — эта справка\n\n"
+        f"Каналов под мониторингом: {total}\n"
+        f"Интервал проверки: {CHECK_INTERVAL} сек"
+    )
+
+
+def bot_send(chat_id: str, text: str) -> None:
+    try:
+        BOT_SESSION.post(
+            f"{BOT_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        ).raise_for_status()
+    except requests.RequestException as error:
+        log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
+
+
+def save_channels_file() -> None:
+    with CHANNELS_LOCK:
+        lines = ["# Один публичный Telegram-канал на строку. Символ @ необязателен."]
+        lines.extend(CHANNELS)
+    CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
+    now = datetime.now().astimezone()
+    fresh: list[dict[str, Any]] = []
+    for item in load_results():
+        try:
+            found = datetime.fromisoformat(str(item.get("found_at", "")))
+        except ValueError:
+            continue
+        if found.tzinfo is None:
+            found = found.astimezone()
+        if now - found <= timedelta(minutes=minutes):
+            fresh.append(item)
+    fresh.sort(key=lambda item: str(item.get("found_at", "")), reverse=True)
+    return fresh
+
+
+def status_text() -> str:
+    items = load_results()
+    total = len(items)
+    today = datetime.now().astimezone().date()
+    today_count = 0
+    last_item: dict[str, Any] | None = None
+    last_found: datetime | None = None
+    for item in items:
+        try:
+            found = datetime.fromisoformat(str(item.get("found_at", "")))
+        except ValueError:
+            continue
+        if found.tzinfo is None:
+            found = found.astimezone()
+        if found.date() == today:
+            today_count += 1
+        if last_found is None or found > last_found:
+            last_found = found
+            last_item = item
+
+    lines = [
+        f"🎁 Найдено ссылок всего: {total}",
+        f"📅 За сегодня: {today_count}",
+    ]
+    if last_item and last_found:
+        channel = html.escape(str(last_item.get("channel", "?")))
+        url = html.escape(str(last_item.get("url", "")))
+        lines.append(f"🕑 Последняя ссылка: {last_found.strftime('%H:%M')} (@{channel})")
+        if url:
+            lines.append(url)
+    else:
+        lines.append("🕑 Последняя ссылка: пока нет")
+    return "\n".join(lines)
+
+
+def handle_command(chat_id: str, text: str) -> None:
+    parts = text.strip().split(maxsplit=1)
+    command = parts[0].split("@", 1)[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    if command == "/start":
+        bot_send(
+            chat_id,
+            f"{icon('start')} <b>WheelsParser</b>\n"
+            "Я слежу за Telegram-каналами стримеров и присылаю новые ссылки "
+            "сразу после публикации.\n\n"
+            + help_text(),
+        )
+    elif command == "/help":
+        bot_send(chat_id, help_text())
+    elif command == "/status":
+        bot_send(chat_id, status_text())
+    elif command == "/wheels":
+        wheels = recent_wheels()
+        if not wheels:
+            bot_send(
+                chat_id,
+                f"За последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
+                "Как только появится ссылка — пришлю её сразу.",
+            )
+            return
+        lines = [f"{icon('link')} <b>Колёса за последние {WHEELS_WINDOW_MINUTES} минут:</b>"]
+        for item in wheels:
+            found_at = str(item.get("found_at", ""))
+            found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+            channel = html.escape(str(item.get("channel", "")))
+            url = html.escape(str(item.get("url", "")))
+            lines.append(f"• {found_time} — @{channel}\n{url}")
+        bot_send(chat_id, "\n".join(lines))
+    elif command == "/active":
+        pw_note = "" if HAS_PLAYWRIGHT else " (⚠️ Playwright не установлен, результат может быть неточным)"
+        bot_send(chat_id, f"{icon('bell')} Проверяю все сохранённые колёса...{pw_note} Подождите.")
+        all_items = load_results()
+        # Дедупликация по URL
+        seen_urls: set[str] = set()
+        unique_items: list[dict[str, Any]] = []
+        for item in reversed(all_items):  # сначала свежие
+            url = str(item.get("url", ""))
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_items.append(item)
+
+        if not unique_items:
+            bot_send(chat_id, "В базе нет сохранённых колёс. Запусти парсер и подожди первых ссылок.")
+            return
+
+        active_items = get_active_wheels(unique_items)
+
+        if not active_items:
+            bot_send(
+                chat_id,
+                f"{icon('warn')} Среди {len(unique_items)} сохранённых колёс активных не найдено.\n"
+                "Все розыгрыши уже завершились или ещё не начались.",
+            )
+            return
+
+        lines = [
+            f"{icon('link')} <b>Активные колёса ({len(active_items)} из {len(unique_items)}):</b>"
+        ]
+        for item in active_items:
+            found_at = str(item.get("found_at", ""))
+            found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+            channel = html.escape(str(item.get("channel", "")))
+            url = html.escape(str(item.get("url", "")))
+            lines.append(f"• {found_time} — @{channel}\n{url}")
+        bot_send(chat_id, "\n".join(lines))
+    elif command == "/channels":
+        with CHANNELS_LOCK:
+            total = len(CHANNELS)
+            listing = "\n".join(f"• @{html.escape(channel)}" for channel in CHANNELS)
+        bot_send(chat_id, f"<b>Каналы ({total}):</b>\n{listing}")
+    elif command in ("/add", "/remove"):
+        match = USERNAME_RE.match(argument)
+        if not match:
+            bot_send(chat_id, f"Укажите канал: <code>{command} @channel</code>")
+            return
+        channel = match.group(1)
+        with CHANNELS_LOCK:
+            if command == "/add":
+                if channel in CHANNELS:
+                    bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
+                    return
+                CHANNELS.append(channel)
+                save_channels_file()
+                total = len(CHANNELS)
+                bot_send(
+                    chat_id,
+                    f"{icon('ok')} @{html.escape(channel)} добавлен. Каналов: {total}",
+                )
+                log.info("Бот: канал @%s добавлен, всего %s", channel, total)
+            else:
+                if channel not in CHANNELS:
+                    bot_send(chat_id, f"@{html.escape(channel)} нет в списке.")
+                    return
+                CHANNELS.remove(channel)
+                save_channels_file()
+                total = len(CHANNELS)
+                bot_send(
+                    chat_id,
+                    f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}",
+                )
+                log.info("Бот: канал @%s удалён, всего %s", channel, total)
+
+
+def bot_loop() -> None:
+    try:
+        BOT_SESSION.post(
+            f"{BOT_API}/setMyCommands",
+            json={"commands": BOT_COMMANDS},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        log.warning("Бот: не удалось зарегистрировать меню команд: %s", error)
+
+    offset = 0
+    while not STOP_EVENT.is_set():
+        try:
+            response = BOT_SESSION.get(
+                f"{BOT_API}/getUpdates",
+                params={"timeout": 25, "offset": offset},
+                timeout=REQUEST_TIMEOUT + 30,
+            )
+            response.raise_for_status()
+            updates = response.json().get("result", [])
+        except (requests.RequestException, ValueError) as error:
+            log.warning("Бот: ошибка получения обновлений: %s", error)
+            STOP_EVENT.wait(5)
+            continue
+        for update in updates:
+            offset = max(offset, int(update.get("update_id", 0)) + 1)
+            message = update.get("message") or {}
+            text = str(message.get("text") or "")
+            chat_id = str((message.get("chat") or {}).get("id", ""))
+            if not chat_id or not text.startswith("/"):
+                continue
+            if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
+                continue  # игнорируем чужие чаты
+            try:
+                handle_command(chat_id, text)
+            except Exception:
+                log.exception("Бот: ошибка обработки команды %r", text)
+
+
+def process_cycle(
+    seen: dict[str, set[str]], results: list[dict[str, Any]], baseline: bool = False
+) -> int:
+    known_urls = {str(item.get("url")) for item in results if item.get("url")}
+    new_entries: list[dict[str, Any]] = []
+    failed_channels: list[str] = []
+
+    with CHANNELS_LOCK:
+        channels = list(CHANNELS)
+
+    for index, channel in enumerate(channels):
+        if STOP_EVENT.is_set():
+            break
+        messages = fetch_channel(channel)
+        if messages is None:
+            failed_channels.append(channel)
+            messages = []
+        channel_seen = seen.setdefault(channel, set())
+        # Канал, добавленный через /add на лету, сначала проходит «тихий» цикл,
+        # чтобы не рассылать уведомления по его старым сообщениям.
+        channel_baseline = baseline or (not channel_seen and not ALERT_ON_FIRST_RUN)
+        for message in messages:
+            is_new_message = message["id"] not in channel_seen
+            channel_seen.add(message["id"])
+            if channel_baseline or not is_new_message:
+                continue
+            for url in message["urls"]:
+                if url in known_urls:
+                    continue
+                entry = {
+                    "url": url,
+                    "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "channel": channel,
+                    "msg_id": message["id"],
+                    "message_url": message["message_url"],
+                    "preview": message["text"][:200],
+                    "notified": False,
+                }
+                entry["notified"] = send_telegram_notification(entry)
+                results.append(entry)
+                new_entries.append(entry)
+                known_urls.add(url)
+                log.info(
+                    "%s Новая ссылка [@%s]: %s",
+                    icon("link"),
+                    channel,
+                    url,
+                    extra={"highlight": True},
+                )
+        if index < len(channels) - 1:
+            STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
+
+    save_seen(seen)
+    if new_entries:
+        atomic_write_json(OUTPUT_FILE, results)
+    status_icon = icon("warn") if failed_channels else icon("ok")
+    log.info(
+        "%s Цикл завершён · каналы %s/%s · новых ссылок: %s",
+        status_icon,
+        len(channels) - len(failed_channels),
+        len(channels),
+        len(new_entries),
+    )
+    if failed_channels:
+        log.warning("%s Недоступные каналы: %s", icon("warn"), ", ".join(failed_channels))
+    return len(new_entries)
+
+
+def acquire_single_instance_lock() -> Any | None:
+    """Не даёт запустить второй экземпляр парсера.
+
+    Два процесса с одним токеном конфликтуют в getUpdates (409 Conflict),
+    поэтому при старте берём эксклюзивную блокировку lock-файла.
+    ОС снимает блокировку автоматически при любом завершении процесса,
+    так что «зависших» lock-файлов после падения не остаётся.
+    """
+    lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_handle.close()
+        return None
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    return lock_handle
+
+
+def main() -> int:
+    # Держим lock_handle до конца работы процесса.
+    lock_handle = acquire_single_instance_lock()
+    if lock_handle is None:
+        log.error(
+            "%s Уже запущен другой экземпляр WheelsParser (lock: %s) — выход",
+            icon("stop"),
+            LOCK_FILE.name,
+        )
+        return 1
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+
+    seen, has_state = load_seen()
+    results = load_results()
+    if not OUTPUT_FILE.exists():
+        atomic_write_json(OUTPUT_FILE, results)
+
+    notifications = "включены" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "выключены"
+    log.info(
+        "%s WheelsParser запущен · каналов %s · интервал %ss",
+        icon("start"),
+        len(CHANNELS),
+        CHECK_INTERVAL,
+    )
+    log.info("%s Telegram-уведомления: %s", icon("bell"), notifications)
+
+    if TELEGRAM_BOT_TOKEN:
+        threading.Thread(target=bot_loop, name="bot", daemon=True).start()
+        command_list = " ".join(f"/{item['command']}" for item in BOT_COMMANDS)
+        log.info("%s Команды бота активны: %s", icon("bell"), command_list)
+
+    baseline = not has_state and not ALERT_ON_FIRST_RUN
+    if baseline:
+        log.info("Первый запуск: создаю базовое состояние без старых уведомлений")
+    process_cycle(seen, results, baseline=baseline)
+
+    while not STOP_EVENT.is_set():
+        if STOP_EVENT.wait(CHECK_INTERVAL):
+            break
+        process_cycle(seen, results)
+
+    save_seen(seen)
+    log.info("%s WheelsParser остановлен", icon("stop"))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        log.exception("Критическая ошибка")
+        sys.exit(1)
