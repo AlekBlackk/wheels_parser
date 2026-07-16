@@ -176,6 +176,9 @@ CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
+# Максимум записей в freebets.json: без лимита файл и память растут бесконечно.
+# При превышении старые записи отбрасываются в конце цикла.
+MAX_RESULTS = env_int("MAX_RESULTS", 5000, 100)
 WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
 # /active смотрит только на колёса, найденные сегодня по МСК: счётчик «N из M»
 # сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
@@ -238,28 +241,20 @@ def icon(name: str) -> str:
     return (ICONS if USE_ICONS else ASCII_ICONS)[name]
 
 
-BOT_TOKEN_RE = re.compile(r"bot\d+:[\w-]{20,}")
-
-
 class RedactTokenFilter(logging.Filter):
     """Маскирует токен бота в сообщениях лога.
 
     Ошибки requests содержат полный URL вида
     https://api.telegram.org/bot<TOKEN>/... — без фильтра токен
     попадает в parser.log (например, при 409 Conflict).
-
-    Маскирует и точное значение TELEGRAM_BOT_TOKEN, и любой
-    URL-паттерн bot<id>:<token> на случай чужих/старых токенов.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        masked = BOT_TOKEN_RE.sub("bot***TOKEN***", message)
         if TELEGRAM_BOT_TOKEN:
-            masked = masked.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
-        if masked != message:
-            record.msg = masked
-            record.args = None
+            message = record.getMessage()
+            if TELEGRAM_BOT_TOKEN in message:
+                record.msg = message.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+                record.args = None
         return True
 
 
@@ -294,12 +289,7 @@ def setup_logging() -> logging.Logger:
         LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
-    redact_filter = RedactTokenFilter()
-    logger.addFilter(redact_filter)
-    # Фильтры на хендлерах ловят записи из любых логгеров,
-    # которые попадают в консоль и parser.log.
-    console.addFilter(redact_filter)
-    file_handler.addFilter(redact_filter)
+    logger.addFilter(RedactTokenFilter())
     logger.addHandler(console)
     logger.addHandler(file_handler)
     return logger
@@ -392,9 +382,15 @@ def message_id_sort_key(message_id: str) -> int:
 
 
 def save_seen(seen: dict[str, set[str]]) -> None:
+    with CHANNELS_LOCK:
+        active = set(CHANNELS)
+    # Каналы, удалённые через /remove, в файл не пишем — иначе seen_ids.json
+    # копит их ID вечно. Из памяти (seen) не удаляем: если канал вернут через
+    # /add до рестарта, старые сообщения не вызовут ложных уведомлений.
     serializable = {
         channel: sorted(ids, key=message_id_sort_key)[-MAX_SEEN_PER_CHANNEL:]
         for channel, ids in seen.items()
+        if channel in active
     }
     atomic_write_json(SEEN_FILE, serializable)
 
@@ -1105,6 +1101,10 @@ def process_cycle(
 
     save_seen(seen)
     if new_entries:
+        if len(results) > MAX_RESULTS:
+            # Обрезаем на месте (del, а не переприсваивание): список results
+            # общий между циклами, терять ссылку на него нельзя.
+            del results[: len(results) - MAX_RESULTS]
         atomic_write_json(OUTPUT_FILE, results)
     status_icon = icon("warn") if failed_channels else icon("ok")
     next_at = (
