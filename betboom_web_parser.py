@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -13,7 +14,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -34,8 +35,8 @@ except ImportError:
     HAS_COLOR = False
 
 try:
-    from playwright.sync_api import sync_playwright
-    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright
+    from playwright.async_api import TimeoutError as PlaywrightTimeout
 
     HAS_PLAYWRIGHT = True
 except ImportError:
@@ -134,6 +135,11 @@ REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
 WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
+# /active смотрит только на колёса, найденные сегодня по МСК: счётчик «N из M»
+# сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
+MSK_TZ = timezone(timedelta(hours=3), "MSK")
+# Сколько вкладок Playwright проверяют колёса одновременно при /active.
+ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 4, 1)
 # Повторное уведомление о том же URL разрешено после этого кулдауна (мин).
 # Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
 # «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
@@ -171,6 +177,8 @@ ICONS = {
     "link": "\U0001f381",
     "stop": "\U0001f6d1",
     "bell": "\U0001f514",
+    "scan": "\U0001f50d",
+    "bot": "\u2328\ufe0f",
 }
 ASCII_ICONS = {
     "start": "[*]",
@@ -179,6 +187,8 @@ ASCII_ICONS = {
     "link": "[NEW]",
     "stop": "[x]",
     "bell": "[i]",
+    "scan": "[>>]",
+    "bot": "[BOT]",
 }
 
 
@@ -317,7 +327,7 @@ def load_seen() -> tuple[dict[str, set[str]], bool]:
 def message_id_sort_key(message_id: str) -> int:
     """Числовой суффикс из data-post вида 'channel/12345'.
 
-    ���ек��икографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
+    Лексикографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
     и при обрезке лимита свежие ID вылетали бы вместо старых.
     """
     try:
@@ -427,7 +437,7 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
 BOT_COMMANDS = [
     {"command": "start", "description": "О боте"},
     {"command": "wheels", "description": f"Колёса за последние {WHEELS_WINDOW_MINUTES} мин"},
-    {"command": "active", "description": "Проверить все колёса — показать только живые"},
+    {"command": "active", "description": "Живые колёса за сегодня (сброс в 00:00 МСК)"},
     {"command": "status", "description": "Статистика: всего / за сегодня / последняя"},
     {"command": "channels", "description": "Список каналов"},
     {"command": "add", "description": "Добавить канал: /add @channel"},
@@ -439,7 +449,7 @@ BOT_COMMANDS = [
 # Маркеры состояния колеса — ищем их в отрендеренном HTML (Playwright)
 _ACTIVE_MARKERS = ("До розыгрыша",)
 _EXPIRED_MARKERS = ("Пока ждёшь следующий запуск", "Пока ждешь следующий запуск")
-_SOON_MARKERS = ("Акция скоро начнётс��", "Акция скоро начнется")
+_SOON_MARKERS = ("Акция скоро начнётся", "Акция скоро начнется")
 _ALL_MARKERS = _ACTIVE_MARKERS + _EXPIRED_MARKERS + _SOON_MARKERS
 
 # JS-предикат для wait_for_function — ждём появления любого из маркеров
@@ -475,42 +485,73 @@ def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return _get_active_requests(items)
 
 
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+
 def _get_active_playwright(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    active: list[dict[str, Any]] = []
+    """Синхронная обёртка: запускает параллельную проверку колёс."""
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
-                locale="ru-RU",
-            )
-            for item in items:
-                url = str(item.get("url", ""))
-                if not url:
-                    continue
+        return asyncio.run(_get_active_playwright_async(items))
+    except Exception as error:
+        log.error("Playwright: проверка колёс не удалась: %s", error)
+        return []
+
+
+async def _get_active_playwright_async(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Проверяет колёса параллельно (ACTIVE_CHECK_CONCURRENCY вкладок).
+
+    Раньше колёса проверялись по одному (до 50 сек на URL) — на десяток ссылок
+    уходили минуты. Теперь вкладки работают параллельно, а картинки/видео/шрифты
+    блокируются — текстовым маркерам они не нужны, а грузятся дольше всего.
+    """
+    found: list[tuple[int, dict[str, Any]]] = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
+            locale="ru-RU",
+        )
+
+        async def block_heavy(route: Any) -> None:
+            if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await context.route("**/*", block_heavy)
+
+        semaphore = asyncio.Semaphore(ACTIVE_CHECK_CONCURRENCY)
+
+        async def check(index: int, item: dict[str, Any]) -> None:
+            url = str(item.get("url", ""))
+            if not url:
+                return
+            async with semaphore:
+                page = await context.new_page()
                 try:
-                    page = context.new_page()
-                    page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                    await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
                     try:
-                        page.wait_for_function(_WAIT_JS, timeout=20_000)
+                        await page.wait_for_function(_WAIT_JS, timeout=10_000)
                     except PlaywrightTimeout:
                         log.debug("Playwright: таймаут ожидания маркера на %s", url)
-                    text = page.inner_text("body")
-                    page.close()
+                    text = await page.inner_text("body")
                     status = _text_to_status(text)
                     log.debug("active-check [playwright]: %s → %s", url, status)
-                    if status == "active":
-                        active.append(item)
-                    elif status == "soon":
-                        active.append(item)  # скоро начнётся — тоже показываем
+                    if status in ("active", "soon"):
+                        found.append((index, item))
                 except Exception as error:
                     log.debug("Playwright: ошибка %s: %s", url, error)
-            context.close()
-            browser.close()
-    except Exception as error:
-        log.error("Playwright: запуск браузера не удался: %s", error)
-    return active
+                finally:
+                    await page.close()
+
+        await asyncio.gather(*(check(i, item) for i, item in enumerate(items)))
+        await context.close()
+        await browser.close()
+    found.sort(key=lambda pair: pair[0])
+    return [item for _, item in found]
 
 
 def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -544,7 +585,7 @@ def help_text() -> str:
     return (
         "<b>Команды:</b>\n"
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
-        "/active — проверить все колёса, показать только живые\n"
+        "/active — живые колёса за сегодня (сброс в 00:00 МСК)\n"
         "/status — статистика найденных ссылок\n"
         "/channels — список отслеживаемых каналов\n"
         "/add @channel — добавить канал\n"
@@ -651,7 +692,7 @@ def handle_command(chat_id: str, text: str) -> None:
         if not wheels:
             bot_send(
                 chat_id,
-                f"��а последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
+                f"За последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
                 "Как только появится ссылка — пришлю её сразу.",
             )
             return
@@ -664,34 +705,57 @@ def handle_command(chat_id: str, text: str) -> None:
             lines.append(f"• {found_time} — @{channel}\n{url}")
         bot_send(chat_id, "\n".join(lines))
     elif command == "/active":
-        pw_note = "" if HAS_PLAYWRIGHT else " (⚠️ Playwright не установлен, результат может быть неточным)"
-        bot_send(chat_id, f"{icon('bell')} Проверяю все сохранённые колёса...{pw_note} Подождите.")
-        all_items = load_results()
+        # Сброс каждый день в 00:00 по МСК: показываем и проверяем только те
+        # колёса, что найдены с начала текущих суток по Москве.
+        cutoff = datetime.now(MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        fresh_items: list[dict[str, Any]] = []
+        for item in load_results():
+            try:
+                found = datetime.fromisoformat(str(item.get("found_at", "")))
+            except ValueError:
+                continue
+            if found.tzinfo is None:
+                found = found.astimezone()
+            if found >= cutoff:
+                fresh_items.append(item)
         # Дедупликация по URL
         seen_urls: set[str] = set()
         unique_items: list[dict[str, Any]] = []
-        for item in reversed(all_items):  # сначала свежие
+        for item in reversed(fresh_items):  # сначала свежие
             url = str(item.get("url", ""))
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 unique_items.append(item)
 
         if not unique_items:
-            bot_send(chat_id, "В базе нет сохранённых колёс. Запусти парсер и подожди первых ссылок.")
+            bot_send(
+                chat_id,
+                "Сегодня (с 00:00 МСК) колёс ещё не найдено. "
+                "Как только появится ссылка — пришлю её сразу.",
+            )
             return
+
+        pw_note = "" if HAS_PLAYWRIGHT else " (⚠️ Playwright не установлен, результат может быть неточным)"
+        bot_send(
+            chat_id,
+            f"{icon('bell')} Проверяю все сохранённые колёса за сегодня…"
+            f"{pw_note} Немного подождите",
+        )
 
         active_items = get_active_wheels(unique_items)
 
         if not active_items:
             bot_send(
                 chat_id,
-                f"{icon('warn')} Среди {len(unique_items)} сохранённых колёс активных не найдено.\n"
+                f"{icon('warn')} Среди {len(unique_items)} колёс за сегодня "
+                "активных не найдено.\n"
                 "Все розыгрыши уже завершились или ещё не начались.",
             )
             return
 
         lines = [
-            f"{icon('link')} <b>Активные колёса ({len(active_items)} из {len(unique_items)}):</b>"
+            f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
+            f"{len(unique_items)} за сегодня):</b>"
         ]
         for item in active_items:
             found_at = str(item.get("found_at", ""))
@@ -794,6 +858,9 @@ def bot_loop() -> None:
 def process_cycle(
     seen: dict[str, set[str]], results: list[dict[str, Any]], baseline: bool = False
 ) -> int:
+    with CHANNELS_LOCK:
+        total_channels = len(CHANNELS)
+    log.info("%s Начинаю проверку · каналов %s", icon("scan"), total_channels)
     now = datetime.now().astimezone()
     # URL -> время последней находки. Раньше дедупликация была глобальной
     # («один URL — одно уведомление за всю историю»), из-за чего повторный
@@ -867,12 +934,17 @@ def process_cycle(
     if new_entries:
         atomic_write_json(OUTPUT_FILE, results)
     status_icon = icon("warn") if failed_channels else icon("ok")
+    next_at = (
+        datetime.now().astimezone() + timedelta(seconds=CHECK_INTERVAL)
+    ).strftime("%H:%M:%S")
+    suffix = "" if STOP_EVENT.is_set() else f" · следующая проверка в {next_at}"
     log.info(
-        "%s Цикл завершён · каналы %s/%s · новых ссылок: %s",
+        "%s Цикл завершён · каналы %s/%s · новых ссылок: %s%s",
         status_icon,
         len(channels) - len(failed_channels),
         len(channels),
         len(new_entries),
+        suffix,
     )
     if failed_channels:
         log.warning("%s Недоступные каналы: %s", icon("warn"), ", ".join(failed_channels))
@@ -885,7 +957,7 @@ def acquire_single_instance_lock() -> Any | None:
     Два процесса с одним токеном конфликтуют в getUpdates (409 Conflict),
     поэтому при старте берём эксклюзивную блокировку lock-файла.
     ОС снимает блокировку автоматически при любом завершении процесса,
-    так что «зависших» lock-файлов после ��адения не остаётся.
+    так что «зависших» lock-файлов после падения не остаётся.
     """
     lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
@@ -952,7 +1024,7 @@ def main() -> int:
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=bot_loop, name="bot", daemon=True).start()
         command_list = " ".join(f"/{item['command']}" for item in BOT_COMMANDS)
-        log.info("%s Команды бота активны: %s", icon("bell"), command_list)
+        log.info("%s Команды бота активны: %s", icon("bot"), command_list)
 
     baseline = not has_state and not ALERT_ON_FIRST_RUN
     if baseline:
