@@ -238,20 +238,28 @@ def icon(name: str) -> str:
     return (ICONS if USE_ICONS else ASCII_ICONS)[name]
 
 
+BOT_TOKEN_RE = re.compile(r"bot\d+:[\w-]{20,}")
+
+
 class RedactTokenFilter(logging.Filter):
     """Маскирует токен бота в сообщениях лога.
 
     Ошибки requests содержат полный URL вида
     https://api.telegram.org/bot<TOKEN>/... — без фильтра токен
     попадает в parser.log (например, при 409 Conflict).
+
+    Маскирует и точное значение TELEGRAM_BOT_TOKEN, и любой
+    URL-паттерн bot<id>:<token> на случай чужих/старых токенов.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        masked = BOT_TOKEN_RE.sub("bot***TOKEN***", message)
         if TELEGRAM_BOT_TOKEN:
-            message = record.getMessage()
-            if TELEGRAM_BOT_TOKEN in message:
-                record.msg = message.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
-                record.args = None
+            masked = masked.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+        if masked != message:
+            record.msg = masked
+            record.args = None
         return True
 
 
@@ -286,7 +294,12 @@ def setup_logging() -> logging.Logger:
         LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
-    logger.addFilter(RedactTokenFilter())
+    redact_filter = RedactTokenFilter()
+    logger.addFilter(redact_filter)
+    # Фильтры на хендлерах ловят записи из любых логгеров,
+    # которые попадают в консоль и parser.log.
+    console.addFilter(redact_filter)
+    file_handler.addFilter(redact_filter)
     logger.addHandler(console)
     logger.addHandler(file_handler)
     return logger
