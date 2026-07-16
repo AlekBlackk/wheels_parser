@@ -439,6 +439,73 @@ def find_keywords(text: str) -> list[str]:
     return [keyword for keyword in keywords if keyword.casefold() in lowered]
 
 
+def format_found_at(value: Any) -> str:
+    """Время находки в читаемом виде: 16.07.2026 | 20:40:31 | +03:00."""
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return str(value)
+    formatted = f"{moment.strftime('%d.%m.%Y')} | {moment.strftime('%H:%M:%S')}"
+    offset = moment.strftime("%z")
+    if offset:
+        formatted += f" | {offset[:3]}:{offset[3:]}"
+    return formatted
+
+
+def message_preview_html(text_element: Any, limit: int = 200) -> str:
+    """HTML-превью текста поста для отправки с parse_mode=HTML.
+
+    Кликабельные ссылки из поста (например «Твич | ВК») сохраняются как
+    <a href="...">, остальной текст экранируется. limit ограничивает видимую
+    длину текста (HTML-теги не считаются).
+    """
+    if text_element is None:
+        return ""
+    tokens: list[tuple[str, str, str]] = []  # (вид, текст/подпись, href)
+
+    def walk(node: Any) -> None:
+        for child in node.children:
+            if getattr(child, "name", None) is None:
+                chunk = re.sub(r"\s+", " ", str(child)).strip()
+                if chunk:
+                    tokens.append(("text", chunk, ""))
+            elif child.name == "a" and child.get("href"):
+                label = re.sub(r"\s+", " ", child.get_text(" ", strip=True)).strip()
+                href = str(child["href"]).strip()
+                if label and href:
+                    tokens.append(("link", label, href))
+                elif label:
+                    tokens.append(("text", label, ""))
+            else:
+                walk(child)
+
+    walk(text_element)
+
+    parts: list[str] = []
+    visible = 0
+    for kind, label, href in tokens:
+        if visible >= limit:
+            parts.append("…")
+            break
+        if kind == "link":
+            if visible + len(label) > limit:
+                parts.append("…")
+                break
+            parts.append(
+                f'<a href="{html.escape(href, quote=True)}">{html.escape(label)}</a>'
+            )
+        else:
+            if visible + len(label) > limit:
+                cut = label[: limit - visible].rstrip()
+                if cut:
+                    parts.append(html.escape(cut))
+                parts.append("…")
+                break
+            parts.append(html.escape(label))
+        visible += len(label) + 1
+    return " ".join(parts)
+
+
 def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
     url = f"https://t.me/s/{channel}"
     try:
@@ -466,6 +533,7 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
         results.append({
             "id": message_id,
             "text": text,
+            "preview_html": message_preview_html(text_element),
             "urls": find_urls(message, text),
             "message_url": f"https://t.me/{message_id}",
         })
@@ -478,7 +546,7 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
     text = (
         f"{icon('start')} Новая ссылка WheelsParser\n"
         f"Канал: @{entry['channel']}\n"
-        f"Найдено: {entry['found_at']}\n"
+        f"Найдено: {format_found_at(entry['found_at'])}\n"
         f"Ссылка: {entry['url']}\n"
         f"Пост: {entry['message_url']}"
     )
@@ -499,20 +567,40 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
 def send_keyword_notification(entry: dict[str, Any]) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
-    text = (
+    plain_preview = str(entry.get("preview", ""))
+    preview_html = str(entry.get("preview_html") or "").strip()
+    if not preview_html:
+        preview_html = html.escape(plain_preview)
+    header = (
         f"{icon('bell')} Ключевые слова: {', '.join(entry['keywords'])}\n"
         f"Канал: @{entry['channel']}\n"
-        f"Найдено: {entry['found_at']}\n"
-        f"Текст: {entry['preview']}\n"
-        f"Пост: {entry['message_url']}"
+        f"Найдено: {format_found_at(entry['found_at'])}\n"
     )
+    footer = f"\nПост: {entry['message_url']}"
+    html_text = f"{html.escape(header)}Текст: {preview_html}{html.escape(footer)}"
     endpoint = f"{BOT_API}/sendMessage"
     try:
         response = SESSION.post(
             endpoint,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": html_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
             timeout=REQUEST_TIMEOUT,
         )
+        if response.status_code == 400:
+            # Telegram отклонил HTML-разметку — шлём обычный текст без ссылок.
+            response = SESSION.post(
+                endpoint,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": f"{header}Текст: {plain_preview}{footer}",
+                    "disable_web_page_preview": True,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
         response.raise_for_status()
         return True
     except requests.RequestException as error:
@@ -782,12 +870,22 @@ def handle_command(chat_id: str, text: str) -> None:
     argument = parts[1].strip() if len(parts) > 1 else ""
 
     if command == "/start":
+        with CHANNELS_LOCK:
+            total = len(CHANNELS)
         bot_send(
             chat_id,
             f"{icon('start')} <b>WheelsParser</b>\n"
-            "Я слежу за Telegram-каналами стримеров и присылаю новые ссылки "
-            "сразу после публикации.\n\n"
-            + help_text(),
+            "Я мониторю Telegram-каналы стримеров и присылаю ссылки на "
+            "фрибет-колёса BetBoom сразу после публикации — ничего "
+            "запрашивать не нужно.\n\n"
+            "Что я умею:\n"
+            f"{icon('link')} ловлю ссылки на колёса в {total} каналах\n"
+            f"{icon('scan')} проверяю каналы каждые {CHECK_INTERVAL} сек\n\n"
+            "Самое полезное:\n"
+            f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
+            "/active — живые колёса за сегодня\n"
+            "/status — статистика находок\n\n"
+            "Полный список команд — /help",
         )
     elif command == "/help":
         bot_send(chat_id, help_text())
@@ -1085,6 +1183,7 @@ def process_cycle(
                         "msg_id": message["id"],
                         "message_url": message["message_url"],
                         "preview": message["text"][:200],
+                        "preview_html": message.get("preview_html", ""),
                         "keywords": matched,
                     }
                     send_keyword_notification(entry)
@@ -1128,7 +1227,7 @@ def acquire_single_instance_lock() -> Any | None:
     """Не даёт запустить второй экземпляр парсера.
 
     Два процесса с одним токеном конфликтуют в getUpdates (409 Conflict),
-    поэтому при старте берём эксклюзивну�� блокировку lock-файла.
+    поэтому при старте берём эксклюзивную блокировку lock-файла.
     ОС снимает блокировку автоматически при любом завершении процесса,
     так что «зависших» lock-файлов после падения не остаётся.
     """
