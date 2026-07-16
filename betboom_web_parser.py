@@ -73,31 +73,74 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_channels() -> list[str]:
-    raw = os.getenv("WHEELSPARSER_CHANNELS", "")
-    if raw.strip():
-        channels = [item.strip().lstrip("@") for item in raw.split(",") if item.strip()]
-        return list(dict.fromkeys(channels))
+def parse_channels(raw: str) -> list[str]:
+    channels = [item.strip().lstrip("@") for item in raw.split(",") if item.strip()]
+    return list(dict.fromkeys(channels))
+
+
+def read_channels_file() -> list[str]:
+    channels = []
+    for line in CHANNELS_FILE.read_text(encoding="utf-8").splitlines():
+        value = line.split("#", 1)[0].strip().lstrip("@")
+        if value:
+            channels.append(value)
+    return list(dict.fromkeys(channels))
+
+
+# Сообщения о загрузке каналов; логгер на этом этапе ещё не создан,
+# поэтому копим их здесь и выводим в main().
+CHANNEL_LOAD_NOTES: list[tuple[int, str]] = []
+
+
+def load_channels() -> tuple[list[str], bool]:
+    """Возвращает (каналы, нужно_ли_создать_channels_txt).
+
+    Единственный источник правды — channels.txt. Переменная окружения
+    WHEELSPARSER_CHANNELS используется только для первичной инициализации:
+    если channels.txt ещё не существует, список из env записывается в файл
+    при старте. Дальше все изменения (/add, /remove, ручная правка файла)
+    живут в channels.txt и переживают рестарт.
+    """
+    env_channels = parse_channels(os.getenv("WHEELSPARSER_CHANNELS", ""))
 
     if CHANNELS_FILE.exists():
-        channels = []
-        for line in CHANNELS_FILE.read_text(encoding="utf-8").splitlines():
-            value = line.split("#", 1)[0].strip().lstrip("@")
-            if value:
-                channels.append(value)
-        if channels:
-            return list(dict.fromkeys(channels))
+        file_channels = read_channels_file()
+        if file_channels:
+            if env_channels and set(env_channels) != set(file_channels):
+                CHANNEL_LOAD_NOTES.append((
+                    logging.WARNING,
+                    "WHEELSPARSER_CHANNELS задана, но игнорируется: источник "
+                    "правды — channels.txt. Удалите channels.txt, чтобы заново "
+                    "инициализировать список каналов из переменной окружения.",
+                ))
+            return file_channels, False
 
-    return DEFAULT_CHANNELS.copy()
+    if env_channels:
+        CHANNEL_LOAD_NOTES.append((
+            logging.INFO,
+            "Список каналов из WHEELSPARSER_CHANNELS сохранён в channels.txt; "
+            "дальше управляйте каналами через channels.txt или команды "
+            "/add и /remove.",
+        ))
+        return env_channels, True
+
+    return DEFAULT_CHANNELS.copy(), True
 
 
-CHANNELS = load_channels()
+CHANNELS, _SEED_CHANNELS_FILE = load_channels()
 CHANNELS_LOCK = threading.RLock()
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
 WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
+# Повторное уведомление о том же URL разрешено после этого кулдауна (мин).
+# Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
+# «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
+REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
+# Команды старше этого возраста (сек) подтверждаются, но не выполняются —
+# защита от бэклога getUpdates, накопившегося за время простоя парсера.
+STALE_COMMAND_SECONDS = env_int("STALE_COMMAND_SECONDS", 120, 10)
 ALERT_ON_FIRST_RUN = env_bool("ALERT_ON_FIRST_RUN", False)
 USE_COLORS = env_bool("USE_COLORS", True)
 USE_ICONS = env_bool("USE_ICONS", True)
@@ -225,8 +268,16 @@ STOP_EVENT = threading.Event()  # потокобезопасный флаг ос
 
 
 def request_stop(_signum: int, _frame: Any) -> None:
+    if STOP_EVENT.is_set():
+        # Второй Ctrl+C — не ждём graceful shutdown, выходим сразу.
+        # Состояние не теряется: save_seen() вызывается в конце каждого цикла.
+        log.warning("%s Повторный Ctrl+C — принудительный выход", icon("stop"))
+        os._exit(1)
     STOP_EVENT.set()
-    log.info("Получен сигнал остановки; завершаю текущий цикл")
+    log.info(
+        "Получен сигнал остановки; завершаю текущий цикл "
+        "(ещё раз Ctrl+C — немедленный выход)"
+    )
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -266,7 +317,7 @@ def load_seen() -> tuple[dict[str, set[str]], bool]:
 def message_id_sort_key(message_id: str) -> int:
     """Числовой суффикс из data-post вида 'channel/12345'.
 
-    Лексикографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
+    ���ек��икографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
     и при обрезке лимита свежие ID вылетали бы вместо старых.
     """
     try:
@@ -388,7 +439,7 @@ BOT_COMMANDS = [
 # Маркеры состояния колеса — ищем их в отрендеренном HTML (Playwright)
 _ACTIVE_MARKERS = ("До розыгрыша",)
 _EXPIRED_MARKERS = ("Пока ждёшь следующий запуск", "Пока ждешь следующий запуск")
-_SOON_MARKERS = ("Акция скоро начнётся", "Акция скоро начнется")
+_SOON_MARKERS = ("Акция скоро начнётс��", "Акция скоро начнется")
 _ALL_MARKERS = _ACTIVE_MARKERS + _EXPIRED_MARKERS + _SOON_MARKERS
 
 # JS-предикат для wait_for_function — ждём появления любого из маркеров
@@ -600,7 +651,7 @@ def handle_command(chat_id: str, text: str) -> None:
         if not wheels:
             bot_send(
                 chat_id,
-                f"За последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
+                f"��а последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
                 "Как только появится ссылка — пришлю её сразу.",
             )
             return
@@ -711,6 +762,7 @@ def bot_loop() -> None:
             log.warning("Бот: ошибка получения обновлений: %s", error)
             STOP_EVENT.wait(5)
             continue
+        stale_count = 0
         for update in updates:
             offset = max(offset, int(update.get("update_id", 0)) + 1)
             message = update.get("message") or {}
@@ -720,16 +772,46 @@ def bot_loop() -> None:
                 continue
             if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
                 continue  # игнорируем чужие чаты
+            # Устаревшие команды (например, отправленные, пока парсер лежал)
+            # подтверждаем сдвигом offset, но не выполняем: отвечать на
+            # команды суточной давности бессмысленно и создаёт спам в чате.
+            message_date = int(message.get("date") or 0)
+            if message_date and time.time() - message_date > STALE_COMMAND_SECONDS:
+                stale_count += 1
+                continue
             try:
                 handle_command(chat_id, text)
             except Exception:
                 log.exception("Бот: ошибка обработки команды %r", text)
+        if stale_count:
+            log.info(
+                "%s Бот: пропущено устаревших команд из бэклога: %s",
+                icon("bell"),
+                stale_count,
+            )
 
 
 def process_cycle(
     seen: dict[str, set[str]], results: list[dict[str, Any]], baseline: bool = False
 ) -> int:
-    known_urls = {str(item.get("url")) for item in results if item.get("url")}
+    now = datetime.now().astimezone()
+    # URL -> время последней находки. Раньше дедупликация была глобальной
+    # («один URL — одно уведомление за всю историю»), из-за чего повторный
+    # запуск колеса на том же адресе молча игнорировался. Теперь повтор
+    # подавляется только в течение REALERT_COOLDOWN_MINUTES.
+    last_found: dict[str, datetime] = {}
+    for item in results:
+        item_url = str(item.get("url", ""))
+        if not item_url:
+            continue
+        try:
+            found = datetime.fromisoformat(str(item.get("found_at", "")))
+        except ValueError:
+            continue
+        if found.tzinfo is None:
+            found = found.astimezone()
+        if item_url not in last_found or found > last_found[item_url]:
+            last_found[item_url] = found
     new_entries: list[dict[str, Any]] = []
     failed_channels: list[str] = []
 
@@ -753,8 +835,11 @@ def process_cycle(
             if channel_baseline or not is_new_message:
                 continue
             for url in message["urls"]:
-                if url in known_urls:
-                    continue
+                previous = last_found.get(url)
+                if previous and now - previous <= timedelta(
+                    minutes=REALERT_COOLDOWN_MINUTES
+                ):
+                    continue  # недавно уже оповещали об этом колесе
                 entry = {
                     "url": url,
                     "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -767,7 +852,7 @@ def process_cycle(
                 entry["notified"] = send_telegram_notification(entry)
                 results.append(entry)
                 new_entries.append(entry)
-                known_urls.add(url)
+                last_found[url] = now
                 log.info(
                     "%s Новая ссылка [@%s]: %s",
                     icon("link"),
@@ -800,7 +885,7 @@ def acquire_single_instance_lock() -> Any | None:
     Два процесса с одним токеном конфликтуют в getUpdates (409 Conflict),
     поэтому при старте берём эксклюзивную блокировку lock-файла.
     ОС снимает блокировку автоматически при любом завершении процесса,
-    так что «зависших» lock-файлов после падения не остаётся.
+    так что «зависших» lock-файлов после ��адения не остаётся.
     """
     lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
@@ -838,6 +923,18 @@ def main() -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, request_stop)
 
+    # channels.txt — единственный источник правды: при первом запуске
+    # фиксируем в нём стартовый список (из env или дефолтный).
+    if _SEED_CHANNELS_FILE:
+        save_channels_file()
+        log.info(
+            "%s Создан channels.txt (каналов: %s) — теперь это единственный источник правды",
+            icon("ok"),
+            len(CHANNELS),
+        )
+    for note_level, note in CHANNEL_LOAD_NOTES:
+        log.log(note_level, "%s %s", icon("warn") if note_level >= logging.WARNING else icon("bell"), note)
+
     seen, has_state = load_seen()
     results = load_results()
     if not OUTPUT_FILE.exists():
@@ -860,14 +957,34 @@ def main() -> int:
     baseline = not has_state and not ALERT_ON_FIRST_RUN
     if baseline:
         log.info("Первый запуск: создаю базовое состояние без старых уведомлений")
-    process_cycle(seen, results, baseline=baseline)
+
+    # Весь сетевой ввод-вывод — в отдельном daemon-потоке. Обработчик Ctrl+C
+    # выполняется только в главном потоке и не может прервать блокирующий
+    # сетевой вызов (особенно на Windows), поэтому главный поток должен
+    # только ждать STOP_EVENT — тогда сигнал обрабатывается мгновенно.
+    def parse_loop() -> None:
+        process_cycle(seen, results, baseline=baseline)
+        while not STOP_EVENT.is_set():
+            if STOP_EVENT.wait(CHECK_INTERVAL):
+                break
+            process_cycle(seen, results)
+
+    parser_thread = threading.Thread(target=parse_loop, name="parser", daemon=True)
+    parser_thread.start()
 
     while not STOP_EVENT.is_set():
-        if STOP_EVENT.wait(CHECK_INTERVAL):
-            break
-        process_cycle(seen, results)
+        STOP_EVENT.wait(1)
 
-    save_seen(seen)
+    # Даём циклу шанс корректно дописать файлы, но не ждём вечно.
+    parser_thread.join(timeout=REQUEST_TIMEOUT + 5)
+    if parser_thread.is_alive():
+        log.warning(
+            "%s Цикл не успел завершиться за отведённое время — выхожу; "
+            "состояние сохранено после предыдущего цикла",
+            icon("warn"),
+        )
+    else:
+        save_seen(seen)
     log.info("%s WheelsParser остановлен", icon("stop"))
     return 0
 
