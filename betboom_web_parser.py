@@ -46,6 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 CHANNELS_FILE = BASE_DIR / "channels.txt"
+KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 OUTPUT_FILE = BASE_DIR / "freebets.json"
 SEEN_FILE = BASE_DIR / "seen_ids.json"
 LOG_FILE = BASE_DIR / "parser.log"
@@ -58,6 +59,10 @@ DEFAULT_CHANNELS = [
     "obshakstaya", "meowbettt", "mechanogun", "Vophets", "GShikaryan",
     "acoolbazarit",
 ]
+
+# Ключевые слова по умолчанию. Поиск регистронезависимый:
+# «колесо», «Колесо» и «КОЛЕСО» — одно и то же слово.
+DEFAULT_KEYWORDS = ["колесо"]
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -86,6 +91,41 @@ def read_channels_file() -> list[str]:
         if value:
             channels.append(value)
     return list(dict.fromkeys(channels))
+
+
+def _dedupe_keywords(keywords: list[str]) -> list[str]:
+    """Убирает дубликаты без учёта регистра, сохраняя первое написание."""
+    unique: list[str] = []
+    seen_folded: set[str] = set()
+    for keyword in keywords:
+        folded = keyword.casefold()
+        if folded not in seen_folded:
+            seen_folded.add(folded)
+            unique.append(keyword)
+    return unique
+
+
+def read_keywords_file() -> list[str]:
+    keywords = []
+    for line in KEYWORDS_FILE.read_text(encoding="utf-8").splitlines():
+        value = line.split("#", 1)[0].strip()
+        if value:
+            keywords.append(value)
+    return _dedupe_keywords(keywords)
+
+
+def load_keywords() -> tuple[list[str], bool]:
+    """Возвращает (ключевые слова, нужно_ли_создать_keywords.txt).
+
+    keywords.txt — единственный источник правды (как channels.txt для каналов).
+    Если файла нет или он пуст, он создаётся со словами из DEFAULT_KEYWORDS.
+    """
+    if KEYWORDS_FILE.exists():
+        file_keywords = read_keywords_file()
+        if file_keywords:
+            return file_keywords, False
+
+    return DEFAULT_KEYWORDS.copy(), True
 
 
 # Сообщения о загрузке каналов; логгер на этом этапе ещё не создан,
@@ -130,6 +170,8 @@ def load_channels() -> tuple[list[str], bool]:
 
 CHANNELS, _SEED_CHANNELS_FILE = load_channels()
 CHANNELS_LOCK = threading.RLock()
+KEYWORDS, _SEED_KEYWORDS_FILE = load_keywords()
+KEYWORDS_LOCK = threading.RLock()
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
@@ -373,6 +415,21 @@ def find_urls(message: Any, text: str) -> list[str]:
     return urls
 
 
+def find_keywords(text: str) -> list[str]:
+    """Ключевые слова, найденные в тексте сообщения.
+
+    Поиск регистронезависимый (casefold): «Колесо», «КОЛЕСО» и «колесо»
+    совпадают. Ищется вхождение подстроки, поэтому «колесо» найдёт и
+    «колесом», «колесо!», «суперколесо».
+    """
+    if not text:
+        return []
+    lowered = text.casefold()
+    with KEYWORDS_LOCK:
+        keywords = list(KEYWORDS)
+    return [keyword for keyword in keywords if keyword.casefold() in lowered]
+
+
 def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
     url = f"https://t.me/s/{channel}"
     try:
@@ -430,6 +487,30 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
         return False
 
 
+def send_keyword_notification(entry: dict[str, Any]) -> bool:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    text = (
+        f"{icon('bell')} Ключевые слова: {', '.join(entry['keywords'])}\n"
+        f"Канал: @{entry['channel']}\n"
+        f"Найдено: {entry['found_at']}\n"
+        f"Текст: {entry['preview']}\n"
+        f"Пост: {entry['message_url']}"
+    )
+    endpoint = f"{BOT_API}/sendMessage"
+    try:
+        response = SESSION.post(
+            endpoint,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        log.error("Не удалось отправить уведомление о ключевых словах: %s", error)
+        return False
+
+
 # ----------------------------------------------------------------------------
 # Бот: команды /start /help /wheels /channels /add /remove
 # ----------------------------------------------------------------------------
@@ -442,6 +523,9 @@ BOT_COMMANDS = [
     {"command": "channels", "description": "Список каналов"},
     {"command": "add", "description": "Добавить канал: /add @channel"},
     {"command": "remove", "description": "Убрать канал: /remove @channel"},
+    {"command": "words", "description": "Список ключевых слов"},
+    {"command": "addword", "description": "Добавить слово: /addword колесо"},
+    {"command": "removeword", "description": "Убрать слово: /removeword колесо"},
     {"command": "help", "description": "Справка"},
 ]
 
@@ -582,6 +666,8 @@ def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def help_text() -> str:
     with CHANNELS_LOCK:
         total = len(CHANNELS)
+    with KEYWORDS_LOCK:
+        total_words = len(KEYWORDS)
     return (
         "<b>Команды:</b>\n"
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
@@ -590,8 +676,12 @@ def help_text() -> str:
         "/channels — список отслеживаемых каналов\n"
         "/add @channel — добавить канал\n"
         "/remove @channel — убрать канал\n"
+        "/words — список ключевых слов\n"
+        "/addword слово — добавить ключевое слово\n"
+        "/removeword слово — убрать ключевое слово\n"
         "/help — эта справка\n\n"
         f"Каналов под мониторингом: {total}\n"
+        f"Ключевых слов: {total_words}\n"
         f"Интервал проверки: {CHECK_INTERVAL} сек"
     )
 
@@ -617,6 +707,13 @@ def save_channels_file() -> None:
         lines = ["# Один публичный Telegram-канал на строку. Символ @ необязателен."]
         lines.extend(CHANNELS)
     CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def save_keywords_file() -> None:
+    with KEYWORDS_LOCK:
+        lines = ["# Одно ключевое слово (или фраза) на строку. Регистр не важен."]
+        lines.extend(KEYWORDS)
+    KEYWORDS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
@@ -769,6 +866,47 @@ def handle_command(chat_id: str, text: str) -> None:
             total = len(CHANNELS)
             listing = "\n".join(f"• @{html.escape(channel)}" for channel in CHANNELS)
         bot_send(chat_id, f"<b>Каналы ({total}):</b>\n{listing}")
+    elif command == "/words":
+        with KEYWORDS_LOCK:
+            total = len(KEYWORDS)
+            listing = "\n".join(f"• {html.escape(keyword)}" for keyword in KEYWORDS)
+        if not total:
+            bot_send(chat_id, "Ключевых слов пока нет. Добавьте: /addword колесо")
+        else:
+            bot_send(chat_id, f"<b>Ключевые слова ({total}):</b>\n{listing}")
+    elif command in ("/addword", "/removeword"):
+        keyword = argument.strip()
+        if not keyword or len(keyword) > 64:
+            bot_send(chat_id, f"Укажите слово: <code>{command} колесо</code>")
+            return
+        with KEYWORDS_LOCK:
+            existing = next(
+                (k for k in KEYWORDS if k.casefold() == keyword.casefold()), None
+            )
+            if command == "/addword":
+                if existing is not None:
+                    bot_send(chat_id, f"«{html.escape(existing)}» уже в списке.")
+                    return
+                KEYWORDS.append(keyword)
+                save_keywords_file()
+                total = len(KEYWORDS)
+                bot_send(
+                    chat_id,
+                    f"{icon('ok')} «{html.escape(keyword)}» добавлено. Слов: {total}",
+                )
+                log.info("Бот: слово %r добавлено, всего %s", keyword, total)
+            else:
+                if existing is None:
+                    bot_send(chat_id, f"«{html.escape(keyword)}» нет в списке.")
+                    return
+                KEYWORDS.remove(existing)
+                save_keywords_file()
+                total = len(KEYWORDS)
+                bot_send(
+                    chat_id,
+                    f"{icon('stop')} «{html.escape(existing)}» удалено. Слов: {total}",
+                )
+                log.info("Бот: слово %r удалено, всего %s", keyword, total)
     elif command in ("/add", "/remove"):
         match = USERNAME_RE.match(argument)
         if not match:
@@ -927,6 +1065,28 @@ def process_cycle(
                     url,
                     extra={"highlight": True},
                 )
+            # Поиск по ключевым словам — только для сообщений без ссылок,
+            # чтобы не дублировать уведомление о найденном колесе.
+            if not message["urls"]:
+                matched = find_keywords(message["text"])
+                if matched:
+                    entry = {
+                        "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "channel": channel,
+                        "msg_id": message["id"],
+                        "message_url": message["message_url"],
+                        "preview": message["text"][:200],
+                        "keywords": matched,
+                    }
+                    send_keyword_notification(entry)
+                    log.info(
+                        "%s Ключевые слова (%s) [@%s]: %s",
+                        icon("bell"),
+                        ", ".join(matched),
+                        channel,
+                        entry["message_url"],
+                        extra={"highlight": True},
+                    )
         if index < len(channels) - 1:
             STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
 
@@ -955,7 +1115,7 @@ def acquire_single_instance_lock() -> Any | None:
     """Не даёт запустить второй экземпляр парсера.
 
     Два процесса с одним токеном конфликтуют в getUpdates (409 Conflict),
-    поэтому при старте берём эксклюзивную блокировку lock-файла.
+    поэтому при старте берём эксклюзивну�� блокировку lock-файла.
     ОС снимает блокировку автоматически при любом завершении процесса,
     так что «зависших» lock-файлов после падения не остаётся.
     """
@@ -1004,6 +1164,13 @@ def main() -> int:
             icon("ok"),
             len(CHANNELS),
         )
+    if _SEED_KEYWORDS_FILE:
+        save_keywords_file()
+        log.info(
+            "%s Создан keywords.txt (ключевых слов: %s) — управляйте словами через файл или /addword и /removeword",
+            icon("ok"),
+            len(KEYWORDS),
+        )
     for note_level, note in CHANNEL_LOAD_NOTES:
         log.log(note_level, "%s %s", icon("warn") if note_level >= logging.WARNING else icon("bell"), note)
 
@@ -1014,9 +1181,10 @@ def main() -> int:
 
     notifications = "включены" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "выключены"
     log.info(
-        "%s WheelsParser запущен · каналов %s · интервал %ss",
+        "%s WheelsParser запущен · каналов %s · ключевых слов %s · интервал %ss",
         icon("start"),
         len(CHANNELS),
+        len(KEYWORDS),
         CHECK_INTERVAL,
     )
     log.info("%s Telegram-уведомления: %s", icon("bell"), notifications)
