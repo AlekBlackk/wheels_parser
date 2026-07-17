@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import json
 import logging
@@ -62,6 +63,11 @@ DEFAULT_CHANNELS = [
 
 # Ключевые слова по умолчанию. Поиск регистронезависимый:
 # «колесо», «Колесо» и «КОЛЕСО» — одно и то же слово.
+# Формат записи:
+#   слово    — поиск по границам слова с учётом русских окончаний
+#              («колесо» найдёт «колеса», «колесом», «колёсами»,
+#              но не «колесовать» и не «околесица»);
+#   *слово*  — поиск по подстроке (найдёт и «суперколесо»).
 DEFAULT_KEYWORDS = ["колесо"]
 
 
@@ -184,7 +190,22 @@ WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
 # сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
 MSK_TZ = timezone(timedelta(hours=3), "MSK")
 # Сколько вкладок Playwright проверяют колёса одновременно при /active.
-ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 4, 1)
+# Снижено с 8 до 3: каждая вкладка — отдельный renderer-процесс Chromium,
+# 8 параллельных рендеров тяжёлого CSR-сайта съедали весь CPU сервера
+# и подвешивали парсер/бот на время проверки.
+ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 3, 1)
+# Таймауты ожидания маркера состояния колеса (мс): базовый и увеличенный
+# для повторной попытки (холодный старт после рестарта, медленная сеть).
+# Не снижать: при 8000 мс страница BetBoom не успевает отрендерить маркер
+# даже с тёплым браузером — все колёса получают статус unknown.
+ACTIVE_WAIT_TIMEOUT_MS = env_int("ACTIVE_WAIT_TIMEOUT_MS", 12000, 1000)
+# Повтор при unknown: даём больше времени на прогрев браузера.
+# Выполняется при любом unknown: медленный рендер на слабом CPU — частая причина.
+ACTIVE_RETRY_TIMEOUT_MS = env_int("ACTIVE_RETRY_TIMEOUT_MS", 15000, 1000)
+# Браузер Playwright закрывается через N минут без /active (экономия ~200–400 МБ RAM).
+# Увеличено с 15 до 60 мин: холодный запуск Chromium — сам по себе пик CPU,
+# из-��а короткого таймаута почти каждый /active платил его заново.
+ACTIVE_IDLE_SHUTDOWN_MINUTES = env_int("ACTIVE_IDLE_SHUTDOWN_MINUTES", 60, 1)
 # Повторное уведомление о том же URL разрешено после этого кулдауна (мин).
 # Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
 # «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
@@ -372,7 +393,7 @@ def load_seen() -> tuple[dict[str, set[str]], bool]:
 def message_id_sort_key(message_id: str) -> int:
     """Числовой суффикс из data-post вида 'channel/12345'.
 
-    Лексикографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
+    Лексикографическа�� сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
     и при обрезке лимита свежие ID вылетали бы вместо старых.
     """
     try:
@@ -424,19 +445,69 @@ def find_urls(message: Any, text: str) -> list[str]:
     return urls
 
 
+# Частые русские окончания для поиска по границам слова: «колесо» найдёт
+# «колеса», «колесом», «колёсами». Порядок не влияет на корректность
+# (regex перебирает альтернативы с backtracking), но длинные идут первыми.
+_RU_ENDINGS = (
+    "ами", "ями", "ого", "его", "ому", "ему", "ыми", "ими",
+    "ая", "яя", "ое", "ее", "ые", "ие", "ой", "ей", "ом", "ем",
+    "ам", "ям", "ах", "ях", "ов", "ев", "ым", "им", "ых", "их",
+    "ую", "юю", "ий", "ый",
+    "а", "я", "о", "е", "у", "ю", "ы", "и", "й", "ь",
+)
+_WORD_CHARS = "0-9A-Za-zА-Яа-яЁё_"
+
+
+def _normalize_for_match(text: str) -> str:
+    """casefold + «ё» → «е», чтобы «колёса» совпадало с «колеса»."""
+    return text.casefold().replace("ё", "е")
+
+
+@functools.lru_cache(maxsize=256)
+def _keyword_regex(keyword: str) -> re.Pattern[str]:
+    """Компилирует регэксп для одного ключевого слова.
+
+    - «*слово*» — поиск по подстроке (старое поведение: найдёт «суперколесо»);
+    - «слово» — по границам слова с учётом русских окончаний:
+      «колесо» найдёт «колесо», «колеса», «колесом», «колёсами»,
+      но не «колесовать» и не «околесица».
+    Для фраз («фрибет колесо») окончания допускаются у каждого слова.
+    """
+    raw = _normalize_for_match(keyword.strip())
+    if raw.startswith("*") and raw.endswith("*") and len(raw) > 2:
+        return re.compile(re.escape(raw.strip("*")))
+    endings = "|".join(_RU_ENDINGS)
+    token_patterns: list[str] = []
+    for token in raw.split():
+        stem = token
+        # Окончание самого ключевого слова тоже отбрасываем:
+        # «колесо» → основа «колес» + любое окончание из списка.
+        for ending in _RU_ENDINGS:
+            if stem.endswith(ending) and len(stem) - len(ending) >= 3:
+                stem = stem[: len(stem) - len(ending)]
+                break
+        token_patterns.append(rf"{re.escape(stem)}(?:{endings})?")
+    body = r"\s+".join(token_patterns)
+    return re.compile(rf"(?<![{_WORD_CHARS}]){body}(?![{_WORD_CHARS}])")
+
+
 def find_keywords(text: str) -> list[str]:
     """Ключевые слова, найденные в тексте сообщения.
 
-    Поиск регистронезависимый (casefold): «Колесо», «КОЛЕСО» и «колесо»
-    совпадают. Ищется вхождение подстроки, поэтому «колесо» найдёт и
-    «колесом», «колесо!», «суперколесо».
+    Поиск регистронезависимый, «ё» и «е» считаются одной буквой.
+    «слово» ищется по границам слова с учётом окончаний,
+    «*слово*» — по подстроке (см. _keyword_regex).
     """
     if not text:
         return []
-    lowered = text.casefold()
+    normalized = _normalize_for_match(text)
     with KEYWORDS_LOCK:
         keywords = list(KEYWORDS)
-    return [keyword for keyword in keywords if keyword.casefold() in lowered]
+    return [
+        keyword
+        for keyword in keywords
+        if _keyword_regex(keyword).search(normalized)
+    ]
 
 
 def format_found_at(value: Any) -> str:
@@ -656,83 +727,339 @@ def _text_to_status(text: str) -> str:
     return "unknown"
 
 
-def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     """
     Проверяет список колёс и возвращает только активные.
     Если Playwright установлен — открывает один headless-браузер на весь список.
+
+    Возвращает None, если проверка вообще не выполнилась (н��пример, не
+    запустился браузер). None — это «сбой проверки», а НЕ «активных нет»:
+    вызывающий код должен сообщать об этих ситуациях по-разному.
     """
     if HAS_PLAYWRIGHT:
         return _get_active_playwright(items)
     return _get_active_requests(items)
 
 
-_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}  # stylesheet не блокируем: страница может скрывать состояния через display:none
+
+# ---------------------------------------------------------------------------
+# Постоянный Playwright event loop + браузер.
+#
+# Браузер живёт между ��ызовами /active → cold start однократный.
+# Контекст — свежий на каждый вызов (миллисекунды) → чистые cookies/кэш.
+# Fire-and-forget: поток бота не блокируется; результат уходит через
+# PW_SESSION после завершения корутины в pw-loop.
+# Idle-shutdown: watchdog закрывает браузер после простоя
+# (ACTIVE_IDLE_SHUTDOWN_MINUTES мин), чтобы не занимать ~200–400 МБ RAM.
+# ---------------------------------------------------------------------------
+
+_pw_loop: asyncio.AbstractEventLoop | None = None
+_pw_loop_lock = threading.Lock()
+_pw_browser_obj: Any = None        # chromium Browser (None — закрыт)
+_pw_playwright_obj: Any = None     # Playwright instance
+_pw_last_use: float = 0.0          # time.monotonic() последнего /active
+_pw_active_lock = threading.Lock() # один /active за раз (non-blocking acquire)
+
+# Кэш завершившихся колёс на текущие сутки МСК: url -> "YYYY-MM-DD".
+# Завершившееся колесо не «оживает», поэтому повторные /active за день не
+# перепроверяют его через браузер — к вечеру это главный источник ускорения.
+# Доступ только из pw-loop (один поток) — блокировка не нужна.
+_expired_cache: dict[str, str] = {}
+
+# Отдельная HTTP-сессия для отправки результатов /active из pw-loop callback.
+# requests.Session не является потокобезопасной — BOT_SESSION принадлежит
+# только боту-потоку и нельзя использовать его из pw-loop.
+PW_SESSION = build_session()
 
 
-def _get_active_playwright(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Синхронная обёртка: запускает параллельную проверку колёс."""
+def _get_pw_loop() -> asyncio.AbstractEventLoop:
+    """Возвращает (создавая при необходимости) постоянный event loop для Playwright."""
+    global _pw_loop
+    with _pw_loop_lock:
+        if _pw_loop is None or _pw_loop.is_closed():
+            loop = asyncio.new_event_loop()
+            _pw_loop = loop
+            t = threading.Thread(target=loop.run_forever, daemon=True, name="pw-loop")
+            t.start()
+            asyncio.run_coroutine_threadsafe(_pw_idle_watchdog(), loop)
+    return _pw_loop
+
+
+async def _close_pw_browser() -> None:
+    """Закрывает браузер и playwright-экземпляр (только внутри pw-loop)."""
+    global _pw_browser_obj, _pw_playwright_obj
+    if _pw_browser_obj is not None:
+        try:
+            await _pw_browser_obj.close()
+        except Exception:
+            pass
+        _pw_browser_obj = None
+    if _pw_playwright_obj is not None:
+        try:
+            await _pw_playwright_obj.stop()
+        except Exception:
+            pass
+        _pw_playwright_obj = None
+
+
+async def _pw_idle_watchdog() -> None:
+    """Закрывает браузер после ACTIVE_IDLE_SHUTDOWN_MINUTES минут без /active."""
+    while True:
+        await asyncio.sleep(60)
+        if _pw_browser_obj is None:
+            continue
+        idle_secs = time.monotonic() - _pw_last_use
+        if idle_secs > ACTIVE_IDLE_SHUTDOWN_MINUTES * 60:
+            log.info(
+                "Playwright: браузер закрыт по таймауту простоя (%d мин)",
+                ACTIVE_IDLE_SHUTDOWN_MINUTES,
+            )
+            await _close_pw_browser()
+
+
+async def _ensure_pw_browser() -> Any:
+    """Возвращает живой Browser, создаёт/перезапускает при необходимости.
+
+    Вызывается только внутри pw-loop.
+    """
+    global _pw_browser_obj, _pw_playwright_obj
+    if _pw_browser_obj is not None and _pw_browser_obj.is_connected():
+        return _pw_browser_obj
+    await _close_pw_browser()  # чистим старые объекты при наличии
+    pw = await async_playwright().start()
+    _pw_playwright_obj = pw
+    browser = await pw.chromium.launch(headless=True)
+    _pw_browser_obj = browser
+    log.info("Playwright: браузер запущен")
+    return browser
+
+
+async def _pw_check_once(page: Any, url: str, wait_timeout_ms: int) -> str:
+    """Одна попытка: открыть URL и определить статус колеса."""
+    # commit — навигация завершена после первого байта; DOM ждём через wait_for_function.
+    await page.goto(url, timeout=15_000, wait_until="commit")
     try:
-        return asyncio.run(_get_active_playwright_async(items))
-    except Exception as error:
-        log.error("Playwright: проверка колёс не удалась: %s", error)
-        return []
+        await page.wait_for_function(_WAIT_JS, timeout=wait_timeout_ms)
+    except PlaywrightTimeout:
+        log.info(
+            "active-check: маркер не появился за %s мс на %s",
+            wait_timeout_ms,
+            url,
+        )
+    # evaluate быстрее inner_text: нет обхода CSSOM
+    text: str = await page.evaluate(
+        "() => document.body ? document.body.innerText : ''"
+    )
+    return _text_to_status(text)
 
 
 async def _get_active_playwright_async(
     items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     """Проверяет колёса параллельно (ACTIVE_CHECK_CONCURRENCY вкладок).
 
-    Раньше колёса проверялись по одному (до 50 сек на URL) — на десяток ссылок
-    уходили минуты. Теперь вкладки работают параллельно, а картинки/видео/шрифты
-    блокируются — текстовым маркерам они не нужны, а грузятся дольше всего.
+    Использует постоянный браузер и свежий контекст на каждый вызов.
+    Возвращает кортеж (active_items, unknown_count):
+      - active_items  — колёса со статусом active/soon;
+      - unknown_count — количество колёс с неопределённым статусом
+        (таймаут рендера); если > 0 — результат может быть неполным.
     """
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    # Чистим кэш от записей прошлых суток (сброс в 00:00 МСК, как и сам /active).
+    for stale_url in [u for u, d in _expired_cache.items() if d != today]:
+        _expired_cache.pop(stale_url, None)
+    browser = await _ensure_pw_browser()
+    context = await browser.new_context(
+        user_agent=HEADERS["User-Agent"],
+        extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
+        locale="ru-RU",
+    )
+
+    async def block_heavy(route: Any) -> None:
+        if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await context.route("**/*", block_heavy)
+
     found: list[tuple[int, dict[str, Any]]] = []
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
-            locale="ru-RU",
+    unknown_count = 0
+    semaphore = asyncio.Semaphore(ACTIVE_CHECK_CONCURRENCY)
+
+    async def check(index: int, item: dict[str, Any]) -> None:
+        nonlocal unknown_count
+        url = str(item.get("url", ""))
+        if not url:
+            return
+        if _expired_cache.get(url) == today:
+            log.info("active-check [cache]: %s → expired (кэш за сегодня)", url)
+            return
+        async with semaphore:
+            page = await context.new_page()
+            try:
+                status = "unknown"
+                try:
+                    status = await _pw_check_once(page, url, ACTIVE_WAIT_TIMEOUT_MS)
+                except Exception as error:
+                    log.warning(
+                        "%s active-check: ошибка на %s: %s",
+                        icon("warn"),
+                        url,
+                        error,
+                    )
+                if status == "unknown":
+                    # Ретрай: рендер BetBoom на слабом CPU может не уложиться
+                    # в базовый таймаут даже с тёплым браузером. Повторные
+                    # вызовы /active ускоряет кэш завершённых (_expired_cache).
+                    log.info(
+                        "active-check: статус unknown, повторная попытка: %s",
+                        url,
+                    )
+                    try:
+                        status = await _pw_check_once(
+                            page, url, ACTIVE_RETRY_TIMEOUT_MS
+                        )
+                    except Exception as error:
+                        log.warning(
+                            "%s active-check: повтор не удался на %s: %s",
+                            icon("warn"),
+                            url,
+                            error,
+                        )
+                log.info("active-check [playwright]: %s → %s", url, status)
+                if status in ("active", "soon"):
+                    found.append((index, item))
+                elif status == "expired":
+                    _expired_cache[url] = today
+                elif status == "unknown":
+                    unknown_count += 1
+            finally:
+                await page.close()
+
+    try:
+        await asyncio.gather(*(check(i, item) for i, item in enumerate(items)))
+    finally:
+        await context.close()
+
+    found.sort(key=lambda pair: pair[0])
+    return [item for _, item in found], unknown_count
+
+
+def _pw_bot_send(chat_id: str, text: str) -> None:
+    """bot_send через PW_SESSION (для вызова вне бот-потока)."""
+    try:
+        PW_SESSION.post(
+            f"{BOT_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        ).raise_for_status()
+    except requests.RequestException as error:
+        log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
+
+
+def _format_active_result(
+    active_items: list[dict[str, Any]] | None,
+    total: int,
+    unknown_count: int = 0,
+) -> str:
+    """Форматирует ответ команды /active для отправки в Telegram.
+
+    unknown_count > 0 означает, что часть колёс не удалось проверить
+    (таймаут рендера страницы) — результат может быть неполным.
+    """
+    if active_items is None:
+        return (
+            f"{icon('warn')} Не удалось проверить колёса: сбой запуска "
+            "браузера (Playwright/Chromium). Это ошибка проверки, а не "
+            "«активных нет» — подробности в parser.log.\n"
+            "Частая причина после перезапуска сервера: не установлен "
+            "браузер. Выполните: <code>playwright install chromium</code>"
+        )
+    # Все колёса вернули unknown — скорее всего таймаут при холодном старте.
+    if not active_items and unknown_count > 0 and unknown_count == total:
+        return (
+            f"{icon('warn')} Не удалось определить статус {total} колёс "
+            "(таймаут рендера страницы).\n"
+            "Вероятная причина: холодный старт браузера после перезапуска сервиса.\n"
+            "Попробуйте /active ещё раз через 10–15 секунд."
+        )
+    if not active_items:
+        suffix = (
+            f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
+            "результат может быть неполным."
+            if unknown_count
+            else ""
+        )
+        return (
+            f"{icon('warn')} Среди {total} колёс за сегодня "
+            "активных не найдено.\n"
+            f"Все розыгрыши уже завершились или ещё не начались.{suffix}"
+        )
+    suffix = (
+        f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
+        "список может быть неполным."
+        if unknown_count
+        else ""
+    )
+    lines = [
+        f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
+        f"{total} за сегодня):</b>"
+    ]
+    for item in active_items:
+        found_at = str(item.get("found_at", ""))
+        found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+        channel = html.escape(str(item.get("channel", "")))
+        url = html.escape(str(item.get("url", "")))
+        lines.append(f"• {found_time} — @{channel}\n{url}")
+    if suffix:
+        lines.append(suffix)
+    return "\n".join(lines)
+
+
+def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
+    """Fire-and-forget: отправляет проверку в pw-loop, немедленно возвращается.
+
+    Поток бота не блокируется. Результат придёт отдельным сообщением через
+    PW_SESSION после завершения корутины в pw-loop.
+    Если проверка уже идёт — бот сообщает об этом и возвращается.
+    """
+    global _pw_last_use
+
+    if not _pw_active_lock.acquire(blocking=False):
+        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
+        return
+
+    _pw_last_use = time.monotonic()
+    loop = _get_pw_loop()
+    total = len(unique_items)
+
+    async def _run_and_send() -> None:
+        global _pw_last_use, _pw_browser_obj
+        _pw_last_use = time.monotonic()
+        active_items: list[dict[str, Any]] | None = None
+        unknown_count = 0
+        try:
+            active_items, unknown_count = await _get_active_playwright_async(unique_items)
+        except Exception as error:
+            log.error("Playwright: проверка колёс не удалась: %s", error)
+            _pw_browser_obj = None  # следующий /active пересоздаст браузер
+        finally:
+            _pw_active_lock.release()
+
+        text = _format_active_result(active_items, total, unknown_count)
+        # Блокирующий HTTP-запрос выносим в executor, чтобы не стопорить pw-loop
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _pw_bot_send(chat_id, text)
         )
 
-        async def block_heavy(route: Any) -> None:
-            if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await context.route("**/*", block_heavy)
-
-        semaphore = asyncio.Semaphore(ACTIVE_CHECK_CONCURRENCY)
-
-        async def check(index: int, item: dict[str, Any]) -> None:
-            url = str(item.get("url", ""))
-            if not url:
-                return
-            async with semaphore:
-                page = await context.new_page()
-                try:
-                    await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
-                    try:
-                        await page.wait_for_function(_WAIT_JS, timeout=10_000)
-                    except PlaywrightTimeout:
-                        log.debug("Playwright: таймаут ожидания маркера на %s", url)
-                    text = await page.inner_text("body")
-                    status = _text_to_status(text)
-                    log.debug("active-check [playwright]: %s → %s", url, status)
-                    if status in ("active", "soon"):
-                        found.append((index, item))
-                except Exception as error:
-                    log.debug("Playwright: ошибка %s: %s", url, error)
-                finally:
-                    await page.close()
-
-        await asyncio.gather(*(check(i, item) for i, item in enumerate(items)))
-        await context.close()
-        await browser.close()
-    found.sort(key=lambda pair: pair[0])
-    return [item for _, item in found]
+    asyncio.run_coroutine_threadsafe(_run_and_send(), loop)
 
 
 def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -751,13 +1078,41 @@ def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             response = BOT_SESSION.get(url, timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
                 status = _text_to_status(response.text)
-                log.debug("active-check [requests]: %s → %s", url, status)
+                log.info("active-check [requests]: %s → %s", url, status)
                 if status in ("active", "soon"):
                     active.append(item)
         except requests.RequestException as error:
             log.debug("active-check requests ошибка %s: %s", url, error)
         time.sleep(0.5)
     return active
+
+
+def check_channel_preview(channel: str) -> str:
+    """Проверяет канал через t.me/s/<channel> перед добавлением в /add.
+
+    Возвращает:
+    - "ok" — канал существует и веб-превью отдаёт сообщения;
+    - "not_found" — канал не существует или приватный (404);
+    - "no_preview" — страница есть, но ленты сообщений нет: у канала
+      отключено веб-превью (или он пуст) — парсер не сможет его читать;
+    - "network_error" — проверить не удалось (сеть, 5xx и т.п.).
+
+    Вызывается из потока бота — используем BOT_SESSION.
+    """
+    try:
+        response = BOT_SESSION.get(
+            f"https://t.me/s/{channel}", timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException as error:
+        log.warning("Бот: не удалось проверить канал @%s: %s", channel, error)
+        return "network_error"
+    if response.status_code == 404:
+        return "not_found"
+    if response.status_code != 200:
+        return "network_error"
+    if "tgme_widget_message_wrap" in response.text:
+        return "ok"
+    return "no_preview"
 
 
 def help_text() -> str:
@@ -775,6 +1130,7 @@ def help_text() -> str:
         "/remove @channel — убрать канал\n"
         "/words — список ключевых слов\n"
         "/addword слово — добавить ключевое слово\n"
+        "    (слово — по границам слова, *слово* — по подстроке)\n"
         "/removeword слово — убрать ключевое слово\n"
         "/help — эта справка\n\n"
         f"Каналов под мониторингом: {total}\n"
@@ -808,7 +1164,11 @@ def save_channels_file() -> None:
 
 def save_keywords_file() -> None:
     with KEYWORDS_LOCK:
-        lines = ["# Одно ключевое слово (или фраза) на строку. Регистр не важен."]
+        lines = [
+            "# Одно ключевое слово (или фраза) на строку. Регистр не важен.",
+            "# слово — поиск по границам слова с учётом русских окончаний;",
+            "# *слово* — поиск по подстроке (найдёт и «суперколесо»).",
+        ]
         lines.extend(KEYWORDS)
     KEYWORDS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -939,35 +1299,26 @@ def handle_command(chat_id: str, text: str) -> None:
             )
             return
 
-        pw_note = "" if HAS_PLAYWRIGHT else " (⚠️ Playwright не установлен, результат может быть неточным)"
-        bot_send(
-            chat_id,
-            f"{icon('bell')} Проверяю все сохранённые колёса за сегодня…"
-            f"{pw_note} Немного подождите",
-        )
-
-        active_items = get_active_wheels(unique_items)
-
-        if not active_items:
+        if not HAS_PLAYWRIGHT:
+            # Fallback без Playwright: синхронная проверка (BetBoom — CSR, почти не работает).
             bot_send(
                 chat_id,
-                f"{icon('warn')} Среди {len(unique_items)} колёс за сегодня "
-                "активных не найдено.\n"
-                "Все розыгрыши уже завершились или ещё не начались.",
+                f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
+                " (⚠️ Playwright не установлен, результат может быть неточным)"
+                " Немного подождите",
             )
+            active_items = _get_active_requests(unique_items)
+            bot_send(chat_id, _format_active_result(active_items, len(unique_items)))
             return
 
-        lines = [
-            f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
-            f"{len(unique_items)} за сегодня):</b>"
-        ]
-        for item in active_items:
-            found_at = str(item.get("found_at", ""))
-            found_time = found_at[11:16] if len(found_at) >= 16 else found_at
-            channel = html.escape(str(item.get("channel", "")))
-            url = html.escape(str(item.get("url", "")))
-            lines.append(f"• {found_time} — @{channel}\n{url}")
-        bot_send(chat_id, "\n".join(lines))
+        # Fire-and-forget: поток бота не блокируется.
+        # Результат придёт отдельным сообщением после проверки в pw-loop.
+        bot_send(
+            chat_id,
+            f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
+            " Результат пришлю отдельным сообщением.",
+        )
+        _fire_active_check(chat_id, unique_items)
     elif command == "/channels":
         with CHANNELS_LOCK:
             total = len(CHANNELS)
@@ -985,6 +1336,15 @@ def handle_command(chat_id: str, text: str) -> None:
         keyword = argument.strip()
         if not keyword or len(keyword) > 64:
             bot_send(chat_id, f"Укажите слово: <code>{command} колесо</code>")
+            return
+        if "*" in keyword and not (
+            keyword.startswith("*") and keyword.endswith("*") and len(keyword) > 2
+        ):
+            bot_send(
+                chat_id,
+                "Звёздочки — только с обеих сторон: <code>*колесо*</code> "
+                "(поиск по подстроке). Без звёздочек — поиск по границам слова.",
+            )
             return
         with KEYWORDS_LOCK:
             existing = next(
@@ -1020,31 +1380,64 @@ def handle_command(chat_id: str, text: str) -> None:
             bot_send(chat_id, f"Укажите канал: <code>{command} @channel</code>")
             return
         channel = match.group(1)
-        with CHANNELS_LOCK:
-            if command == "/add":
+        if command == "/add":
+            with CHANNELS_LOCK:
+                already = channel in CHANNELS
+            if already:
+                bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
+                return
+            # Валидация до добавления. Сетевой запрос выполняем БЕЗ
+            # CHANNELS_LOCK, чтобы не бло��ировать основной цикл парсинга.
+            status = check_channel_preview(channel)
+            if status == "not_found":
+                bot_send(
+                    chat_id,
+                    f"{icon('warn')} @{html.escape(channel)} не найден: "
+                    "канал не существует или приватный. Не добавлен.",
+                )
+                return
+            if status == "no_preview":
+                bot_send(
+                    chat_id,
+                    f"{icon('warn')} У @{html.escape(channel)} недоступна лента "
+                    "t.me/s (веб-превью отключено или канал пуст) — парсер не "
+                    "сможет читать его сообщения. Не добавлен.",
+                )
+                return
+            note = (
+                ""
+                if status == "ok"
+                else (
+                    f"\n{icon('warn')} Проверить канал не удалось "
+                    "(сетевая ошибка) — добавлен без проверки."
+                )
+            )
+            with CHANNELS_LOCK:
                 if channel in CHANNELS:
                     bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
                     return
                 CHANNELS.append(channel)
                 save_channels_file()
                 total = len(CHANNELS)
-                bot_send(
-                    chat_id,
-                    f"{icon('ok')} @{html.escape(channel)} добавлен. Каналов: {total}",
-                )
-                log.info("Бот: канал @%s добавлен, всего %s", channel, total)
-            else:
+            bot_send(
+                chat_id,
+                f"{icon('ok')} @{html.escape(channel)} добавлен. "
+                f"Каналов: {total}{note}",
+            )
+            log.info("Бот: канал @%s добавлен, всего %s", channel, total)
+        else:
+            with CHANNELS_LOCK:
                 if channel not in CHANNELS:
-                    bot_send(chat_id, f"@{html.escape(channel)} нет в списке.")
+                    bot_send(chat_id, f"@{html.escape(channel)} нет в спис��е.")
                     return
                 CHANNELS.remove(channel)
                 save_channels_file()
                 total = len(CHANNELS)
-                bot_send(
-                    chat_id,
-                    f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}",
-                )
-                log.info("Бот: канал @%s удалён, всего %s", channel, total)
+            bot_send(
+                chat_id,
+                f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}",
+            )
+            log.info("Бот: канал @%s удалён, всего %s", channel, total)
 
 
 def bot_loop() -> None:
@@ -1337,6 +1730,15 @@ def main() -> int:
         )
     else:
         save_seen(seen)
+    # Закрываем Playwright-браузер, если он был запущен
+    with _pw_loop_lock:
+        _loop_ref = _pw_loop
+    if HAS_PLAYWRIGHT and _loop_ref is not None and not _loop_ref.is_closed():
+        _fut = asyncio.run_coroutine_threadsafe(_close_pw_browser(), _loop_ref)
+        try:
+            _fut.result(timeout=5)
+        except Exception:
+            pass
     log.info("%s WheelsParser остановлен", icon("stop"))
     return 0
 
