@@ -21,6 +21,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Установка браузера...
+playwright install chromium
+if errorlevel 1 (
+    echo Не удалось установить браузер для Playwright.
+    pause
+    exit /b 1
+)
+
 echo Запуск WheelsParser...
 python betboom_web_parser.py
 pause
