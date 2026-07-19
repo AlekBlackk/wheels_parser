@@ -70,3 +70,6 @@ class ApiCheckTests(unittest.TestCase):
 class RegressionTests(unittest.TestCase):
     def test_active_check_module_does_not_require_playwright(self):
         self.assertFalse(hasattr(parser, "async_playwright"))
+
+    def test_active_max_age_is_twenty_hours_by_default(self):
+        self.assertEqual(parser.ACTIVE_MAX_AGE_HOURS, 20)

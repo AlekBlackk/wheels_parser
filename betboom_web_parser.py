@@ -178,6 +178,7 @@ MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
 # При превышении старые записи отбрасываются в конце цикла.
 MAX_RESULTS = env_int("MAX_RESULTS", 5000, 100)
 WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
+ACTIVE_MAX_AGE_HOURS = env_int("ACTIVE_MAX_AGE_HOURS", 20, 1)
 # /active смотрит только на колёса, найденные сегодня по МСК: счётчик «N из M»
 # сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
 MSK_TZ = timezone(timedelta(hours=3), "MSK")
@@ -1194,9 +1195,12 @@ def handle_command(chat_id: str, text: str) -> None:
             lines.append(f"• {found_time} — @{channel}\n{url}")
         bot_send(chat_id, "\n".join(lines))
     elif command == "/active":
-        # Сброс каждый день в 00:00 по МСК: показываем и проверяем только те
-        # колёса, что найдены с начала текущих суток по Москве.
-        cutoff = datetime.now(MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Показываем только колёса текущих суток по Москве и не старше заданного
+        # срока, чтобы зависшие записи не оставались в /active.
+        now_msk = datetime.now(MSK_TZ)
+        day_cutoff = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+        age_cutoff = now_msk - timedelta(hours=ACTIVE_MAX_AGE_HOURS)
+        cutoff = max(day_cutoff, age_cutoff)
         fresh_items: list[dict[str, Any]] = []
         for item in load_results():
             try:
@@ -1220,7 +1224,7 @@ def handle_command(chat_id: str, text: str) -> None:
         if not unique_items:
             bot_send(
                 chat_id,
-                "Сегодня (с 00:00 МСК) колёс ещё не найдено. "
+                f"За последние {ACTIVE_MAX_AGE_HOURS} часов колёс не найдено. "
                 "Как только появится ссылка — пришлю её сразу.",
             )
             return
