@@ -205,6 +205,8 @@ REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
 # Команды старше этого возраста (сек) подтверждаются, но не выполняются —
 # защита от бэклога getUpdates, накопившегося за время простоя парсера.
 STALE_COMMAND_SECONDS = env_int("STALE_COMMAND_SECONDS", 120, 10)
+# Уведомление о «мёртвом» канале после N подряд неудачных циклов.
+CHANNEL_FAIL_THRESHOLD = env_int("CHANNEL_FAIL_THRESHOLD", 5, 2)
 ALERT_ON_FIRST_RUN = env_bool("ALERT_ON_FIRST_RUN", False)
 USE_COLORS = env_bool("USE_COLORS", True)
 USE_ICONS = env_bool("USE_ICONS", True)
@@ -669,6 +671,27 @@ def send_keyword_notification(entry: dict[str, Any]) -> bool:
         return True
     except requests.RequestException as error:
         log.error("Не удалось отправить уведомление о ключевых словах: %s", error)
+        return False
+
+
+def send_service_notification(text: str) -> bool:
+    """Сервисное сообщение в доверенный чат (вызывается из parser-потока)."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    try:
+        response = SESSION.post(
+            f"{BOT_API}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        log.error("Не удалось отправить сервисное уведомление: %s", error)
         return False
 
 
@@ -1357,8 +1380,11 @@ def bot_loop() -> None:
             chat_id = str((message.get("chat") or {}).get("id", ""))
             if not chat_id or not text.startswith("/"):
                 continue
-            if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
-                continue  # игнорируем чужие чаты
+            if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
+                # Команды принимаем только из доверенного чата. Пустой
+                # TELEGRAM_CHAT_ID означал бы «командовать может кто угодно»,
+                # поэтому без него команды полностью отключены.
+                continue
             # Устаревшие команды (например, отправленные, пока парсер лежал)
             # подтверждаем сдвигом offset, но не выполняем: отвечать на
             # команды суточной давности бессмысленно и создаёт спам в чате.
@@ -1378,9 +1404,55 @@ def bot_loop() -> None:
             )
 
 
+# Мониторинг «мёртвых» каналов: счётчики подряд неудачных циклов per-канал.
+# Доступ только из parser-потока — блокировка не нужна.
+CHANNEL_FAIL_STREAK: dict[str, int] = {}
+CHANNEL_FAIL_ALERTED: set[str] = set()
+
+
+def _update_channel_fail_streaks(
+    checked_channels: list[str], failed_channels: list[str]
+) -> None:
+    """Обновляет счётчики недоступности и один раз уведомляет о «мёртвом» канале."""
+    failed = set(failed_channels)
+    for channel in checked_channels:
+        if channel in failed:
+            CHANNEL_FAIL_STREAK[channel] = CHANNEL_FAIL_STREAK.get(channel, 0) + 1
+            if (
+                CHANNEL_FAIL_STREAK[channel] >= CHANNEL_FAIL_THRESHOLD
+                and channel not in CHANNEL_FAIL_ALERTED
+            ):
+                CHANNEL_FAIL_ALERTED.add(channel)
+                log.warning(
+                    "%s Канал @%s недоступен %s циклов подряд — отправляю уведомление",
+                    icon("warn"),
+                    channel,
+                    CHANNEL_FAIL_STREAK[channel],
+                )
+                send_service_notification(
+                    f"{icon('warn')} Канал @{channel} недоступен "
+                    f"{CHANNEL_FAIL_STREAK[channel]} циклов подряд.\n"
+                    "Возможно, он удалён, стал приватным или отключил веб-превью.\n"
+                    f"Убрать из списка: /remove {channel}"
+                )
+        else:
+            # Канал снова доступен — сбрасываем счётчик и разрешаем
+            # повторное уведомление при следующей серии неудач.
+            CHANNEL_FAIL_STREAK.pop(channel, None)
+            CHANNEL_FAIL_ALERTED.discard(channel)
+    # Чистим счётчики каналов, удалённых через /remove.
+    with CHANNELS_LOCK:
+        current = set(CHANNELS)
+    for channel in list(CHANNEL_FAIL_STREAK):
+        if channel not in current:
+            CHANNEL_FAIL_STREAK.pop(channel, None)
+            CHANNEL_FAIL_ALERTED.discard(channel)
+
+
 def process_cycle(
     seen: dict[str, set[str]], results: list[dict[str, Any]], baseline: bool = False
 ) -> int:
+    cycle_started = time.monotonic()
     with CHANNELS_LOCK:
         total_channels = len(CHANNELS)
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), total_channels)
@@ -1404,6 +1476,7 @@ def process_cycle(
             last_found[item_url] = found
     new_entries: list[dict[str, Any]] = []
     failed_channels: list[str] = []
+    checked_channels: list[str] = []
 
     with CHANNELS_LOCK:
         channels = list(CHANNELS)
@@ -1412,6 +1485,7 @@ def process_cycle(
         if STOP_EVENT.is_set():
             break
         messages = fetch_channel(channel)
+        checked_channels.append(channel)
         if messages is None:
             failed_channels.append(channel)
             messages = []
@@ -1476,6 +1550,7 @@ def process_cycle(
         if index < len(channels) - 1:
             STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
 
+    _update_channel_fail_streaks(checked_channels, failed_channels)
     save_seen(seen)
     if new_entries:
         if len(results) > MAX_RESULTS:
@@ -1484,8 +1559,11 @@ def process_cycle(
             del results[: len(results) - MAX_RESULTS]
         atomic_write_json(OUTPUT_FILE, results)
     status_icon = icon("warn") if failed_channels else icon("ok")
+    # Следующий запуск отсчитывается от НАЧАЛА цикла (см. parse_loop).
+    elapsed = time.monotonic() - cycle_started
     next_at = (
-        datetime.now().astimezone() + timedelta(seconds=CHECK_INTERVAL)
+        datetime.now().astimezone()
+        + timedelta(seconds=max(5.0, CHECK_INTERVAL - elapsed))
     ).strftime("%H:%M:%S")
     suffix = "" if STOP_EVENT.is_set() else f" · следующая проверка в {next_at}"
     log.info(
@@ -1579,24 +1657,35 @@ def main() -> int:
     )
     log.info("%s Telegram-уведомления: %s", icon("bell"), notifications)
 
-    if TELEGRAM_BOT_TOKEN:
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         threading.Thread(target=bot_loop, name="bot", daemon=True).start()
         command_list = " ".join(f"/{item['command']}" for item in BOT_COMMANDS)
         log.info("%s Команды бота активны: %s", icon("bot"), command_list)
+    elif TELEGRAM_BOT_TOKEN:
+        log.warning(
+            "%s TELEGRAM_CHAT_ID не задан — команды бота отключены: "
+            "иначе управлять парсером мог бы любой пользователь Telegram",
+            icon("warn"),
+        )
 
     baseline = not has_state and not ALERT_ON_FIRST_RUN
     if baseline:
         log.info("Первый запуск: создаю базовое состояние без старых уведомлений")
 
     # Весь сетевой ввод-вывод — в отдельном daemon-потоке. Обработчик Ctrl+C
-    # выполняется только в главном потоке и не может прервать блокирующий
+    # выполняется только в главном по��оке и не может прервать блокирующий
     # сетевой вызов (особенно на Windows), поэтому главный поток должен
     # только ждать STOP_EVENT — тогда сигнал обрабатывается мгновенно.
     def parse_loop() -> None:
+        # Интервал отсчитывается от НАЧАЛА цикла: иначе реальный период
+        # равен «длительность цикла + CHECK_INTERVAL» и расписание дрейфует.
+        cycle_started = time.monotonic()
         process_cycle(seen, results, baseline=baseline)
         while not STOP_EVENT.is_set():
-            if STOP_EVENT.wait(CHECK_INTERVAL):
+            elapsed = time.monotonic() - cycle_started
+            if STOP_EVENT.wait(max(5.0, CHECK_INTERVAL - elapsed)):
                 break
+            cycle_started = time.monotonic()
             process_cycle(seen, results)
 
     parser_thread = threading.Thread(target=parse_loop, name="parser", daemon=True)
