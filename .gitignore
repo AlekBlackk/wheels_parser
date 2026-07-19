@@ -5,3 +5,9 @@ freebets.json
 .env
 keywords.txt
 channels.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.tmp
