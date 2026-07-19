@@ -6,7 +6,7 @@ WheelsParser отслеживает публичные Telegram-каналы и 
 
 - мониторинг публичных каналов через `https://t.me/s/<channel>` без Telegram API для чтения;
 - Telegram-уведомления через Bot API
-- использование Playwright для обхода динамического рендеринга (SPA) страниц BetBoom;
+- прямые запросы к API BetBoom для проверки статуса колёс;
 - интерактивные команды бота, которые можно увидеть, прописав `/help`;
 - управление списком каналов прямо из Telegram без правки `channels.txt`;
 - управление списком ключевых слов прямо из Telegram без правки `keywords.txt`;
@@ -59,13 +59,12 @@ WheelsParser отслеживает публичные Telegram-каналы и 
 2. Скопируйте `.env.example` в `.env` и заполните `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`.
 3. Запустите `run.bat`.
 
-Скрипт сам установит зависимости, скачает нужный браузер для Playwright и запустит парсер.
+Скрипт сам установит зависимости и запустит парсер.
 
 ## Обычный запуск
 
 ```bash
 python -m pip install -r requirements.txt
-playwright install chromium
 python betboom_web_parser.py
 ```
 
