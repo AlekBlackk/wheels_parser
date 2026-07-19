@@ -727,6 +727,18 @@ def _text_to_status(text: str) -> str:
     return "unknown"
 
 
+def _api_info_to_status(info: dict[str, Any]) -> str:
+    is_ended = info.get("is_ended")
+    if not isinstance(is_ended, bool):
+        return "unknown"
+    if is_ended:
+        return "expired"
+    is_early = info.get("is_early")
+    if not isinstance(is_early, bool):
+        return "unknown"
+    return "soon" if is_early else "active"
+
+
 def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     """
     Проверяет список колёс и возвращает только активные.
