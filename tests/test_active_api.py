@@ -57,3 +57,8 @@ class ApiCheckTests(unittest.TestCase):
             parser._check_wheel_api({"url": "https://betboom.ru/freestream/a"}, session),
             "unknown",
         )
+
+
+class RegressionTests(unittest.TestCase):
+    def test_active_check_module_does_not_require_playwright(self):
+        self.assertFalse(hasattr(parser, "async_playwright"))

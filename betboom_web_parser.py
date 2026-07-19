@@ -35,13 +35,6 @@ try:
 except ImportError:
     HAS_COLOR = False
 
-try:
-    from playwright.async_api import async_playwright
-    from playwright.async_api import TimeoutError as PlaywrightTimeout
-
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -829,222 +822,32 @@ def _get_active_api(
 
 def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     """
-    Проверяет список колёс и возвращает только активные.
-    Если Playwright установлен — открывает один headless-браузер на весь список.
+    Проверяет список колёс через BetBoom API и возвращает только активные.
 
-    Возвращает None, если проверка вообще не выполнилась (например, не
-    запустился браузер). None — это «сбой проверки», а НЕ «активных нет»:
-    вызывающий код должен сообщать об этих ситуациях по-разному.
+    Возвращает None, если проверка не выполнилась из-за ошибки. None — это
+    «сбой проверки», а НЕ «активных нет»: вызывающий код должен сообщать
+    об этих ситуациях по-разному.
     """
-    if HAS_PLAYWRIGHT:
-        return _get_active_playwright(items)
-    return _get_active_requests(items)
+    try:
+        active_items, unknown_count = _get_active_api(items)
+        return active_items
+    except Exception as error:
+        log.error("active-check: ошибка проверки: %s", error)
+        return None
 
 
-_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}  # stylesheet не блокируем: страница может скрывать состояния через display:none
-
-# ---------------------------------------------------------------------------
-# Постоянный Playwright event loop + браузер.
-#
-# Браузер живёт между ��ызовами /active → cold start однократный.
-# Контекст — свежий на каждый вызов (миллисекунды) → чистые cookies/кэш.
-# Fire-and-forget: поток бота не блокируется; результат уходит через
-# PW_SESSION после завершения корутины в pw-loop.
-# Idle-shutdown: watchdog закрывает браузер после простоя
-# (ACTIVE_IDLE_SHUTDOWN_MINUTES мин), чтобы не занимать ~200–400 МБ RAM.
-# ---------------------------------------------------------------------------
-
-_pw_loop: asyncio.AbstractEventLoop | None = None
-_pw_loop_lock = threading.Lock()
-_pw_browser_obj: Any = None        # chromium Browser (None — закрыт)
-_pw_playwright_obj: Any = None     # Playwright instance
-_pw_last_use: float = 0.0          # time.monotonic() последнего /active
-_pw_active_lock = threading.Lock() # один /active за раз (non-blocking acquire)
+# Один /active за раз (non-blocking acquire).
+_pw_active_lock = threading.Lock()
 
 # Кэш завершившихся колёс на текущие сутки МСК: url -> "YYYY-MM-DD".
 # Завершившееся колесо не «оживает», поэтому повторные /active за день не
-# перепроверяют его через браузер — к вечеру это главный источник ускорения.
-# Доступ только из pw-loop (один поток) — блокировка не нужна.
+# перепроверяют его через API — к вечеру это главный источник ускорения.
 _expired_cache: dict[str, str] = {}
 
-# Отдельная HTTP-сессия для отправки результатов /active из pw-loop callback.
+# Отдельная HTTP-сессия для отправки результатов /active из фонового потока.
 # requests.Session не является потокобезопасной — BOT_SESSION принадлежит
-# только боту-потоку и нельзя использовать его из pw-loop.
+# только боту-потоку и нельзя использовать его из фонового потока.
 PW_SESSION = build_session()
-
-
-def _get_pw_loop() -> asyncio.AbstractEventLoop:
-    """Возвращает (создавая при необходимости) постоянный event loop для Playwright."""
-    global _pw_loop
-    with _pw_loop_lock:
-        if _pw_loop is None or _pw_loop.is_closed():
-            loop = asyncio.new_event_loop()
-            _pw_loop = loop
-            t = threading.Thread(target=loop.run_forever, daemon=True, name="pw-loop")
-            t.start()
-            asyncio.run_coroutine_threadsafe(_pw_idle_watchdog(), loop)
-    return _pw_loop
-
-
-async def _close_pw_browser() -> None:
-    """Закрывает браузер и playwright-экземпляр (только внутри pw-loop)."""
-    global _pw_browser_obj, _pw_playwright_obj
-    if _pw_browser_obj is not None:
-        try:
-            await _pw_browser_obj.close()
-        except Exception:
-            pass
-        _pw_browser_obj = None
-    if _pw_playwright_obj is not None:
-        try:
-            await _pw_playwright_obj.stop()
-        except Exception:
-            pass
-        _pw_playwright_obj = None
-
-
-async def _pw_idle_watchdog() -> None:
-    """Закрывает браузер после ACTIVE_IDLE_SHUTDOWN_MINUTES минут без /active."""
-    while True:
-        await asyncio.sleep(60)
-        if _pw_browser_obj is None:
-            continue
-        idle_secs = time.monotonic() - _pw_last_use
-        if idle_secs > ACTIVE_IDLE_SHUTDOWN_MINUTES * 60:
-            log.info(
-                "Playwright: браузер закрыт по таймауту простоя (%d мин)",
-                ACTIVE_IDLE_SHUTDOWN_MINUTES,
-            )
-            await _close_pw_browser()
-
-
-async def _ensure_pw_browser() -> Any:
-    """Возвращает живой Browser, создаёт/перезапускает при необходимости.
-
-    Вызывается только внутри pw-loop.
-    """
-    global _pw_browser_obj, _pw_playwright_obj
-    if _pw_browser_obj is not None and _pw_browser_obj.is_connected():
-        return _pw_browser_obj
-    await _close_pw_browser()  # чистим старые объекты при наличии
-    pw = await async_playwright().start()
-    _pw_playwright_obj = pw
-    browser = await pw.chromium.launch(headless=True)
-    _pw_browser_obj = browser
-    log.info("Playwright: браузер запущен")
-    return browser
-
-
-async def _pw_check_once(page: Any, url: str, wait_timeout_ms: int) -> str:
-    """Одна попытка: открыть URL и определить статус колеса."""
-    # commit — навигация завершена после первого байта; DOM ждём через wait_for_function.
-    await page.goto(url, timeout=15_000, wait_until="commit")
-    try:
-        await page.wait_for_function(_WAIT_JS, timeout=wait_timeout_ms)
-    except PlaywrightTimeout:
-        log.info(
-            "active-check: маркер не появился за %s мс на %s",
-            wait_timeout_ms,
-            url,
-        )
-    # evaluate быстрее inner_text: нет обхода CSSOM
-    text: str = await page.evaluate(
-        "() => document.body ? document.body.innerText : ''"
-    )
-    return _text_to_status(text)
-
-
-async def _get_active_playwright_async(
-    items: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """Проверяет колёса параллельно (ACTIVE_CHECK_CONCURRENCY вкладок).
-
-    Использует постоянный браузер и свежий контекст на каждый вызов.
-    Возвращает кортеж (active_items, unknown_count):
-      - active_items  — колёса со статусом active/soon;
-      - unknown_count — количество колёс с неопределённым статусом
-        (таймаут рендера); если > 0 — результат может быть неполным.
-    """
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
-    # Чистим кэш от записей прошлых суток (сброс в 00:00 МСК, как и сам /active).
-    for stale_url in [u for u, d in _expired_cache.items() if d != today]:
-        _expired_cache.pop(stale_url, None)
-    browser = await _ensure_pw_browser()
-    context = await browser.new_context(
-        user_agent=HEADERS["User-Agent"],
-        extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
-        locale="ru-RU",
-    )
-
-    async def block_heavy(route: Any) -> None:
-        if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
-            await route.abort()
-        else:
-            await route.continue_()
-
-    await context.route("**/*", block_heavy)
-
-    found: list[tuple[int, dict[str, Any]]] = []
-    unknown_count = 0
-    semaphore = asyncio.Semaphore(ACTIVE_CHECK_CONCURRENCY)
-
-    async def check(index: int, item: dict[str, Any]) -> None:
-        nonlocal unknown_count
-        url = str(item.get("url", ""))
-        if not url:
-            return
-        if _expired_cache.get(url) == today:
-            log.info("active-check [cache]: %s → expired (кэш за сегодня)", url)
-            return
-        async with semaphore:
-            page = await context.new_page()
-            try:
-                status = "unknown"
-                try:
-                    status = await _pw_check_once(page, url, ACTIVE_WAIT_TIMEOUT_MS)
-                except Exception as error:
-                    log.warning(
-                        "%s active-check: ошибка на %s: %s",
-                        icon("warn"),
-                        url,
-                        error,
-                    )
-                if status == "unknown":
-                    # Ретрай: рендер BetBoom на слабом CPU может не уложиться
-                    # в базовый таймаут даже с тёплым браузером. Повторные
-                    # вызовы /active ускоряет кэш завершённых (_expired_cache).
-                    log.info(
-                        "active-check: статус unknown, повторная попытка: %s",
-                        url,
-                    )
-                    try:
-                        status = await _pw_check_once(
-                            page, url, ACTIVE_RETRY_TIMEOUT_MS
-                        )
-                    except Exception as error:
-                        log.warning(
-                            "%s active-check: повтор не удался на %s: %s",
-                            icon("warn"),
-                            url,
-                            error,
-                        )
-                log.info("active-check [playwright]: %s → %s", url, status)
-                if status in ("active", "soon"):
-                    found.append((index, item))
-                elif status == "expired":
-                    _expired_cache[url] = today
-                elif status == "unknown":
-                    unknown_count += 1
-            finally:
-                await page.close()
-
-    try:
-        await asyncio.gather(*(check(i, item) for i, item in enumerate(items)))
-    finally:
-        await context.close()
-
-    found.sort(key=lambda pair: pair[0])
-    return [item for _, item in found], unknown_count
 
 
 def _pw_bot_send(chat_id: str, text: str) -> None:
@@ -1084,19 +887,16 @@ def _format_active_result(
     """
     if active_items is None:
         return (
-            f"{icon('warn')} Не удалось проверить колёса: сбой запуска "
-            "браузера (Playwright/Chromium). Это ошибка проверки, а не "
-            "«активных нет» — подробности в parser.log.\n"
-            "Частая причина после перезапуска сервера: не установлен "
-            "браузер. Выполните: <code>playwright install chromium</code>"
+            f"{icon('warn')} Не удалось проверить колёса через API BetBoom. "
+            "Это ошибка проверки, а не «активных нет» — "
+            "подробности в parser.log."
         )
-    # Все колёса вернули unknown — скорее всего таймаут при холодном старте.
+    # Все колёса вернули unknown — скорее всего сетевая ошибка.
     if not active_items and unknown_count > 0 and unknown_count == total:
         return (
             f"{icon('warn')} Не удалось определить статус {total} колёс "
-            "(таймаут рендера страницы).\n"
-            "Вероятная причина: холодный старт браузера после перезапуска сервиса.\n"
-            "Попробуйте /active ещё раз через 10–15 секунд."
+            "(API не ответил).\n"
+            "Попробуйте /active ещё раз через несколько секунд."
         )
     if not active_items:
         suffix = (
