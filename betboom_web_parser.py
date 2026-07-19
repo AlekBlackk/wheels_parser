@@ -220,6 +220,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+STREAMER_WHEEL_INFO_API = "https://betboom.ru/api/streamer-wheel/action/get-info"
 
 FREESTREAM_RE = re.compile(
     r"https?://(?:www\.)?betboom\.ru/freestream/[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-]+",
@@ -739,12 +740,99 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
     return "soon" if is_early else "active"
 
 
+def _freestream_url(url: str) -> str:
+    """Нормализует URL колеса: убирает query-string и фрагмент."""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _check_wheel_api(item: dict[str, Any], session: requests.Session) -> str:
+    """Запрашивает статус одного колеса через BetBoom API без браузера.
+
+    Возвращает 'active', 'soon', 'expired' или 'unknown' при любой ошибке.
+    """
+    url = _freestream_url(str(item.get("url", "")))
+    if not url:
+        return "unknown"
+    try:
+        response = session.post(
+            STREAMER_WHEEL_INFO_API,
+            json={"streamer_link": url},
+            headers={
+                **HEADERS,
+                "Accept": "application/json",
+                "X-Platform": "web",
+                "Referer": url,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            log.debug("active-check API: HTTP %s для %s", response.status_code, url)
+            return "unknown"
+        payload = response.json()
+        return _api_info_to_status(payload.get("info", {}))
+    except Exception as error:
+        log.debug("active-check API: ошибка для %s: %s", url, error)
+        return "unknown"
+
+
+def _get_active_api(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Проверяет список колёс через BetBoom API параллельно.
+
+    Использует ThreadPoolExecutor с ACTIVE_CHECK_CONCURRENCY потоками.
+    Кэширует expired-статусы в пределах текущих суток МСК.
+    Возвращает кортеж (active_items, unknown_count):
+      - active_items  — колёса со статусом active/soon (в исходном порядке);
+      - unknown_count — количество колёс с неопределённым статусом.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    # Чистим устаревшие записи кэша.
+    for stale_url in [u for u, d in list(_expired_cache.items()) if d != today]:
+        _expired_cache.pop(stale_url, None)
+
+    session = build_session()
+    results: list[tuple[int, str]] = []  # (original_index, status)
+    lock = threading.Lock()
+
+    def check(index: int, item: dict[str, Any]) -> None:
+        url = _freestream_url(str(item.get("url", "")))
+        if not url:
+            with lock:
+                results.append((index, "unknown"))
+            return
+        if _expired_cache.get(url) == today:
+            log.info("active-check [cache]: %s → expired (кэш за сегодня)", url)
+            with lock:
+                results.append((index, "expired"))
+            return
+        status = _check_wheel_api(item, session)
+        log.info("active-check [api]: %s → %s", url, status)
+        if status == "expired":
+            _expired_cache[url] = today
+        with lock:
+            results.append((index, status))
+
+    with ThreadPoolExecutor(max_workers=ACTIVE_CHECK_CONCURRENCY) as pool:
+        list(pool.map(lambda args: check(*args), enumerate(items)))
+
+    results.sort(key=lambda pair: pair[0])
+    active_items = [
+        items[i] for i, status in results if status in ("active", "soon")
+    ]
+    unknown_count = sum(1 for _, status in results if status == "unknown")
+    return active_items, unknown_count
+
+
 def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     """
     Проверяет список колёс и возвращает только активные.
     Если Playwright установлен — открывает один headless-браузер на весь список.
 
-    Возвращает None, если проверка вообще не выполнилась (н��пример, не
+    Возвращает None, если проверка вообще не выполнилась (например, не
     запустился браузер). None — это «сбой проверки», а НЕ «активных нет»:
     вызывающий код должен сообщать об этих ситуациях по-разному.
     """
@@ -976,6 +1064,14 @@ def _pw_bot_send(chat_id: str, text: str) -> None:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
+def _background_bot_send(chat_id: str, text: str) -> None:
+    """Отправляет сообщение в Telegram из фонового потока (active-api).
+
+    Использует PW_SESSION, чтобы не делить BOT_SESSION между потоками.
+    """
+    _pw_bot_send(chat_id, text)
+
+
 def _format_active_result(
     active_items: list[dict[str, Any]] | None,
     total: int,
@@ -1036,42 +1132,32 @@ def _format_active_result(
 
 
 def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
-    """Fire-and-forget: отправляет проверку в pw-loop, немедленно возвращается.
+    """Fire-and-forget: запускает API-проверку в daemon-потоке, немедленно возвращается.
 
     Поток бота не блокируется. Результат придёт отдельным сообщением через
-    PW_SESSION после завершения корутины в pw-loop.
+    _background_bot_send после завершения проверки в фоновом потоке.
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
-    global _pw_last_use
-
     if not _pw_active_lock.acquire(blocking=False):
         bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
         return
 
-    _pw_last_use = time.monotonic()
-    loop = _get_pw_loop()
     total = len(unique_items)
 
-    async def _run_and_send() -> None:
-        global _pw_last_use, _pw_browser_obj
-        _pw_last_use = time.monotonic()
+    def _run_and_send() -> None:
         active_items: list[dict[str, Any]] | None = None
         unknown_count = 0
         try:
-            active_items, unknown_count = await _get_active_playwright_async(unique_items)
+            active_items, unknown_count = _get_active_api(unique_items)
         except Exception as error:
-            log.error("Playwright: проверка колёс не удалась: %s", error)
-            _pw_browser_obj = None  # следующий /active пересоздаст браузер
+            log.error("active-check: проверка колёс не удалась: %s", error)
         finally:
             _pw_active_lock.release()
 
         text = _format_active_result(active_items, total, unknown_count)
-        # Блокирующий HTTP-запрос выносим в executor, чтобы не стопорить pw-loop
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _pw_bot_send(chat_id, text)
-        )
+        _background_bot_send(chat_id, text)
 
-    asyncio.run_coroutine_threadsafe(_run_and_send(), loop)
+    threading.Thread(target=_run_and_send, daemon=True, name="active-api").start()
 
 
 def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
