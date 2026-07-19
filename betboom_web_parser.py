@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import html
 import json
@@ -1197,20 +1196,8 @@ def handle_command(chat_id: str, text: str) -> None:
             )
             return
 
-        if not HAS_PLAYWRIGHT:
-            # Fallback без Playwright: синхронная проверка (BetBoom — CSR, почти не работает).
-            bot_send(
-                chat_id,
-                f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
-                " (⚠️ Playwright не установлен, результат может быть неточным)"
-                " Немного подождите",
-            )
-            active_items = _get_active_requests(unique_items)
-            bot_send(chat_id, _format_active_result(active_items, len(unique_items)))
-            return
-
         # Fire-and-forget: поток бота не блокируется.
-        # Результат придёт отдельным сообщением после проверки в pw-loop.
+        # Результат придёт отдельным сообщением после проверки в фоновом потоке.
         bot_send(
             chat_id,
             f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
@@ -1628,15 +1615,6 @@ def main() -> int:
         )
     else:
         save_seen(seen)
-    # Закрываем Playwright-браузер, если он был запущен
-    with _pw_loop_lock:
-        _loop_ref = _pw_loop
-    if HAS_PLAYWRIGHT and _loop_ref is not None and not _loop_ref.is_closed():
-        _fut = asyncio.run_coroutine_threadsafe(_close_pw_browser(), _loop_ref)
-        try:
-            _fut.result(timeout=5)
-        except Exception:
-            pass
     log.info("%s WheelsParser остановлен", icon("stop"))
     return 0
 
