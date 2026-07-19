@@ -756,9 +756,14 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
 
 
 def _freestream_url(url: str) -> str:
-    """Нормализует URL колеса: убирает query-string и фрагмент."""
-    parts = urlsplit(url)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    """Нормализует URL колеса для API, кэша и дедупликации."""
+    cleaned = str(url).strip().rstrip(TRAILING_PUNCTUATION)
+    parts = urlsplit(cleaned)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if netloc == "www.betboom.ru":
+        netloc = "betboom.ru"
+    return urlunsplit((scheme, netloc, parts.path.rstrip("/"), "", ""))
 
 
 def _check_wheel_api(item: dict[str, Any], session: requests.Session) -> str:
@@ -1202,11 +1207,12 @@ def handle_command(chat_id: str, text: str) -> None:
                 found = found.astimezone()
             if found >= cutoff:
                 fresh_items.append(item)
-        # Дедупликация по URL
+        # Дедупликация по каноническому URL. В найденных сообщениях могут
+        # отличаться query-параметры (utm и т.п.), но это всё равно одно колесо.
         seen_urls: set[str] = set()
         unique_items: list[dict[str, Any]] = []
         for item in reversed(fresh_items):  # сначала свежие
-            url = str(item.get("url", ""))
+            url = _freestream_url(str(item.get("url", "")))
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 unique_items.append(item)

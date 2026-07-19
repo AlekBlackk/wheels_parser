@@ -27,6 +27,14 @@ class ApiStatusTests(unittest.TestCase):
 
 
 class ApiCheckTests(unittest.TestCase):
+    def test_freestream_url_canonicalizes_host_query_and_trailing_slash(self):
+        self.assertEqual(
+            parser._freestream_url(
+                "https://WWW.BETBOOM.RU/freestream/demo/?utm_source=test#part"
+            ),
+            "https://betboom.ru/freestream/demo",
+        )
+
     def test_api_check_posts_normalized_freestream_url(self):
         response = Mock()
         response.status_code = 200
