@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import html
 import json
 import logging
@@ -355,18 +356,29 @@ def atomic_write_json(path: Path, data: Any) -> None:
     temporary.replace(path)
 
 
-def load_seen() -> tuple[dict[str, set[str]], bool]:
+def load_seen() -> tuple[dict[str, dict[str, str]], bool]:
     existed = SEEN_FILE.exists()
     raw = read_json(SEEN_FILE, {})
     if not isinstance(raw, dict):
         raw = {}
-    seen = {
-        channel: set(value if isinstance(value, list) else [])
-        for channel, value in raw.items()
-    }
+    seen: dict[str, dict[str, str]] = {}
+    for channel, value in raw.items():
+        if isinstance(value, dict):
+            # Новый формат: id сообщения -> хэш содержимого.
+            seen[channel] = {
+                str(message_id): str(content_hash or "")
+                for message_id, content_hash in value.items()
+            }
+        elif isinstance(value, list):
+            # Старый формат (список id): хэшей ещё нет. Пустая строка
+            # означает «содержимое неизвестно» — правкой не считается,
+            # хэш просто запоминается при следующем цикле.
+            seen[channel] = {str(message_id): "" for message_id in value}
+        else:
+            seen[channel] = {}
     with CHANNELS_LOCK:
         for channel in CHANNELS:
-            seen.setdefault(channel, set())
+            seen.setdefault(channel, {})
     has_state = existed and any(seen.values())
     return seen, has_state
 
@@ -383,15 +395,20 @@ def message_id_sort_key(message_id: str) -> int:
         return 0  # нестандартный ID уйдёт в начало и обрежется первым
 
 
-def save_seen(seen: dict[str, set[str]]) -> None:
+def save_seen(seen: dict[str, dict[str, str]]) -> None:
     with CHANNELS_LOCK:
         active = set(CHANNELS)
     # Каналы, удалённые через /remove, в файл не пишем — иначе seen_ids.json
     # копит их ID вечно. Из памяти (seen) не удаляем: если канал вернут через
     # /add до рестарта, старые сообщения не вызовут ложных уведомлений.
     serializable = {
-        channel: sorted(ids, key=message_id_sort_key)[-MAX_SEEN_PER_CHANNEL:]
-        for channel, ids in seen.items()
+        channel: {
+            message_id: messages[message_id]
+            for message_id in sorted(messages, key=message_id_sort_key)[
+                -MAX_SEEN_PER_CHANNEL:
+            ]
+        }
+        for channel, messages in seen.items()
         if channel in active
     }
     atomic_write_json(SEEN_FILE, serializable)
@@ -424,6 +441,19 @@ def find_urls(message: Any, text: str) -> list[str]:
         if normalized not in urls:
             urls.append(normalized)
     return urls
+
+
+def message_content_hash(text: str, urls: list[str]) -> str:
+    """Хэш содержимого сообщения для обнаружения правок постов.
+
+    Считается по нормализованному тексту (схлопнутые пробелы) и списку
+    найденных ссылок: правка href без изменения видимого текста тоже
+    меняет хэш. Усечён до 16 hex-символов — криптостойкость не нужна,
+    важна только смена значения при реальном изменении содержимого.
+    """
+    normalized = re.sub(r"\s+", " ", text).strip()
+    payload = normalized + "\n" + "\n".join(urls)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 # Частые русские окончания для поиска по границам слова: «колесо» найдёт
@@ -582,11 +612,13 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
             continue
         text_element = message.select_one(".tgme_widget_message_text")
         text = text_element.get_text(" ", strip=True) if text_element else ""
+        urls = find_urls(message, text)
         results.append({
             "id": message_id,
             "text": text,
             "preview_html": message_preview_html(text_element),
-            "urls": find_urls(message, text),
+            "urls": urls,
+            "hash": message_content_hash(text, urls),
             "message_url": f"https://t.me/{message_id}",
         })
     return results
@@ -595,8 +627,9 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
 def send_telegram_notification(entry: dict[str, Any]) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
+    source_note = " (пост отредактирован)" if entry.get("edited") else ""
     text = (
-        f"{icon('start')} Новая ссылка WheelsParser\n"
+        f"{icon('start')} Новая ссылка WheelsParser{source_note}\n"
         f"Канал: @{entry['channel']}\n"
         f"Найдено: {format_found_at(entry['found_at'])}\n"
         f"Ссылка: {entry['url']}\n"
@@ -902,7 +935,7 @@ def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
     if not _active_check_lock.acquire(blocking=False):
-        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
+        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подо��дите…")
         return
 
     total = len(unique_items)
@@ -1370,7 +1403,9 @@ def _update_channel_fail_streaks(
 
 
 def process_cycle(
-    seen: dict[str, set[str]], results: list[dict[str, Any]], baseline: bool = False
+    seen: dict[str, dict[str, str]],
+    results: list[dict[str, Any]],
+    baseline: bool = False,
 ) -> int:
     cycle_started = time.monotonic()
     with CHANNELS_LOCK:
@@ -1409,14 +1444,23 @@ def process_cycle(
         if messages is None:
             failed_channels.append(channel)
             messages = []
-        channel_seen = seen.setdefault(channel, set())
+        channel_seen = seen.setdefault(channel, {})
         # Канал, добавленный через /add на лету, сначала проходит «тихий» цикл,
         # чтобы не рассылать уведомления по его старым сообщениям.
         channel_baseline = baseline or (not channel_seen and not ALERT_ON_FIRST_RUN)
         for message in messages:
-            is_new_message = message["id"] not in channel_seen
-            channel_seen.add(message["id"])
-            if channel_baseline or not is_new_message:
+            previous_hash = channel_seen.get(message["id"])
+            is_new_message = previous_hash is None
+            # Правка поста: хэш содержимого изменился. Пустой сохранённый хэш
+            # означает «содержимое неизвестно» (миграция со старого формата
+            # seen_ids.json) — правкой не считаем, просто запоминаем хэш.
+            is_edited_message = (
+                not is_new_message
+                and bool(previous_hash)
+                and previous_hash != message["hash"]
+            )
+            channel_seen[message["id"]] = message["hash"]
+            if channel_baseline or not (is_new_message or is_edited_message):
                 continue
             for url in message["urls"]:
                 previous = last_found.get(url)
@@ -1431,6 +1475,7 @@ def process_cycle(
                     "msg_id": message["id"],
                     "message_url": message["message_url"],
                     "preview": message["text"][:200],
+                    "edited": is_edited_message,
                     "notified": False,
                 }
                 entry["notified"] = send_telegram_notification(entry)
@@ -1438,15 +1483,18 @@ def process_cycle(
                 new_entries.append(entry)
                 last_found[url] = now
                 log.info(
-                    "%s Новая ссылка [@%s]: %s",
+                    "%s %s [@%s]: %s",
                     icon("link"),
+                    "Ссылка из правки поста" if is_edited_message else "Новая ссылка",
                     channel,
                     url,
                     extra={"highlight": True},
                 )
-            # Поиск по ключевым словам — только для сообщений без ссылок,
-            # чтобы не дублировать уведомление о найденном колесе.
-            if not message["urls"]:
+            # Поиск по ключевым словам — только для новых сообщений без ссылок:
+            # ссылки не дублируют уведомление о найденном колесе, а правки
+            # постов проверяем лишь на ссылки — иначе каждая мелкая правка
+            # текста с ключевым словом слала бы повторное уведомление.
+            if is_new_message and not message["urls"]:
                 matched = find_keywords(message["text"])
                 if matched:
                     entry = {
