@@ -182,23 +182,8 @@ ACTIVE_MAX_AGE_HOURS = env_int("ACTIVE_MAX_AGE_HOURS", 20, 1)
 # /active смотрит только на колёса, найденные сегодня по МСК: счётчик «N из M»
 # сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
 MSK_TZ = timezone(timedelta(hours=3), "MSK")
-# Сколько вкладок Playwright проверяют колёса одновременно при /active.
-# Снижено с 8 до 3: каждая вкладка — отдельный renderer-процесс Chromium,
-# 8 параллельных рендеров тяжёлого CSR-сайта съедали весь CPU сервера
-# и подвешивали парсер/бот на время проверки.
+# Сколько потоков одновременно опрашивают API BetBoom при /active.
 ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 3, 1)
-# Таймауты ожидания маркера состояния колеса (мс): базовый и увеличенный
-# для повторной попытки (холодный старт после рестарта, медленная сеть).
-# Не снижать: при 8000 мс страница BetBoom не успевает отрендерить маркер
-# даже с тёплым браузером — все колёса получают статус unknown.
-ACTIVE_WAIT_TIMEOUT_MS = env_int("ACTIVE_WAIT_TIMEOUT_MS", 12000, 1000)
-# Повтор при unknown: даём больше времени на прогрев браузера.
-# Выполняется при любом unknown: медленный рендер на слабом CPU — частая причина.
-ACTIVE_RETRY_TIMEOUT_MS = env_int("ACTIVE_RETRY_TIMEOUT_MS", 15000, 1000)
-# Браузер Playwright закрывается через N минут без /active (экономия ~200–400 МБ RAM).
-# Увеличено с 15 до 60 мин: холодный запуск Chromium — сам по себе пик CPU,
-# из-��а короткого таймаута почти каждый /active платил его заново.
-ACTIVE_IDLE_SHUTDOWN_MINUTES = env_int("ACTIVE_IDLE_SHUTDOWN_MINUTES", 60, 1)
 # Повторное уведомление о том же URL разрешено после этого кулдауна (мин).
 # Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
 # «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
@@ -389,7 +374,7 @@ def load_seen() -> tuple[dict[str, set[str]], bool]:
 def message_id_sort_key(message_id: str) -> int:
     """Числовой суффикс из data-post вида 'channel/12345'.
 
-    Лексикографическа�� сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
+    Лексикографическая сортировка строк здесь опасна: 'channel/999' > 'channel/1000',
     и при обрезке лимита свежие ID вылетали бы вместо старых.
     """
     try:
@@ -715,35 +700,6 @@ BOT_COMMANDS = [
 ]
 
 
-# Маркеры состояния колеса — ищем их в отрендеренном HTML (Playwright)
-_ACTIVE_MARKERS = ("До розыгрыша",)
-_EXPIRED_MARKERS = ("Пока ждёшь следующий запуск", "Пока ждешь следующий запуск")
-_SOON_MARKERS = ("Акция скоро начнётся", "Акция скоро начнется")
-_ALL_MARKERS = _ACTIVE_MARKERS + _EXPIRED_MARKERS + _SOON_MARKERS
-
-# JS-предикат для wait_for_function — ждём появления любого из маркеров
-_WAIT_JS = """
-() => {
-    const t = document.body ? document.body.innerText : "";
-    return t.includes("До розыгрыша") ||
-           t.includes("Пока ждёшь") ||
-           t.includes("Пока ждешь") ||
-           t.includes("Акция скоро начнётся") ||
-           t.includes("Акция скоро начнется");
-}
-"""
-
-
-def _text_to_status(text: str) -> str:
-    if any(m in text for m in _ACTIVE_MARKERS):
-        return "active"
-    if any(m in text for m in _EXPIRED_MARKERS):
-        return "expired"
-    if any(m in text for m in _SOON_MARKERS):
-        return "soon"
-    return "unknown"
-
-
 def _api_info_to_status(info: dict[str, Any]) -> str:
     is_ended = info.get("is_ended")
     if not isinstance(is_ended, bool):
@@ -848,24 +804,8 @@ def _get_active_api(
     return active_items, unknown_count
 
 
-def get_active_wheels(items: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-    """
-    Проверяет список колёс через BetBoom API и возвращает только активные.
-
-    Возвращает None, если проверка не выполнилась из-за ошибки. None — это
-    «сбой проверки», а НЕ «активных нет»: вызывающий код должен сообщать
-    об этих ситуациях по-разному.
-    """
-    try:
-        active_items, unknown_count = _get_active_api(items)
-        return active_items
-    except Exception as error:
-        log.error("active-check: ошибка проверки: %s", error)
-        return None
-
-
 # Один /active за раз (non-blocking acquire).
-_pw_active_lock = threading.Lock()
+_active_check_lock = threading.Lock()
 
 # Кэш завершившихся колёс на текущие сутки МСК: url -> "YYYY-MM-DD".
 # Завершившееся колесо не «оживает», поэтому повторные /active за день не
@@ -875,13 +815,16 @@ _expired_cache: dict[str, str] = {}
 # Отдельная HTTP-сессия для отправки результатов /active из фонового потока.
 # requests.Session не является потокобезопасной — BOT_SESSION принадлежит
 # только боту-потоку и нельзя использовать его из фонового потока.
-PW_SESSION = build_session()
+ACTIVE_CHECK_SESSION = build_session()
 
 
-def _pw_bot_send(chat_id: str, text: str) -> None:
-    """bot_send через PW_SESSION (для вызова вне бот-потока)."""
+def _background_bot_send(chat_id: str, text: str) -> None:
+    """Отправляет сообщение в Telegram из фонового потока (active-api).
+
+    Использует ACTIVE_CHECK_SESSION, чтобы не делить BOT_SESSION между потоками.
+    """
     try:
-        PW_SESSION.post(
+        ACTIVE_CHECK_SESSION.post(
             f"{BOT_API}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -895,14 +838,6 @@ def _pw_bot_send(chat_id: str, text: str) -> None:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
-def _background_bot_send(chat_id: str, text: str) -> None:
-    """Отправляет сообщение в Telegram из фонового потока (active-api).
-
-    Использует PW_SESSION, чтобы не делить BOT_SESSION между потоками.
-    """
-    _pw_bot_send(chat_id, text)
-
-
 def _format_active_result(
     active_items: list[dict[str, Any]] | None,
     total: int,
@@ -911,7 +846,7 @@ def _format_active_result(
     """Форматирует ответ команды /active для отправки в Telegram.
 
     unknown_count > 0 означает, что часть колёс не удалось проверить
-    (таймаут рендера страницы) — результат может быть неполным.
+    (таймаут или ошибка API) — результат может быть неполным.
     """
     if active_items is None:
         return (
@@ -966,7 +901,7 @@ def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None
     _background_bot_send после завершения проверки в фоновом потоке.
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
-    if not _pw_active_lock.acquire(blocking=False):
+    if not _active_check_lock.acquire(blocking=False):
         bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
         return
 
@@ -980,37 +915,12 @@ def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None
         except Exception as error:
             log.error("active-check: проверка колёс не удалась: %s", error)
         finally:
-            _pw_active_lock.release()
+            _active_check_lock.release()
 
         text = _format_active_result(active_items, total, unknown_count)
         _background_bot_send(chat_id, text)
 
     threading.Thread(target=_run_and_send, daemon=True, name="active-api").start()
-
-
-def _get_active_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Fallback через requests — работает только если сайт делает SSR.
-    Для BetBoom (чистый CSR) практически не работает, но оставляем как запасной вариант.
-    """
-    active: list[dict[str, Any]] = []
-    for item in items:
-        url = str(item.get("url", ""))
-        if not url:
-            continue
-        try:
-            # Вызывается из потока бота (/active) — используем BOT_SESSION,
-            # чтобы не делить requests.Session между потоками.
-            response = BOT_SESSION.get(url, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                status = _text_to_status(response.text)
-                log.info("active-check [requests]: %s → %s", url, status)
-                if status in ("active", "soon"):
-                    active.append(item)
-        except requests.RequestException as error:
-            log.debug("active-check requests ошибка %s: %s", url, error)
-        time.sleep(0.5)
-    return active
 
 
 def check_channel_preview(channel: str) -> str:
@@ -1305,7 +1215,7 @@ def handle_command(chat_id: str, text: str) -> None:
                 bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
                 return
             # Валидация до добавления. Сетевой запрос выполняем БЕЗ
-            # CHANNELS_LOCK, чтобы не бло��ировать основной цикл парсинга.
+            # CHANNELS_LOCK, чтобы не блокировать основной цикл парсинга.
             status = check_channel_preview(channel)
             if status == "not_found":
                 bot_send(
@@ -1346,7 +1256,7 @@ def handle_command(chat_id: str, text: str) -> None:
         else:
             with CHANNELS_LOCK:
                 if channel not in CHANNELS:
-                    bot_send(chat_id, f"@{html.escape(channel)} нет в спис��е.")
+                    bot_send(chat_id, f"@{html.escape(channel)} нет в списке.")
                     return
                 CHANNELS.remove(channel)
                 save_channels_file()
@@ -1683,7 +1593,7 @@ def main() -> int:
         log.info("Первый запуск: создаю базовое состояние без старых уведомлений")
 
     # Весь сетевой ввод-вывод — в отдельном daemon-потоке. Обработчик Ctrl+C
-    # выполняется только в главном по��оке и не может прервать блокирующий
+    # выполняется только в главном потоке и не может прервать блокирующий
     # сетевой вызов (особенно на Windows), поэтому главный поток должен
     # только ждать STOP_EVENT — тогда сигнал обрабатывается мгновенно.
     def parse_loop() -> None:
