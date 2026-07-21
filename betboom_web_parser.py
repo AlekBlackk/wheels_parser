@@ -189,6 +189,11 @@ ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 3, 1)
 # Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
 # «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
 REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
+# Проверять колесо через API BetBoom перед отправкой уведомления. Посты
+# нередко содержат «хвосты» — старые href на прошлые колёса, невидимые
+# в Telegram, но попадающие в HTML-разметку (стример скопировал прошлый пост
+# и обновил только видимый текст). Завершившиеся колёса не рассылаются.
+PRECHECK_WHEELS = env_bool("PRECHECK_WHEELS", True)
 # Команды старше этого возраста (сек) подтверждаются, но не выполняются —
 # защита от бэклога getUpdates, накопившегося за время простоя парсера.
 STALE_COMMAND_SECONDS = env_int("STALE_COMMAND_SECONDS", 120, 10)
@@ -628,11 +633,19 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
     source_note = " (пост отредактирован)" if entry.get("edited") else ""
+    status_notes = {
+        "active": "колесо активно",
+        "soon": "розыгрыш ещё не начался",
+        "unknown": "не удалось проверить (API BetBoom не ответил)",
+    }
+    status_note = status_notes.get(str(entry.get("status", "")))
+    status_line = f"Статус: {status_note}\n" if status_note else ""
     text = (
         f"{icon('start')} Новая ссылка WheelsParser{source_note}\n"
         f"Канал: @{entry['channel']}\n"
         f"Найдено: {format_found_at(entry['found_at'])}\n"
         f"Ссылка: {entry['url']}\n"
+        f"{status_line}"
         f"Пост: {entry['message_url']}"
     )
     endpoint = f"{BOT_API}/sendMessage"
@@ -801,8 +814,11 @@ def _get_active_api(
 
     today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
     # Чистим устаревшие записи кэша.
-    for stale_url in [u for u, d in list(_expired_cache.items()) if d != today]:
-        _expired_cache.pop(stale_url, None)
+    with _expired_cache_lock:
+        for stale_url in [
+            u for u, d in list(_expired_cache.items()) if d != today
+        ]:
+            _expired_cache.pop(stale_url, None)
 
     session = build_session()
     results: list[tuple[int, str]] = []  # (original_index, status)
@@ -814,7 +830,9 @@ def _get_active_api(
             with lock:
                 results.append((index, "unknown"))
             return
-        if _expired_cache.get(url) == today:
+        with _expired_cache_lock:
+            cached_expired = _expired_cache.get(url) == today
+        if cached_expired:
             log.info("active-check [cache]: %s → expired (кэш за сегодня)", url)
             with lock:
                 results.append((index, "expired"))
@@ -822,7 +840,8 @@ def _get_active_api(
         status = _check_wheel_api(item, session)
         log.info("active-check [api]: %s → %s", url, status)
         if status == "expired":
-            _expired_cache[url] = today
+            with _expired_cache_lock:
+                _expired_cache[url] = today
         with lock:
             results.append((index, status))
 
@@ -843,7 +862,34 @@ _active_check_lock = threading.Lock()
 # Кэш завершившихся колёс на текущие сутки МСК: url -> "YYYY-MM-DD".
 # Завершившееся колесо не «оживает», поэтому повторные /active за день не
 # перепроверяют его через API — к вечеру это главный источник ускорения.
+# Кэш общий для parser-потока (precheck перед уведомлением) и фонового
+# active-api-потока, поэтому доступ — только под _expired_cache_lock.
 _expired_cache: dict[str, str] = {}
+_expired_cache_lock = threading.Lock()
+
+
+def precheck_wheel_status(url: str) -> str:
+    """Статус колеса перед отправкой уведомления (вызывается из parser-потока).
+
+    Возвращает 'active', 'soon', 'expired' или 'unknown'. При 'unknown'
+    уведомление всё равно отправляется (fail-open): лучше лишний раз
+    оповестить, чем пропустить живое колесо из-за сбоя API.
+    Использует SESSION — она принадлежит parser-потоку.
+    """
+    canonical = _freestream_url(url)
+    if not canonical:
+        return "unknown"
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    with _expired_cache_lock:
+        if _expired_cache.get(canonical) == today:
+            log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
+            return "expired"
+    status = _check_wheel_api({"url": canonical}, SESSION)
+    log.info("precheck [api]: %s → %s", canonical, status)
+    if status == "expired":
+        with _expired_cache_lock:
+            _expired_cache[canonical] = today
+    return status
 
 # Отдельная HTTP-сессия для отправки результатов /active из фонового потока.
 # requests.Session не является потокобезопасной — BOT_SESSION принадлежит
@@ -1468,6 +1514,20 @@ def process_cycle(
                     minutes=REALERT_COOLDOWN_MINUTES
                 ):
                     continue  # недавно уже оповещали об этом колесе
+                # Проверяем колесо через API BetBoom до отправки: «хвосты» —
+                # старые href на прошлые (уже завершившиеся) колёса — молча
+                # пропускаем. Статусы 'active'/'soon'/'unknown' рассылаются,
+                # unknown — fail-open, чтобы не терять живые колёса при сбое API.
+                status = precheck_wheel_status(url) if PRECHECK_WHEELS else ""
+                if status == "expired":
+                    log.info(
+                        "%s Пропускаю %s [@%s]: колесо уже завершилось (API BetBoom)",
+                        icon("warn"),
+                        url,
+                        channel,
+                    )
+                    last_found[url] = now
+                    continue
                 entry = {
                     "url": url,
                     "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1476,6 +1536,7 @@ def process_cycle(
                     "message_url": message["message_url"],
                     "preview": message["text"][:200],
                     "edited": is_edited_message,
+                    "status": status,
                     "notified": False,
                 }
                 entry["notified"] = send_telegram_notification(entry)
