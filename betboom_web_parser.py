@@ -752,6 +752,29 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
         return "unknown"
     if is_ended:
         return "expired"
+    # is_ended у API BetBoom запаздывает: флаг не переключается по таймеру,
+    # и колесо может часами числиться «не завершённым» после окончания.
+    # Поэтому конец розыгрыша считаем сами: start_dttm + duration_min.
+    start_raw = info.get("start_dttm")
+    duration = info.get("duration_min")
+    if (
+        isinstance(start_raw, str)
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0
+    ):
+        try:
+            start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        except ValueError:
+            start = None
+        if start is not None and start.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+            if now >= start + timedelta(minutes=float(duration)):
+                return "expired"
+            if now < start:
+                return "soon"
+            return "active"
+    # Fallback: время посчитать не удалось — старое поведение по is_early.
     is_early = info.get("is_early")
     if not isinstance(is_early, bool):
         return "unknown"
@@ -981,7 +1004,7 @@ def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
     if not _active_check_lock.acquire(blocking=False):
-        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подо��дите…")
+        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
         return
 
     total = len(unique_items)
