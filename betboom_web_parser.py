@@ -48,6 +48,7 @@ TWITCH_CHANNELS_FILE = BASE_DIR / "twitch_channels.txt"
 OUTPUT_FILE = BASE_DIR / "freebets.json"
 SEEN_FILE = BASE_DIR / "seen_ids.json"
 BOT_STATE_FILE = BASE_DIR / "bot_state.json"
+REMOVED_WHEELS_FILE = BASE_DIR / "removed_wheels.json"
 LOG_FILE = BASE_DIR / "parser.log"
 LOCK_FILE = BASE_DIR / "wheelsparser.lock"
 
@@ -533,6 +534,62 @@ def load_results() -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+# ----------------------------------------------------------------------------
+# Удалённые вручную колёса (/removewheel)
+# ----------------------------------------------------------------------------
+# url -> "YYYY-MM-DD" (день удаления по МСК). Удалённое колесо скрывается из
+# /active до конца суток; сам /active и так сбрасывается в 00:00 МСК, поэтому
+# записи прошлых дней вычищаются автоматически. Файл переживает рестарт:
+# удалённое колесо не «воскресает» в /active после перезапуска парсера.
+REMOVED_WHEELS_LOCK = threading.Lock()
+
+
+def load_removed_wheels() -> dict[str, str]:
+    data = read_json(REMOVED_WHEELS_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(url): str(day)
+        for url, day in data.items()
+        if isinstance(url, str) and isinstance(day, str)
+    }
+
+
+REMOVED_WHEELS: dict[str, str] = load_removed_wheels()
+
+
+def _prune_removed_wheels_locked(today: str) -> None:
+    """Убирает записи прошлых суток. Вызывать только под REMOVED_WHEELS_LOCK."""
+    stale = [url for url, day in REMOVED_WHEELS.items() if day != today]
+    for url in stale:
+        del REMOVED_WHEELS[url]
+
+
+def removed_wheels_today() -> set[str]:
+    """Канонические URL колёс, удалённых сегодня командой /removewheel."""
+    today = now_msk().strftime("%Y-%m-%d")
+    with REMOVED_WHEELS_LOCK:
+        _prune_removed_wheels_locked(today)
+        return set(REMOVED_WHEELS)
+
+
+def mark_wheel_removed(url: str) -> bool:
+    """Помечает колесо удалённым до конца текущих суток МСК.
+
+    Возвращает True, если колесо помечено сейчас, и False, если оно уже
+    было удалено сегодня. Файл записывается атомарно, как остальные JSON.
+    """
+    today = now_msk().strftime("%Y-%m-%d")
+    with REMOVED_WHEELS_LOCK:
+        _prune_removed_wheels_locked(today)
+        if url in REMOVED_WHEELS:
+            return False
+        REMOVED_WHEELS[url] = today
+        snapshot = dict(REMOVED_WHEELS)
+    atomic_write_json(REMOVED_WHEELS_FILE, snapshot)
+    return True
+
+
 def normalize_url(url: str) -> str:
     """Единая каноническая форма URL колеса.
 
@@ -899,6 +956,7 @@ BOT_COMMANDS = [
     {"command": "start", "description": "О боте"},
     {"command": "wheels", "description": f"Колёса за последние {WHEELS_WINDOW_MINUTES} мин"},
     {"command": "active", "description": "Живые колёса за сегодня (сброс в 00:00 МСК)"},
+    {"command": "removewheel", "description": "Убрать колесо по номеру из /active: /removewheel 2"},
     {"command": "status", "description": "Статистика: всего / за сегодня / последняя"},
     {"command": "channels", "description": "Список каналов"},
     {"command": "add", "description": "Добавить канал: /add @channel"},
@@ -1120,7 +1178,16 @@ def _background_bot_send(chat_id: str, text: str) -> None:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
-def _format_active_item(item: dict[str, Any]) -> str:
+# Нумерация колёс из последнего ответа /active: номер → канонический URL.
+# По этим номерам работает /removewheel <номер>. Заполняется фоновым
+# active-api-потоком при формировании ответа, читается бот-потоком —
+# доступ только под локом. Хранится в памяти: после рестарта нужно сначала
+# вызвать /active, чтобы получить актуальные номера.
+_LAST_ACTIVE_LOCK = threading.Lock()
+_last_active_numbers: dict[int, str] = {}
+
+
+def _format_active_item(item: dict[str, Any], number: int) -> str:
     """Строка одного колеса в ответе /active."""
     found_at = str(item.get("found_at", ""))
     found_time = found_at[11:16] if len(found_at) >= 16 else found_at
@@ -1131,7 +1198,7 @@ def _format_active_item(item: dict[str, Any]) -> str:
         channel_label = f"@{channel}"
     # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
     url = html.escape(normalize_url(str(item.get("url", ""))))
-    return f"• {found_time} — {channel_label}\n{url}"
+    return f"{number}. {found_time} — {channel_label}\n{url}"
 
 
 def _format_active_result(
@@ -1166,6 +1233,8 @@ def _format_active_result(
         else ""
     )
     if not active_items:
+        with _LAST_ACTIVE_LOCK:
+            _last_active_numbers.clear()
         return (
             f"{icon('warn')} Среди {total} колёс за сегодня "
             "активных не найдено.\n"
@@ -1175,7 +1244,17 @@ def _format_active_result(
         f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
         f"{total} за сегодня):</b>"
     ]
-    lines.extend(_format_active_item(item) for item in active_items)
+    numbered = list(enumerate(active_items, start=1))
+    # Запоминаем нумерацию для /removewheel <номер>: номера действительны
+    # до следующего ответа /active.
+    with _LAST_ACTIVE_LOCK:
+        _last_active_numbers.clear()
+        for number, item in numbered:
+            _last_active_numbers[number] = _freestream_url(
+                str(item.get("url", ""))
+            )
+    lines.extend(_format_active_item(item, number) for number, item in numbered)
+    lines.append("\nУбрать колесо из списка: /removewheel номер")
     if suffix:
         lines.append(suffix)
     return "\n".join(lines)
@@ -1250,6 +1329,8 @@ def help_text() -> str:
         "<b>Команды:</b>\n"
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
         "/active — живые колёса за сегодня (сброс в 00:00 МСК)\n"
+        "/removewheel номер — убрать колесо из /active до конца суток\n"
+        "    (номер — из последнего ответа /active; можно и ссылкой)\n"
         "/status — статистика найденных ссылок\n"
         "/channels — список отслеживаемых каналов\n"
         "/add @channel — добавить канал\n"
@@ -1416,13 +1497,17 @@ def handle_command(chat_id: str, text: str) -> None:
                 fresh_items.append(item)
         # Дедупликация по каноническому URL. В найденных сообщениях могут
         # отличаться query-параметры (utm и т.п.), но это всё равно одно колесо.
+        removed_today = removed_wheels_today()
         seen_urls: set[str] = set()
         unique_items: list[dict[str, Any]] = []
         for item in reversed(fresh_items):  # сначала свежие
             url = _freestream_url(str(item.get("url", "")))
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                unique_items.append(item)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if url in removed_today:
+                continue  # удалено вручную через /removewheel
+            unique_items.append(item)
 
         if not unique_items:
             bot_send(
@@ -1440,6 +1525,59 @@ def handle_command(chat_id: str, text: str) -> None:
             " Результат пришлю отдельным сообщением.",
         )
         _fire_active_check(chat_id, unique_items)
+    elif command in ("/removewheel", "/delwheel"):
+        raw = argument.strip()
+        if not raw:
+            bot_send(
+                chat_id,
+                "Укажите номер колеса из ответа /active: "
+                "<code>/removewheel 2</code>\n"
+                "Работает и ссылка: "
+                "<code>/removewheel https://betboom.ru/freestream/...</code>\n"
+                "Колесо будет скрыто из /active до конца суток (00:00 МСК).",
+            )
+            return
+        if raw.isdigit():
+            number = int(raw)
+            with _LAST_ACTIVE_LOCK:
+                url = _last_active_numbers.get(number)
+                known = len(_last_active_numbers)
+            if not url:
+                if known:
+                    hint = f"В последнем ответе /active номера 1–{known}."
+                else:
+                    hint = (
+                        "Сначала вызовите /active — номера колёс берутся "
+                        "из его последнего ответа."
+                    )
+                bot_send(
+                    chat_id,
+                    f"{icon('warn')} Не нашёл колесо с номером {number}. {hint}",
+                )
+                return
+        else:
+            url = _freestream_url(raw)
+            if not url or not FREESTREAM_RE.match(url):
+                bot_send(
+                    chat_id,
+                    f"{icon('warn')} Укажите номер колеса из /active "
+                    "(например <code>/removewheel 2</code>) или ссылку вида "
+                    "<code>https://betboom.ru/freestream/...</code>",
+                )
+                return
+        if mark_wheel_removed(url):
+            log.info("Бот: колесо удалено из /active вручную: %s", url)
+            bot_send(
+                chat_id,
+                f"{icon('ok')} Колесо удалено и не будет показываться "
+                f"в /active до конца суток (00:00 МСК):\n{html.escape(url)}",
+            )
+        else:
+            bot_send(
+                chat_id,
+                "Это колесо уже удалено из /active. "
+                "Список обнулится в 00:00 МСК.",
+            )
     elif command == "/channels":
         with CHANNELS_LOCK:
             total = len(CHANNELS)
