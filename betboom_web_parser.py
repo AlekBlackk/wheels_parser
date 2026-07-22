@@ -792,9 +792,13 @@ def send_telegram_notification(
     status_note = status_notes.get(str(entry.get("status", "")))
     status_line = f"Статус: {status_note}\n" if status_note else ""
     if entry.get("source") == "twitch":
+        badge_icons = "".join(
+            TWITCH_ROLE_ICONS.get(role, "")
+            for role in entry.get("author_roles", [])
+        )
         origin_line = (
             f"Канал: twitch.tv/{entry['channel']} "
-            f"(сообщение от @{entry.get('author', '?')})\n"
+            f"(сообщение от {badge_icons}@{entry.get('author', '?')})\n"
         )
         post_line = f"Чат: {entry['message_url']}"
     else:
@@ -1399,7 +1403,7 @@ def handle_command(chat_id: str, text: str) -> None:
                 continue
             if found >= cutoff:
                 fresh_items.append(item)
-        # Дедупликация по каноническому URL. В найденных сообщениях могут
+        # Дедупликация по каноничному URL. В найденных сообщениях могут
         # отличаться query-параметры (utm и т.п.), но это всё равно одно колесо.
         seen_urls: set[str] = set()
         unique_items: list[dict[str, Any]] = []
@@ -1720,6 +1724,23 @@ def _mark_url_alert(url: str, when: datetime) -> None:
             LAST_URL_ALERT[url] = when
 
 
+def seed_url_alerts_from_history() -> None:
+    """Восстанавливает кулдаун уведомлений из freebets.json после рестарта.
+
+    Без этого Twitch-кулдаун жил только в памяти: после перезапуска парсера
+    та же ссылка могла уйти в Telegram повторно раньше времени.
+    """
+    for item in read_json(OUTPUT_FILE, []):
+        if not isinstance(item, dict):
+            continue
+        url = normalize_url(str(item.get("url", "")))
+        if not url:
+            continue
+        found = parse_found_at(item.get("found_at"))
+        if found is not None:
+            _mark_url_alert(url, found)
+
+
 def _parse_irc_line(line: str) -> tuple[dict[str, str], str, str, str]:
     """Разбирает строку IRC на (tags, prefix, command, rest)."""
     tags: dict[str, str] = {}
@@ -1735,14 +1756,23 @@ def _parse_irc_line(line: str) -> tuple[dict[str, str], str, str, str]:
     return tags, prefix, command, rest
 
 
-def _twitch_author_allowed(tags: dict[str, str], login: str) -> bool:
-    """Стример (broadcaster), модератор, VIP или известный бот из TWITCH_BOTS."""
-    for badge in tags.get("badges", "").split(","):
-        if badge.split("/", 1)[0] in ("broadcaster", "moderator", "vip"):
-            return True
-    if tags.get("mod") == "1":
-        return True
-    return login in TWITCH_BOTS
+TWITCH_ROLE_ICONS = {
+    "broadcaster": "🎥",
+    "moderator": "🗡",
+    "vip": "💎",
+    "bot": "🤖",
+}
+
+
+def _twitch_author_roles(tags: dict[str, str], login: str) -> list[str]:
+    """Роли автора: broadcaster/moderator/vip/bot. Пустой список — обычный зритель."""
+    badges = {badge.split("/", 1)[0] for badge in tags.get("badges", "").split(",")}
+    roles = [role for role in ("broadcaster", "moderator", "vip") if role in badges]
+    if "moderator" not in roles and tags.get("mod") == "1":
+        roles.append("moderator")
+    if login in TWITCH_BOTS:
+        roles.append("bot")
+    return roles
 
 
 def _handle_twitch_message(
@@ -1756,7 +1786,8 @@ def _handle_twitch_message(
             urls.append(normalized)
     if not urls:
         return
-    if not _twitch_author_allowed(tags, login):
+    roles = _twitch_author_roles(tags, login)
+    if not roles:
         log.info(
             "twitch [#%s]: ссылка от @%s проигнорирована (не стример/мод/VIP/бот)",
             channel,
@@ -1787,6 +1818,7 @@ def _handle_twitch_message(
             "channel": channel,
             "source": "twitch",
             "author": login,
+            "author_roles": roles,
             "msg_id": tags.get("id", ""),
             "message_url": f"https://www.twitch.tv/{channel}",
             "preview": text[:200],
@@ -1794,8 +1826,10 @@ def _handle_twitch_message(
             "status": status,
             "notified": False,
         }
-        entry["notified"] = send_telegram_notification(entry, TWITCH_HTTP_SESSION)
+        # Помечаем ДО отправки: даже при сбое уведомления повторной
+        # рассылки того же колеса в течение кулдауна не будет.
         _mark_url_alert(url, now)
+        entry["notified"] = send_telegram_notification(entry, TWITCH_HTTP_SESSION)
         TWITCH_NEW_ENTRIES.put(entry)
         log.info(
             "%s Новая ссылка из Twitch [#%s, от @%s]: %s",
@@ -2231,6 +2265,7 @@ def main() -> int:
         )
 
     if TWITCH_ENABLED:
+        seed_url_alerts_from_history()
         threading.Thread(target=twitch_loop, name="twitch", daemon=True).start()
         with TWITCH_CHANNELS_LOCK:
             twitch_total = len(TWITCH_CHANNELS)
