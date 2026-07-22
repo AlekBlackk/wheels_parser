@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -467,7 +467,26 @@ def normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, parts.path.rstrip("/"), "", ""))
 
 
-def find_urls(message: Any, text: str) -> list[str]:
+def _legacy_normalize_url(url: str) -> str:
+    """Нормализация URL старых версий парсера (query-параметры сохранялись).
+
+    Нужна только для миграции seen_ids.json: хэши сообщений, посчитанные
+    старой версией, содержат URL с query-параметрами. Сравнение с
+    «легаси»-хэшем позволяет не принять смену формата за правку поста
+    и не рассылать повторные уведомления после обновления парсера.
+    """
+    cleaned = str(url).strip().rstrip(TRAILING_PUNCTUATION)
+    parts = urlsplit(cleaned)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if netloc == "www.betboom.ru":
+        netloc = "betboom.ru"
+    return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+
+
+def _extract_urls(
+    message: Any, text: str, normalizer: Callable[[str], str]
+) -> list[str]:
     candidates = [link.get("href", "") for link in message.find_all("a", href=True)]
     candidates.extend(FREESTREAM_RE.findall(text))
     urls: list[str] = []
@@ -475,10 +494,14 @@ def find_urls(message: Any, text: str) -> list[str]:
         match = FREESTREAM_RE.match(candidate)
         if not match:
             continue
-        normalized = normalize_url(match.group(0))
+        normalized = normalizer(match.group(0))
         if normalized not in urls:
             urls.append(normalized)
     return urls
+
+
+def find_urls(message: Any, text: str) -> list[str]:
+    return _extract_urls(message, text, normalize_url)
 
 
 def message_content_hash(text: str, urls: list[str]) -> str:
@@ -656,6 +679,11 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
             "preview_html": message_preview_html(text_element),
             "urls": urls,
             "hash": message_content_hash(text, urls),
+            # Хэш в формате старых версий (URL с query-параметрами): сравнение
+            # с ним не даёт принять смену формата хэша за правку поста.
+            "legacy_hash": message_content_hash(
+                text, _extract_urls(message, text, _legacy_normalize_url)
+            ),
             "message_url": f"https://t.me/{message_id}",
         })
     return results
@@ -1578,10 +1606,14 @@ def process_cycle(
             # Правка поста: хэш содержимого изменился. Пустой сохранённый хэш
             # означает «содержимое неизвестно» (миграция со старого формата
             # seen_ids.json) — правкой не считаем, просто запоминаем хэш.
+            # Совпадение с legacy_hash (формат до канонизации URL) — тоже
+            # не правка: содержимое поста не менялось, изменился только
+            # способ расчёта хэша; сохранённый хэш молча обновляется ниже.
             is_edited_message = (
                 not is_new_message
                 and bool(previous_hash)
                 and previous_hash != message["hash"]
+                and previous_hash != message["legacy_hash"]
             )
             channel_seen[message["id"]] = message["hash"]
             if channel_baseline or not (is_new_message or is_edited_message):
