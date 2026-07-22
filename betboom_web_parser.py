@@ -985,13 +985,14 @@ def _check_wheel_api(item: dict[str, Any], session: requests.Session) -> str:
 
 def _get_active_api(
     items: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     """Проверяет список колёс через BetBoom API параллельно.
 
     Использует ThreadPoolExecutor с ACTIVE_CHECK_CONCURRENCY потоками.
     Кэширует expired-статусы в пределах текущих суток МСК.
-    Возвращает кортеж (active_items, unknown_count):
-      - active_items  — колёса со статусом active/soon (в исходном порядке);
+    Возвращает кортеж (active_items, soon_items, unknown_count):
+      - active_items  — колёса со статусом active (в исходном порядке);
+      - soon_items    — колёса, розыгрыш которых ещё не начался (soon);
       - unknown_count — количество колёс с неопределённым статусом.
     """
     from concurrent.futures import ThreadPoolExecutor
@@ -1044,11 +1045,10 @@ def _get_active_api(
         list(pool.map(lambda args: check(*args), enumerate(items)))
 
     results.sort(key=lambda pair: pair[0])
-    active_items = [
-        items[i] for i, status in results if status in ("active", "soon")
-    ]
+    active_items = [items[i] for i, status in results if status == "active"]
+    soon_items = [items[i] for i, status in results if status == "soon"]
     unknown_count = sum(1 for _, status in results if status == "unknown")
-    return active_items, unknown_count
+    return active_items, soon_items, unknown_count
 
 
 # Один /active за раз (non-blocking acquire).
@@ -1114,6 +1114,20 @@ def _background_bot_send(chat_id: str, text: str) -> None:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
+def _format_active_item(item: dict[str, Any]) -> str:
+    """Строка одного колеса в ответе /active."""
+    found_at = str(item.get("found_at", ""))
+    found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+    channel = html.escape(str(item.get("channel", "")))
+    if item.get("source") == "twitch":
+        channel_label = f"twitch.tv/{channel}"
+    else:
+        channel_label = f"@{channel}"
+    # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
+    url = html.escape(normalize_url(str(item.get("url", ""))))
+    return f"• {found_time} — {channel_label}\n{url}"
+
+
 def _format_active_result(
     active_items: list[dict[str, Any]] | None,
     total: int,
@@ -1121,6 +1135,8 @@ def _format_active_result(
 ) -> str:
     """Форматирует ответ команды /active для отправки в Telegram.
 
+    Показываются только действительно активные колёса: ещё не начавшиеся
+    (soon) и завершившиеся в ответ не попадают.
     unknown_count > 0 означает, что часть колёс не удалось проверить
     (таймаут или ошибка API) — результат может быть неполным.
     """
@@ -1137,35 +1153,23 @@ def _format_active_result(
             "(API не ответил).\n"
             "Попробуйте /active ещё раз через несколько секунд."
         )
+    suffix = (
+        f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
+        "результат может быть неполным."
+        if unknown_count
+        else ""
+    )
     if not active_items:
-        suffix = (
-            f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
-            "результат может быть неполным."
-            if unknown_count
-            else ""
-        )
         return (
             f"{icon('warn')} Среди {total} колёс за сегодня "
             "активных не найдено.\n"
             f"Все розыгрыши уже завершились или ещё не начались.{suffix}"
         )
-    suffix = (
-        f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
-        "список может быть неполным."
-        if unknown_count
-        else ""
-    )
     lines = [
         f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
         f"{total} за сегодня):</b>"
     ]
-    for item in active_items:
-        found_at = str(item.get("found_at", ""))
-        found_time = found_at[11:16] if len(found_at) >= 16 else found_at
-        channel = html.escape(str(item.get("channel", "")))
-        # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
-        url = html.escape(normalize_url(str(item.get("url", ""))))
-        lines.append(f"• {found_time} — @{channel}\n{url}")
+    lines.extend(_format_active_item(item) for item in active_items)
     if suffix:
         lines.append(suffix)
     return "\n".join(lines)
@@ -1188,7 +1192,8 @@ def _fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None
         active_items: list[dict[str, Any]] | None = None
         unknown_count = 0
         try:
-            active_items, unknown_count = _get_active_api(unique_items)
+            # soon-колёса (ещё не начались) в /active не показываются.
+            active_items, _soon_items, unknown_count = _get_active_api(unique_items)
         except Exception as error:
             log.error("active-check: проверка колёс не удалась: %s", error)
         finally:
@@ -1403,7 +1408,7 @@ def handle_command(chat_id: str, text: str) -> None:
                 continue
             if found >= cutoff:
                 fresh_items.append(item)
-        # Дедупликация по каноничному URL. В найденных сообщениях могут
+        # Дедупликация по каноническому URL. В найденных сообщениях могут
         # отличаться query-параметры (utm и т.п.), но это всё равно одно колесо.
         seen_urls: set[str] = set()
         unique_items: list[dict[str, Any]] = []
