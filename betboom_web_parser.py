@@ -9,9 +9,12 @@ import html
 import json
 import logging
 import os
+import queue
 import random
 import re
 import signal
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -41,6 +44,7 @@ load_dotenv(BASE_DIR / ".env")
 
 CHANNELS_FILE = BASE_DIR / "channels.txt"
 KEYWORDS_FILE = BASE_DIR / "keywords.txt"
+TWITCH_CHANNELS_FILE = BASE_DIR / "twitch_channels.txt"
 OUTPUT_FILE = BASE_DIR / "freebets.json"
 SEEN_FILE = BASE_DIR / "seen_ids.json"
 BOT_STATE_FILE = BASE_DIR / "bot_state.json"
@@ -168,10 +172,55 @@ def load_channels() -> tuple[list[str], bool]:
     return DEFAULT_CHANNELS.copy(), True
 
 
+def parse_twitch_channels(raw: str) -> list[str]:
+    channels = [
+        item.strip().lstrip("@#").lower()
+        for item in raw.split(",")
+        if item.strip()
+    ]
+    return list(dict.fromkeys(channels))
+
+
+def read_twitch_channels_file() -> list[str]:
+    channels = []
+    for line in TWITCH_CHANNELS_FILE.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        channels.append(value.lstrip("@").lower())
+    return list(dict.fromkeys(channels))
+
+
+def load_twitch_channels() -> tuple[list[str], bool]:
+    """Возвращает (twitch-каналы, нужно_ли_создать_twitch_channels_txt).
+
+    Источник правды — twitch_channels.txt (как channels.txt для Telegram).
+    Переменная WHEELSPARSER_TWITCH_CHANNELS используется только для первичной
+    инициализации, пока файла ещё нет; дальше все изменения (/addtwitch,
+    /removetwitch, ручная правка) живут в файле и переживают рестарт.
+    """
+    env_channels = parse_twitch_channels(
+        os.getenv("WHEELSPARSER_TWITCH_CHANNELS", "")
+    )
+    if TWITCH_CHANNELS_FILE.exists():
+        return read_twitch_channels_file(), False
+    if env_channels:
+        CHANNEL_LOAD_NOTES.append((
+            logging.INFO,
+            "Список Twitch-каналов из WHEELSPARSER_TWITCH_CHANNELS сохранён "
+            "в twitch_channels.txt; дальше управляйте каналами через файл "
+            "или команды /addtwitch и /removetwitch.",
+        ))
+        return env_channels, True
+    return [], False
+
+
 CHANNELS, _SEED_CHANNELS_FILE = load_channels()
 CHANNELS_LOCK = threading.RLock()
 KEYWORDS, _SEED_KEYWORDS_FILE = load_keywords()
 KEYWORDS_LOCK = threading.RLock()
+TWITCH_CHANNELS, _SEED_TWITCH_FILE = load_twitch_channels()
+TWITCH_CHANNELS_LOCK = threading.RLock()
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
@@ -207,6 +256,25 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+# --- Twitch ---
+# Мониторинг Twitch-чатов: анонимное IRC-подключение, токены и OAuth не нужны.
+# Реагируем ТОЛЬКО на ссылки betboom.ru/freestream от стримера, модераторов,
+# VIP и известных ботов; ключевые слова в Twitch-чатах не ищутся.
+TWITCH_ENABLED = env_bool("TWITCH_ENABLED", True)
+TWITCH_IRC_HOST = "irc.chat.twitch.tv"
+TWITCH_IRC_PORT = 6697
+TWITCH_USERNAME_RE = re.compile(r"^@?#?([A-Za-z0-9][A-Za-z0-9_]{2,24})$")
+# Известные чат-боты, чьим ссылкам доверяем: обычно колесо публикует бот
+# по команде стримера. Как правило, боты и так имеют бейдж модератора,
+# но проверка по имени страхует, если бейдж не выдан.
+DEFAULT_TWITCH_BOTS = [
+    "nightbot", "streamelements", "moobot", "fossabot", "wizebot", "streamlabs",
+]
+TWITCH_BOTS = {
+    name.strip().lstrip("@").lower()
+    for name in os.getenv("TWITCH_BOTS", ",".join(DEFAULT_TWITCH_BOTS)).split(",")
+    if name.strip()
+}
 STREAMER_WHEEL_INFO_API = "https://betboom.ru/api/streamer-wheel/action/get-info"
 
 FREESTREAM_RE = re.compile(
@@ -328,6 +396,22 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def _force_utf8_console() -> None:
+    """Перевод stdout/stderr в UTF-8 (актуально для Windows).
+
+    В cmd.exe/PowerShell консоль по умолчанию работает в cp866/cp1251:
+    эмодзи и часть символов вызывают UnicodeEncodeError или кракозябры.
+    errors="replace" гарантирует, что вывод не уронит парсер даже там,
+    где UTF-8 недоступен.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            continue
+
+
+_force_utf8_console()
 log = setup_logging()
 
 
@@ -456,9 +540,11 @@ def normalize_url(url: str) -> str:
     повторных уведомлений, в /active, в precheck и в кэше завершившихся
     колёс. Query-параметры (utm и т.п.) и завершающий «/» отбрасываются:
     это тот же адрес колеса, различия в хвосте не должны создавать дубликаты
-    и двойные уведомления.
+    и двойные уведомления. HTML-сущности (&amp; и т.п.) раскодируются:
+    ссылка могла быть извлечена из «сырого» HTML или сохранена
+    старой версией в экранированном виде.
     """
-    cleaned = str(url).strip().rstrip(TRAILING_PUNCTUATION)
+    cleaned = html.unescape(str(url)).strip().rstrip(TRAILING_PUNCTUATION)
     parts = urlsplit(cleaned)
     scheme = parts.scheme.lower()
     netloc = parts.netloc.lower()
@@ -660,7 +746,10 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
         log.warning("[%s] ошибка запроса: %s", channel, error)
         return None
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    # response.content вместо response.text: если сервер не указал charset,
+    # requests подставляет latin-1 и кириллица превращается в кракозябры.
+    # BeautifulSoup сам определяет UTF-8 по <meta charset> страницы.
+    soup = BeautifulSoup(response.content, "html.parser")
     messages = soup.select(".tgme_widget_message_wrap")[-MESSAGES_PER_CHANNEL:]
     results: list[dict[str, Any]] = []
     for message in messages:
@@ -689,7 +778,9 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
     return results
 
 
-def send_telegram_notification(entry: dict[str, Any]) -> bool:
+def send_telegram_notification(
+    entry: dict[str, Any], session: requests.Session | None = None
+) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
     source_note = " (пост отредактирован)" if entry.get("edited") else ""
@@ -700,17 +791,26 @@ def send_telegram_notification(entry: dict[str, Any]) -> bool:
     }
     status_note = status_notes.get(str(entry.get("status", "")))
     status_line = f"Статус: {status_note}\n" if status_note else ""
+    if entry.get("source") == "twitch":
+        origin_line = (
+            f"Канал: twitch.tv/{entry['channel']} "
+            f"(сообщение от @{entry.get('author', '?')})\n"
+        )
+        post_line = f"Чат: {entry['message_url']}"
+    else:
+        origin_line = f"Канал: @{entry['channel']}\n"
+        post_line = f"Пост: {entry['message_url']}"
     text = (
         f"{icon('start')} Новая ссылка WheelsParser{source_note}\n"
-        f"Канал: @{entry['channel']}\n"
+        f"{origin_line}"
         f"Найдено: {format_found_at(entry['found_at'])}\n"
         f"Ссылка: {entry['url']}\n"
         f"{status_line}"
-        f"Пост: {entry['message_url']}"
+        f"{post_line}"
     )
     endpoint = f"{BOT_API}/sendMessage"
     try:
-        response = SESSION.post(
+        response = (session or SESSION).post(
             endpoint,
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
             timeout=REQUEST_TIMEOUT,
@@ -802,6 +902,9 @@ BOT_COMMANDS = [
     {"command": "words", "description": "Список ключевых слов"},
     {"command": "addword", "description": "Добавить слово: /addword колесо"},
     {"command": "removeword", "description": "Убрать слово: /removeword колесо"},
+    {"command": "twitch", "description": "Список Twitch-каналов"},
+    {"command": "addtwitch", "description": "Добавить Twitch-канал: /addtwitch channel"},
+    {"command": "removetwitch", "description": "Убрать Twitch-канал: /removetwitch channel"},
     {"command": "help", "description": "Справка"},
 ]
 
@@ -956,7 +1059,9 @@ _expired_cache: dict[str, str] = {}
 _expired_cache_lock = threading.Lock()
 
 
-def precheck_wheel_status(url: str) -> str:
+def precheck_wheel_status(
+    url: str, session: requests.Session | None = None
+) -> str:
     """Статус колеса перед отправкой уведомления (вызывается из parser-потока).
 
     Возвращает 'active', 'soon', 'expired' или 'unknown'. При 'unknown'
@@ -972,7 +1077,7 @@ def precheck_wheel_status(url: str) -> str:
         if _expired_cache.get(canonical) == today:
             log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
             return "expired"
-    status = _check_wheel_api({"url": canonical}, SESSION)
+    status = _check_wheel_api({"url": canonical}, session or SESSION)
     log.info("precheck [api]: %s → %s", canonical, status)
     if status == "expired":
         with _expired_cache_lock:
@@ -1054,7 +1159,8 @@ def _format_active_result(
         found_at = str(item.get("found_at", ""))
         found_time = found_at[11:16] if len(found_at) >= 16 else found_at
         channel = html.escape(str(item.get("channel", "")))
-        url = html.escape(str(item.get("url", "")))
+        # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
+        url = html.escape(normalize_url(str(item.get("url", ""))))
         lines.append(f"• {found_time} — @{channel}\n{url}")
     if suffix:
         lines.append(suffix)
@@ -1123,6 +1229,8 @@ def help_text() -> str:
         total = len(CHANNELS)
     with KEYWORDS_LOCK:
         total_words = len(KEYWORDS)
+    with TWITCH_CHANNELS_LOCK:
+        total_twitch = len(TWITCH_CHANNELS)
     return (
         "<b>Команды:</b>\n"
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
@@ -1131,12 +1239,16 @@ def help_text() -> str:
         "/channels — список отслеживаемых каналов\n"
         "/add @channel — добавить канал\n"
         "/remove @channel — убрать канал\n"
+        "/twitch — список Twitch-каналов\n"
+        "/addtwitch channel — добавить Twitch-канал\n"
+        "/removetwitch channel — убрать Twitch-канал\n"
         "/words — список ключевых слов\n"
         "/addword слово — добавить ключевое слово\n"
         "    (слово — по границам слова, *слово* — по подстроке)\n"
         "/removeword слово — убрать ключевое слово\n"
         "/help — эта справка\n\n"
         f"Каналов под мониторингом: {total}\n"
+        f"Twitch-каналов: {total_twitch}\n"
         f"Ключевых слов: {total_words}\n"
         f"Интервал проверки: {CHECK_INTERVAL} сек"
     )
@@ -1176,6 +1288,13 @@ def save_keywords_file() -> None:
     KEYWORDS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def save_twitch_channels_file() -> None:
+    with TWITCH_CHANNELS_LOCK:
+        lines = ["# Один Twitch-канал (логин) на строку, без @ и без #."]
+        lines.extend(TWITCH_CHANNELS)
+    TWITCH_CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
     now = now_msk()
     fresh: list[dict[str, Any]] = []
@@ -1212,7 +1331,7 @@ def status_text() -> str:
     ]
     if last_item and last_found:
         channel = html.escape(str(last_item.get("channel", "?")))
-        url = html.escape(str(last_item.get("url", "")))
+        url = html.escape(normalize_url(str(last_item.get("url", ""))))
         lines.append(f"🕑 Последняя ссылка: {last_found.strftime('%H:%M')} (@{channel})")
         if url:
             lines.append(url)
@@ -1262,7 +1381,8 @@ def handle_command(chat_id: str, text: str) -> None:
             found_at = str(item.get("found_at", ""))
             found_time = found_at[11:16] if len(found_at) >= 16 else found_at
             channel = html.escape(str(item.get("channel", "")))
-            url = html.escape(str(item.get("url", "")))
+            # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
+            url = html.escape(normalize_url(str(item.get("url", ""))))
             lines.append(f"• {found_time} — @{channel}\n{url}")
         bot_send(chat_id, "\n".join(lines))
     elif command == "/active":
@@ -1360,6 +1480,55 @@ def handle_command(chat_id: str, text: str) -> None:
                     f"{icon('stop')} «{html.escape(existing)}» удалено. Слов: {total}",
                 )
                 log.info("Бот: слово %r удалено, всего %s", keyword, total)
+    elif command == "/twitch":
+        with TWITCH_CHANNELS_LOCK:
+            total = len(TWITCH_CHANNELS)
+            listing = "\n".join(
+                f"• twitch.tv/{html.escape(channel)}" for channel in TWITCH_CHANNELS
+            )
+        if not total:
+            bot_send(chat_id, "Twitch-каналов пока нет. Добавьте: /addtwitch channel")
+        else:
+            bot_send(chat_id, f"<b>Twitch-каналы ({total}):</b>\n{listing}")
+    elif command in ("/addtwitch", "/removetwitch"):
+        candidate = argument.strip()
+        if "twitch.tv/" in candidate:
+            candidate = candidate.rstrip("/").rsplit("/", 1)[-1]
+        match = TWITCH_USERNAME_RE.match(candidate)
+        if not match:
+            bot_send(chat_id, f"Укажите канал: <code>{command} channel</code>")
+            return
+        channel = match.group(1).lower()
+        if command == "/addtwitch":
+            with TWITCH_CHANNELS_LOCK:
+                if channel in TWITCH_CHANNELS:
+                    bot_send(chat_id, f"twitch.tv/{html.escape(channel)} уже в списке.")
+                    return
+                TWITCH_CHANNELS.append(channel)
+                save_twitch_channels_file()
+                total = len(TWITCH_CHANNELS)
+            TWITCH_RELOAD.set()
+            bot_send(
+                chat_id,
+                f"{icon('ok')} twitch.tv/{html.escape(channel)} добавлен. "
+                f"Twitch-каналов: {total}",
+            )
+            log.info("Бот: twitch-канал %s добавлен, всего %s", channel, total)
+        else:
+            with TWITCH_CHANNELS_LOCK:
+                if channel not in TWITCH_CHANNELS:
+                    bot_send(chat_id, f"twitch.tv/{html.escape(channel)} нет в списке.")
+                    return
+                TWITCH_CHANNELS.remove(channel)
+                save_twitch_channels_file()
+                total = len(TWITCH_CHANNELS)
+            TWITCH_RELOAD.set()
+            bot_send(
+                chat_id,
+                f"{icon('stop')} twitch.tv/{html.escape(channel)} удалён. "
+                f"Twitch-каналов: {total}",
+            )
+            log.info("Бот: twitch-канал %s удалён, всего %s", channel, total)
     elif command in ("/add", "/remove"):
         match = USERNAME_RE.match(argument)
         if not match:
@@ -1510,6 +1679,232 @@ def bot_loop() -> None:
             )
 
 
+# ----------------------------------------------------------------------------
+# Twitch: анонимное чтение чатов через IRC (без токенов и OAuth).
+# Ловим ТОЛЬКО ссылки betboom.ru/freestream от стримера, модераторов, VIP
+# и известных ботов. Ключевые слова в Twitch-чатах не ищутся: зрители пишут
+# «колесо» постоянно, и уведомления превратились бы в спам.
+# ----------------------------------------------------------------------------
+
+# Находки twitch-потока: уведомления по ним уже отправлены, parser-поток
+# забирает записи в начале каждого цикла и сохраняет их в freebets.json
+# (results принадлежит parser-потоку, трогать его из другого потока нельзя).
+TWITCH_NEW_ENTRIES: queue.Queue[dict[str, Any]] = queue.Queue()
+
+# Общий кулдаун уведомлений по URL между источниками (Telegram и Twitch):
+# одно и то же колесо, найденное в двух местах, не рассылается дважды.
+LAST_URL_ALERT: dict[str, datetime] = {}
+LAST_URL_ALERT_LOCK = threading.Lock()
+
+# Сигнал twitch-потоку переподключиться (список каналов изменился на лету).
+TWITCH_RELOAD = threading.Event()
+
+# Отдельная HTTP-сессия twitch-потока: requests.Session не потокобезопасна,
+# SESSION принадлежит parser-потоку, BOT_SESSION — боту.
+TWITCH_HTTP_SESSION = build_session()
+
+
+def _cooldown_active(url: str, now: datetime) -> bool:
+    with LAST_URL_ALERT_LOCK:
+        previous = LAST_URL_ALERT.get(url)
+    return bool(
+        previous
+        and now - previous <= timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    )
+
+
+def _mark_url_alert(url: str, when: datetime) -> None:
+    with LAST_URL_ALERT_LOCK:
+        existing = LAST_URL_ALERT.get(url)
+        if existing is None or when > existing:
+            LAST_URL_ALERT[url] = when
+
+
+def _parse_irc_line(line: str) -> tuple[dict[str, str], str, str, str]:
+    """Разбирает строку IRC на (tags, prefix, command, rest)."""
+    tags: dict[str, str] = {}
+    if line.startswith("@"):
+        raw_tags, _, line = line[1:].partition(" ")
+        for part in raw_tags.split(";"):
+            key, _, value = part.partition("=")
+            tags[key] = value
+    prefix = ""
+    if line.startswith(":"):
+        prefix, _, line = line[1:].partition(" ")
+    command, _, rest = line.partition(" ")
+    return tags, prefix, command, rest
+
+
+def _twitch_author_allowed(tags: dict[str, str], login: str) -> bool:
+    """Стример (broadcaster), модератор, VIP или известный бот из TWITCH_BOTS."""
+    for badge in tags.get("badges", "").split(","):
+        if badge.split("/", 1)[0] in ("broadcaster", "moderator", "vip"):
+            return True
+    if tags.get("mod") == "1":
+        return True
+    return login in TWITCH_BOTS
+
+
+def _handle_twitch_message(
+    channel: str, login: str, tags: dict[str, str], text: str
+) -> None:
+    """Обрабатывает одно сообщение Twitch-чата (вызывается из twitch-потока)."""
+    urls: list[str] = []
+    for candidate in FREESTREAM_RE.findall(text):
+        normalized = normalize_url(candidate)
+        if normalized and normalized not in urls:
+            urls.append(normalized)
+    if not urls:
+        return
+    if not _twitch_author_allowed(tags, login):
+        log.info(
+            "twitch [#%s]: ссылка от @%s проигнорирована (не стример/мод/VIP/бот)",
+            channel,
+            login,
+        )
+        return
+    for url in urls:
+        now = now_msk()
+        if _cooldown_active(url, now):
+            continue  # недавно уже оповещали об этом колесе (TG или Twitch)
+        status = (
+            precheck_wheel_status(url, TWITCH_HTTP_SESSION)
+            if PRECHECK_WHEELS
+            else ""
+        )
+        if status == "expired":
+            log.info(
+                "%s Пропускаю %s [twitch #%s]: колесо уже завершилось (API BetBoom)",
+                icon("warn"),
+                url,
+                channel,
+            )
+            _mark_url_alert(url, now)
+            continue
+        entry = {
+            "url": url,
+            "found_at": now_msk().isoformat(timespec="seconds"),
+            "channel": channel,
+            "source": "twitch",
+            "author": login,
+            "msg_id": tags.get("id", ""),
+            "message_url": f"https://www.twitch.tv/{channel}",
+            "preview": text[:200],
+            "edited": False,
+            "status": status,
+            "notified": False,
+        }
+        entry["notified"] = send_telegram_notification(entry, TWITCH_HTTP_SESSION)
+        _mark_url_alert(url, now)
+        TWITCH_NEW_ENTRIES.put(entry)
+        log.info(
+            "%s Новая ссылка из Twitch [#%s, от @%s]: %s",
+            icon("link"),
+            channel,
+            login,
+            url,
+            extra={"highlight": True},
+        )
+
+
+def _twitch_connect(channels: list[str]) -> ssl.SSLSocket:
+    """Подключается к IRC Twitch анонимно и джойнит каналы."""
+    raw_socket = socket.create_connection(
+        (TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=REQUEST_TIMEOUT
+    )
+    sock = ssl.create_default_context().wrap_socket(
+        raw_socket, server_hostname=TWITCH_IRC_HOST
+    )
+    sock.settimeout(5.0)
+    # Анонимный вход: ник justinfan<цифры>, пароль не нужен. Читать чат
+    # можно без регистрации приложения и OAuth-токенов.
+    nick = f"justinfan{random.randint(10_000, 99_999)}"
+    # tags — бейджи авторов (broadcaster/moderator/vip),
+    # commands — служебные сообщения вроде RECONNECT.
+    sock.sendall(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
+    sock.sendall(f"NICK {nick}\r\n".encode())
+    for index, channel in enumerate(channels):
+        sock.sendall(f"JOIN #{channel}\r\n".encode())
+        # Лимит Twitch на частоту JOIN — обязательная пауза между каналами.
+        if index < len(channels) - 1:
+            STOP_EVENT.wait(0.6)
+    return sock
+
+
+def twitch_loop() -> None:
+    """Поток Twitch: держит IRC-соединение и переподключается при обрывах."""
+    backoff = 5.0
+    while not STOP_EVENT.is_set():
+        TWITCH_RELOAD.clear()
+        with TWITCH_CHANNELS_LOCK:
+            channels = list(TWITCH_CHANNELS)
+        if not channels:
+            # Каналов нет — ждём /addtwitch или остановки.
+            STOP_EVENT.wait(5)
+            continue
+        sock: ssl.SSLSocket | None = None
+        try:
+            sock = _twitch_connect(channels)
+            log.info(
+                "%s Twitch: подключён, чатов под мониторингом: %s",
+                icon("ok"),
+                len(channels),
+            )
+            backoff = 5.0
+            buffer = b""
+            while not STOP_EVENT.is_set() and not TWITCH_RELOAD.is_set():
+                try:
+                    chunk = sock.recv(4096)
+                except TimeoutError:
+                    continue
+                except ssl.SSLError as error:
+                    if "timed out" in str(error).lower():
+                        continue
+                    raise
+                if not chunk:
+                    raise ConnectionError("соединение закрыто сервером")
+                buffer += chunk
+                while b"\r\n" in buffer:
+                    raw_line, buffer = buffer.split(b"\r\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if not line:
+                        continue
+                    if line.startswith("PING"):
+                        sock.sendall(
+                            line.replace("PING", "PONG", 1).encode() + b"\r\n"
+                        )
+                        continue
+                    tags, prefix, command, rest = _parse_irc_line(line)
+                    if command == "RECONNECT":
+                        raise ConnectionError("сервер запросил RECONNECT")
+                    if command != "PRIVMSG":
+                        continue
+                    login = prefix.split("!", 1)[0].lower()
+                    target, _, message_text = rest.partition(" :")
+                    chat = target.strip().lstrip("#").lower()
+                    try:
+                        _handle_twitch_message(chat, login, tags, message_text)
+                    except Exception:
+                        log.exception("Twitch: ошибка обработки сообщения")
+        except OSError as error:
+            if STOP_EVENT.is_set():
+                break
+            log.warning(
+                "%s Twitch: ошибка соединения (%s) — переподключение через %.0f с",
+                icon("warn"),
+                error,
+                backoff,
+            )
+            STOP_EVENT.wait(backoff)
+            backoff = min(backoff * 2, 120.0)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+
 # Мониторинг «мёртвых» каналов: счётчики подряд неудачных циклов per-канал.
 # Доступ только из parser-потока — блокировка не нужна.
 CHANNEL_FAIL_STREAK: dict[str, int] = {}
@@ -1565,6 +1960,16 @@ def process_cycle(
         total_channels = len(CHANNELS)
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), total_channels)
     now = now_msk()
+    # Забираем находки twitch-потока: уведомления по ним уже отправлены,
+    # осталось сохранить их в freebets.json и учесть в дедупликации ниже.
+    twitch_entries: list[dict[str, Any]] = []
+    while True:
+        try:
+            twitch_entries.append(TWITCH_NEW_ENTRIES.get_nowait())
+        except queue.Empty:
+            break
+    if twitch_entries:
+        results.extend(twitch_entries)
     # URL -> время последней находки. Раньше дедупликация была глобальной
     # («один URL — одно уведомление за всю историю»), из-за чего повторный
     # запуск колеса на том же адресе молча игнорировался. Теперь повтор
@@ -1620,6 +2025,13 @@ def process_cycle(
                 continue
             for url in message["urls"]:
                 previous = last_found.get(url)
+                # Кулдаун общий с Twitch: находки twitch-потока с момента
+                # последнего цикла ещё не попали в results, но уже отмечены
+                # в LAST_URL_ALERT.
+                with LAST_URL_ALERT_LOCK:
+                    cross_source = LAST_URL_ALERT.get(url)
+                if cross_source and (previous is None or cross_source > previous):
+                    previous = cross_source
                 if previous and now - previous <= timedelta(
                     minutes=REALERT_COOLDOWN_MINUTES
                 ):
@@ -1637,6 +2049,7 @@ def process_cycle(
                         channel,
                     )
                     last_found[url] = now
+                    _mark_url_alert(url, now)
                     continue
                 entry = {
                     "url": url,
@@ -1653,6 +2066,7 @@ def process_cycle(
                 results.append(entry)
                 new_entries.append(entry)
                 last_found[url] = now
+                _mark_url_alert(url, now)
                 log.info(
                     "%s %s [@%s]: %s",
                     icon("link"),
@@ -1691,7 +2105,7 @@ def process_cycle(
 
     _update_channel_fail_streaks(checked_channels, failed_channels)
     save_seen(seen)
-    if new_entries:
+    if new_entries or twitch_entries:
         if len(results) > MAX_RESULTS:
             # Обрезаем на месте (del, а не переприсваивание): список results
             # общий между циклами, терять ссылку на него нельзя.
@@ -1777,6 +2191,14 @@ def main() -> int:
             icon("ok"),
             len(KEYWORDS),
         )
+    if _SEED_TWITCH_FILE:
+        save_twitch_channels_file()
+        log.info(
+            "%s Создан twitch_channels.txt (каналов: %s) — управляйте "
+            "каналами через файл или /addtwitch и /removetwitch",
+            icon("ok"),
+            len(TWITCH_CHANNELS),
+        )
     for note_level, note in CHANNEL_LOAD_NOTES:
         log.log(note_level, "%s %s", icon("warn") if note_level >= logging.WARNING else icon("bell"), note)
 
@@ -1787,9 +2209,11 @@ def main() -> int:
 
     notifications = "включены" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "выключены"
     log.info(
-        "%s WheelsParser запущен · каналов %s · ключевых слов %s · интервал %ss",
+        "%s WheelsParser запущен · каналов %s · twitch-каналов %s · "
+        "ключевых слов %s · интервал %ss",
         icon("start"),
         len(CHANNELS),
+        len(TWITCH_CHANNELS),
         len(KEYWORDS),
         CHECK_INTERVAL,
     )
@@ -1805,6 +2229,26 @@ def main() -> int:
             "иначе управлять парсером мог бы любой пользователь Telegram",
             icon("warn"),
         )
+
+    if TWITCH_ENABLED:
+        threading.Thread(target=twitch_loop, name="twitch", daemon=True).start()
+        with TWITCH_CHANNELS_LOCK:
+            twitch_total = len(TWITCH_CHANNELS)
+        if twitch_total:
+            log.info(
+                "%s Twitch-мониторинг запущен · каналов %s · только ссылки "
+                "от стримера/модов/VIP/ботов",
+                icon("scan"),
+                twitch_total,
+            )
+        else:
+            log.info(
+                "%s Twitch-мониторинг активен, каналов пока нет — добавьте: "
+                "/addtwitch channel",
+                icon("bell"),
+            )
+    else:
+        log.info("%s Twitch-мониторинг выключен (TWITCH_ENABLED=false)", icon("bell"))
 
     baseline = not has_state and not ALERT_ON_FIRST_RUN
     if baseline:
