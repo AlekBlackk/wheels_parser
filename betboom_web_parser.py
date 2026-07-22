@@ -922,6 +922,7 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
     # is_ended у API BetBoom запаздывает: флаг не переключается по таймеру,
     # и колесо может часами числиться «не завершённым» после окончания.
     # Поэтому конец розыгрыша считаем сами: start_dttm + duration_min.
+    time_status: str | None = None
     start_raw = info.get("start_dttm")
     duration = info.get("duration_min")
     if (
@@ -938,14 +939,19 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
             now = datetime.now(timezone.utc)
             if now >= start + timedelta(minutes=float(duration)):
                 return "expired"
-            if now < start:
-                return "soon"
-            return "active"
-    # Fallback: время посчитать не удалось — старое поведение по is_early.
+            time_status = "soon" if now < start else "active"
+    # «Акция скоро начнётся» на сайте показывается по флагу is_early,
+    # поэтому он надёжнее расчёта по start_dttm: бывает, что start_dttm
+    # уже в прошлом, а розыгрыш стример ещё не запустил. is_early=True
+    # всегда означает «ещё не началось» (если не истекло по времени выше).
     is_early = info.get("is_early")
+    if isinstance(is_early, bool) and is_early:
+        return "soon"
+    if time_status is not None:
+        return time_status
     if not isinstance(is_early, bool):
         return "unknown"
-    return "soon" if is_early else "active"
+    return "active"
 
 
 def _freestream_url(url: str) -> str:
