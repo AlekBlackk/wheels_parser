@@ -43,6 +43,7 @@ CHANNELS_FILE = BASE_DIR / "channels.txt"
 KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 OUTPUT_FILE = BASE_DIR / "freebets.json"
 SEEN_FILE = BASE_DIR / "seen_ids.json"
+BOT_STATE_FILE = BASE_DIR / "bot_state.json"
 LOG_FILE = BASE_DIR / "parser.log"
 LOCK_FILE = BASE_DIR / "wheelsparser.lock"
 
@@ -249,6 +250,30 @@ def icon(name: str) -> str:
     return (ICONS if USE_ICONS else ASCII_ICONS)[name]
 
 
+def now_msk() -> datetime:
+    """Текущее время в московской зоне — единая точка отсчёта проекта.
+
+    Все пользовательские даты (/status, /wheels, /active, found_at) и
+    внутренние расчёты считаются по МСК независимо от таймзоны сервера.
+    """
+    return datetime.now(MSK_TZ)
+
+
+def parse_found_at(value: Any) -> datetime | None:
+    """Разбирает found_at и приводит к МСК.
+
+    Наивные метки времени (без зоны) из старых версий freebets.json
+    считаются московскими. Возвращает None, если строку разобрать нельзя.
+    """
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=MSK_TZ)
+    return moment.astimezone(MSK_TZ)
+
+
 class RedactTokenFilter(logging.Filter):
     """Маскирует токен бота в сообщениях лога.
 
@@ -425,13 +450,21 @@ def load_results() -> list[dict[str, Any]]:
 
 
 def normalize_url(url: str) -> str:
-    cleaned = url.strip().rstrip(TRAILING_PUNCTUATION)
+    """Единая каноническая форма URL колеса.
+
+    Используется везде: при извлечении ссылок из постов, для кулдауна
+    повторных уведомлений, в /active, в precheck и в кэше завершившихся
+    колёс. Query-параметры (utm и т.п.) и завершающий «/» отбрасываются:
+    это тот же адрес колеса, различия в хвосте не должны создавать дубликаты
+    и двойные уведомления.
+    """
+    cleaned = str(url).strip().rstrip(TRAILING_PUNCTUATION)
     parts = urlsplit(cleaned)
     scheme = parts.scheme.lower()
     netloc = parts.netloc.lower()
     if netloc == "www.betboom.ru":
         netloc = "betboom.ru"
-    return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+    return urlunsplit((scheme, netloc, parts.path.rstrip("/"), "", ""))
 
 
 def find_urls(message: Any, text: str) -> list[str]:
@@ -527,10 +560,9 @@ def find_keywords(text: str) -> list[str]:
 
 
 def format_found_at(value: Any) -> str:
-    """Время находки в читаемом виде: 16.07.2026 | 20:40:31 | +03:00."""
-    try:
-        moment = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
+    """Время находки в читаемом виде (МСК): 16.07.2026 | 20:40:31 | +03:00."""
+    moment = parse_found_at(value)
+    if moment is None:
         return str(value)
     formatted = f"{moment.strftime('%d.%m.%Y')} | {moment.strftime('%H:%M:%S')}"
     offset = moment.strftime("%z")
@@ -782,14 +814,8 @@ def _api_info_to_status(info: dict[str, Any]) -> str:
 
 
 def _freestream_url(url: str) -> str:
-    """Нормализует URL колеса для API, кэша и дедупликации."""
-    cleaned = str(url).strip().rstrip(TRAILING_PUNCTUATION)
-    parts = urlsplit(cleaned)
-    scheme = parts.scheme.lower()
-    netloc = parts.netloc.lower()
-    if netloc == "www.betboom.ru":
-        netloc = "betboom.ru"
-    return urlunsplit((scheme, netloc, parts.path.rstrip("/"), "", ""))
+    """Алиас единой канонизации URL — см. normalize_url."""
+    return normalize_url(url)
 
 
 def _check_wheel_api(item: dict[str, Any], session: requests.Session) -> str:
@@ -835,7 +861,7 @@ def _get_active_api(
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
     # Чистим устаревшие записи кэша.
     with _expired_cache_lock:
         for stale_url in [
@@ -843,7 +869,18 @@ def _get_active_api(
         ]:
             _expired_cache.pop(stale_url, None)
 
-    session = build_session()
+    # requests.Session не потокобезопасна, поэтому общая сессия на все
+    # рабочие потоки ThreadPoolExecutor недопустима: у каждого потока —
+    # своя сессия через threading.local (создаётся лениво при первом запросе).
+    thread_local = threading.local()
+
+    def worker_session() -> requests.Session:
+        session = getattr(thread_local, "session", None)
+        if session is None:
+            session = build_session()
+            thread_local.session = session
+        return session
+
     results: list[tuple[int, str]] = []  # (original_index, status)
     lock = threading.Lock()
 
@@ -860,7 +897,7 @@ def _get_active_api(
             with lock:
                 results.append((index, "expired"))
             return
-        status = _check_wheel_api(item, session)
+        status = _check_wheel_api(item, worker_session())
         log.info("active-check [api]: %s → %s", url, status)
         if status == "expired":
             with _expired_cache_lock:
@@ -902,7 +939,7 @@ def precheck_wheel_status(url: str) -> str:
     canonical = _freestream_url(url)
     if not canonical:
         return "unknown"
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
     with _expired_cache_lock:
         if _expired_cache.get(canonical) == today:
             log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
@@ -1112,15 +1149,12 @@ def save_keywords_file() -> None:
 
 
 def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
-    now = datetime.now().astimezone()
+    now = now_msk()
     fresh: list[dict[str, Any]] = []
     for item in load_results():
-        try:
-            found = datetime.fromisoformat(str(item.get("found_at", "")))
-        except ValueError:
+        found = parse_found_at(item.get("found_at"))
+        if found is None:
             continue
-        if found.tzinfo is None:
-            found = found.astimezone()
         if now - found <= timedelta(minutes=minutes):
             fresh.append(item)
     fresh.sort(key=lambda item: str(item.get("found_at", "")), reverse=True)
@@ -1130,17 +1164,14 @@ def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
 def status_text() -> str:
     items = load_results()
     total = len(items)
-    today = datetime.now().astimezone().date()
+    today = now_msk().date()
     today_count = 0
     last_item: dict[str, Any] | None = None
     last_found: datetime | None = None
     for item in items:
-        try:
-            found = datetime.fromisoformat(str(item.get("found_at", "")))
-        except ValueError:
+        found = parse_found_at(item.get("found_at"))
+        if found is None:
             continue
-        if found.tzinfo is None:
-            found = found.astimezone()
         if found.date() == today:
             today_count += 1
         if last_found is None or found > last_found:
@@ -1209,18 +1240,15 @@ def handle_command(chat_id: str, text: str) -> None:
     elif command == "/active":
         # Показываем только колёса текущих суток по Москве и не старше заданного
         # срока, чтобы зависшие записи не оставались в /active.
-        now_msk = datetime.now(MSK_TZ)
-        day_cutoff = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-        age_cutoff = now_msk - timedelta(hours=ACTIVE_MAX_AGE_HOURS)
+        now = now_msk()
+        day_cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        age_cutoff = now - timedelta(hours=ACTIVE_MAX_AGE_HOURS)
         cutoff = max(day_cutoff, age_cutoff)
         fresh_items: list[dict[str, Any]] = []
         for item in load_results():
-            try:
-                found = datetime.fromisoformat(str(item.get("found_at", "")))
-            except ValueError:
+            found = parse_found_at(item.get("found_at"))
+            if found is None:
                 continue
-            if found.tzinfo is None:
-                found = found.astimezone()
             if found >= cutoff:
                 fresh_items.append(item)
         # Дедупликация по каноническому URL. В найденных сообщениях могут
@@ -1370,6 +1398,29 @@ def handle_command(chat_id: str, text: str) -> None:
             log.info("Бот: канал @%s удалён, всего %s", channel, total)
 
 
+def load_bot_offset() -> int:
+    """Читает сохранённый offset getUpdates (последний update_id + 1).
+
+    Благодаря этому после рестарта парсера уже обработанные команды
+    не выполняются повторно.
+    """
+    raw = read_json(BOT_STATE_FILE, {})
+    if isinstance(raw, dict):
+        try:
+            return max(0, int(raw.get("offset", 0)))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+def save_bot_offset(offset: int) -> None:
+    """Атомарно сохраняет offset getUpdates в bot_state.json."""
+    try:
+        atomic_write_json(BOT_STATE_FILE, {"offset": offset})
+    except OSError as error:
+        log.warning("Бот: не удалось сохранить %s: %s", BOT_STATE_FILE.name, error)
+
+
 def bot_loop() -> None:
     try:
         BOT_SESSION.post(
@@ -1380,7 +1431,9 @@ def bot_loop() -> None:
     except requests.RequestException as error:
         log.warning("Бот: не удалось зарегистрировать меню команд: %s", error)
 
-    offset = 0
+    # offset переживает рестарт: подтверждённый update_id хранится в
+    # bot_state.json, чтобы не обработать один и тот же бэклог дважды.
+    offset = load_bot_offset()
     while not STOP_EVENT.is_set():
         try:
             response = BOT_SESSION.get(
@@ -1394,6 +1447,7 @@ def bot_loop() -> None:
             log.warning("Бот: ошибка получения обновлений: %s", error)
             STOP_EVENT.wait(5)
             continue
+        offset_before = offset
         stale_count = 0
         for update in updates:
             offset = max(offset, int(update.get("update_id", 0)) + 1)
@@ -1418,6 +1472,8 @@ def bot_loop() -> None:
                 handle_command(chat_id, text)
             except Exception:
                 log.exception("Бот: ошибка обработки команды %r", text)
+        if offset > offset_before:
+            save_bot_offset(offset)
         if stale_count:
             log.info(
                 "%s Бот: пропущено устаревших команд из бэклога: %s",
@@ -1480,22 +1536,21 @@ def process_cycle(
     with CHANNELS_LOCK:
         total_channels = len(CHANNELS)
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), total_channels)
-    now = datetime.now().astimezone()
+    now = now_msk()
     # URL -> время последней находки. Раньше дедупликация была глобальной
     # («один URL — одно уведомление за всю историю»), из-за чего повторный
     # запуск колеса на том же адресе молча игнорировался. Теперь повтор
     # подавляется только в течение REALERT_COOLDOWN_MINUTES.
     last_found: dict[str, datetime] = {}
     for item in results:
-        item_url = str(item.get("url", ""))
+        # Канонизация и здесь: старые записи freebets.json могли сохранить
+        # URL с query-параметрами — без нормализации кулдаун их не увидит.
+        item_url = normalize_url(str(item.get("url", "")))
         if not item_url:
             continue
-        try:
-            found = datetime.fromisoformat(str(item.get("found_at", "")))
-        except ValueError:
+        found = parse_found_at(item.get("found_at"))
+        if found is None:
             continue
-        if found.tzinfo is None:
-            found = found.astimezone()
         if item_url not in last_found or found > last_found[item_url]:
             last_found[item_url] = found
     new_entries: list[dict[str, Any]] = []
@@ -1553,7 +1608,7 @@ def process_cycle(
                     continue
                 entry = {
                     "url": url,
-                    "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "found_at": now_msk().isoformat(timespec="seconds"),
                     "channel": channel,
                     "msg_id": message["id"],
                     "message_url": message["message_url"],
@@ -1582,7 +1637,7 @@ def process_cycle(
                 matched = find_keywords(message["text"])
                 if matched:
                     entry = {
-                        "found_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "found_at": now_msk().isoformat(timespec="seconds"),
                         "channel": channel,
                         "msg_id": message["id"],
                         "message_url": message["message_url"],
@@ -1614,8 +1669,7 @@ def process_cycle(
     # Следующий запуск отсчитывается от НАЧАЛА цикла (см. parse_loop).
     elapsed = time.monotonic() - cycle_started
     next_at = (
-        datetime.now().astimezone()
-        + timedelta(seconds=max(5.0, CHECK_INTERVAL - elapsed))
+        now_msk() + timedelta(seconds=max(5.0, CHECK_INTERVAL - elapsed))
     ).strftime("%H:%M:%S")
     suffix = "" if STOP_EVENT.is_set() else f" · следующая проверка в {next_at}"
     log.info(
