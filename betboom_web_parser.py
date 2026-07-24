@@ -2445,14 +2445,28 @@ def main() -> int:
     def parse_loop() -> None:
         # Интервал отсчитывается от НАЧАЛА цикла: иначе реальный период
         # равен «длительность цикла + CHECK_INTERVAL» и расписание дрейфует.
+        # try/except вокруг process_cycle: одиночная ошибка цикла не должна
+        # убивать daemon-поток (сценарий «поток умер, процесс жив»).
         cycle_started = time.monotonic()
-        process_cycle(seen, results, baseline=baseline)
+        try:
+            process_cycle(seen, results, baseline=baseline)
+        except Exception:
+            log.exception(
+                "%s Необработанная ошибка в цикле парсинга — жду следующий цикл",
+                icon("warn"),
+            )
         while not STOP_EVENT.is_set():
             elapsed = time.monotonic() - cycle_started
             if STOP_EVENT.wait(max(5.0, CHECK_INTERVAL - elapsed)):
                 break
             cycle_started = time.monotonic()
-            process_cycle(seen, results)
+            try:
+                process_cycle(seen, results)
+            except Exception:
+                log.exception(
+                    "%s Необработанная ошибка в цикле парсинга — жду следующий цикл",
+                    icon("warn"),
+                )
 
     parser_thread = threading.Thread(target=parse_loop, name="parser", daemon=True)
     parser_thread.start()
