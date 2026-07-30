@@ -1,7 +1,20 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 from wheelsparser import betboom, config
+
+
+def running_info(**extra):
+    """info запущенного колеса: старт минуту назад, розыгрыш идёт полчаса."""
+    started = datetime.now(timezone.utc) - timedelta(minutes=1)
+    return {
+        "is_ended": False,
+        "is_early": False,
+        "start_dttm": started.isoformat().replace("+00:00", "Z"),
+        "duration_min": 30,
+        **extra,
+    }
 
 
 class ApiStatusTests(unittest.TestCase):
@@ -16,10 +29,30 @@ class ApiStatusTests(unittest.TestCase):
 
     def test_marks_running_wheel_active_regardless_of_join_state(self):
         self.assertEqual(
-            betboom.api_info_to_status(
-                {"is_ended": False, "is_early": False, "is_joined": True}
-            ),
+            betboom.api_info_to_status(running_info(is_joined=True)),
             "active",
+        )
+
+    def test_marks_wheel_without_start_time_soon(self):
+        # Стример создал колесо, но не запустил: API отдаёт info без
+        # start_dttm, на сайте «Акция скоро начнётся» и кнопки участия нет.
+        self.assertEqual(
+            betboom.api_info_to_status(
+                {"is_ended": False, "is_early": False, "duration_min": 30}
+            ),
+            "soon",
+        )
+
+    def test_marks_wheel_with_future_start_soon(self):
+        start = datetime.now(timezone.utc) + timedelta(minutes=5)
+        self.assertEqual(
+            betboom.api_info_to_status({
+                "is_ended": False,
+                "is_early": False,
+                "start_dttm": start.isoformat().replace("+00:00", "Z"),
+                "duration_min": 30,
+            }),
+            "soon",
         )
 
     def test_rejects_incomplete_info(self):
@@ -44,7 +77,7 @@ class ApiCheckTests(unittest.TestCase):
         response.json.return_value = {
             "code": 200,
             "status": "OK",
-            "info": {"is_ended": False, "is_early": False},
+            "info": running_info(),
         }
         session = Mock()
         session.post.return_value = response
@@ -108,12 +141,10 @@ class PrecheckWheelTests(unittest.TestCase):
         response.json.return_value = {
             "code": 200,
             "status": "OK",
-            "info": {
-                "is_ended": False,
-                "is_early": False,
-                "title": "КОЛЕСО",
-                "description": "Розыгрыш для рефералов",
-            },
+            "info": running_info(
+                title="КОЛЕСО",
+                description="Розыгрыш для рефералов",
+            ),
         }
         session = Mock()
         session.post.return_value = response

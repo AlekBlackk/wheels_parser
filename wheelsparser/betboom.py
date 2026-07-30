@@ -95,7 +95,12 @@ def api_info_to_status(info: dict[str, Any]) -> str:
         return time_status
     if not isinstance(is_early, bool):
         return "unknown"
-    return "active"
+    # Сюда попадают колёса без пригодного start_dttm. Розыгрыш идёт только
+    # с момента старта, поэтому у активного колеса время старта в info есть
+    # всегда. Его отсутствие означает «стример создал колесо, но не запустил»:
+    # на странице «Акция скоро начнётся» и кнопки участия нет — даже при
+    # is_early=false. Такое колесо в /active показывать нельзя.
+    return "soon"
 
 
 def fetch_wheel_info(
