@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import threading
+from datetime import datetime, timedelta
 
 from .config import OUTPUT_FILE, REALERT_COOLDOWN_MINUTES
 from .storage import read_json

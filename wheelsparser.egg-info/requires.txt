@@ -1,0 +1,9 @@
+requests<3,>=2.32
+beautifulsoup4<5,>=4.12
+python-dotenv<2,>=1.0
+colorama<0.5,>=0.4.6
+
+[dev]
+pytest<9,>=8
+ruff>=0.5
+mypy>=1.10

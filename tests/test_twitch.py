@@ -20,7 +20,7 @@ class IrcParsingTests(unittest.TestCase):
         self.assertEqual(rest, "#demo :привет")
 
     def test_parses_line_without_tags(self):
-        tags, prefix, command, rest = twitch.parse_irc_line("PING :tmi.twitch.tv")
+        tags, prefix, command, _rest = twitch.parse_irc_line("PING :tmi.twitch.tv")
         self.assertEqual(tags, {})
         self.assertEqual(prefix, "")
         self.assertEqual(command, "PING")

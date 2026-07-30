@@ -11,7 +11,7 @@ if errorlevel 1 (
 )
 
 if not exist ".env" (
-    echo [!] .env was not found. Copy .env.example to .env and configure the token and chat ID.
+    echo [!] .env was not found. Copy env.example to .env and configure the token and chat ID.
 )
 
 if not exist ".venv\Scripts\python.exe" (
@@ -23,7 +23,7 @@ if not exist ".venv\Scripts\python.exe" (
     )
 
     echo Installing dependencies into .venv...
-    "%VENV_PYTHON%" -m pip install -r requirements.txt
+    "%VENV_PYTHON%" -m pip install -e .
     if errorlevel 1 (
         echo Failed to install dependencies.
         goto :error

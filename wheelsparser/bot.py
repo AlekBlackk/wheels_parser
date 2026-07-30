@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import html
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 import requests
 

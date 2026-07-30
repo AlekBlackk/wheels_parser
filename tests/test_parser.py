@@ -33,7 +33,7 @@ class FetchChannelTests(unittest.TestCase):
             </div>
           </div>
         </div>
-        """.encode("utf-8")
+        """.encode()
 
         with patch.object(parser.PARSER_SESSION, "get", return_value=response) as get:
             messages = parser.fetch_channel("demo")

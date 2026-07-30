@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import html
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .config import FREESTREAM_RE, TRAILING_PUNCTUATION
