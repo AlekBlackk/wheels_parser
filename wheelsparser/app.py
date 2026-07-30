@@ -29,14 +29,20 @@ from .config import (
     TWITCH_ENABLED,
     icon,
 )
-from .logging_setup import log
+from .logging_setup import force_utf8_console, log, setup_logging
 from .parser import process_cycle
 from .runtime import (
     STOP_EVENT,
     acquire_single_instance_lock,
     install_signal_handlers,
 )
-from .storage import atomic_write_json, load_results, load_seen, save_seen
+from .storage import (
+    atomic_write_json,
+    ensure_data_dir,
+    load_results,
+    load_seen,
+    save_seen,
+)
 from .twitch import twitch_loop
 
 
@@ -148,6 +154,21 @@ def _run_parse_loop(
 
 
 def main() -> int:
+    # Порядок важен: сначала каталог данных (и перенос старых файлов из
+    # корня), затем логирование — RotatingFileHandler открывает LOG_FILE
+    # в DATA_DIR сразу, а перенесённый parser.log должен успеть переехать
+    # ДО открытия нового.
+    moved = ensure_data_dir()
+    force_utf8_console()
+    setup_logging()
+    if moved:
+        log.info(
+            "%s Файлы состояния перенесены в %s: %s",
+            icon("ok"),
+            "data/",
+            ", ".join(moved),
+        )
+
     # Держим lock_handle до конца работы процесса.
     lock_handle = acquire_single_instance_lock()
     if lock_handle is None:

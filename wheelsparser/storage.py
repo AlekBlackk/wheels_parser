@@ -13,7 +13,10 @@ from typing import Any
 
 from . import registry
 from .config import (
+    BASE_DIR,
     BOT_STATE_FILE,
+    DATA_DIR,
+    LOG_FILE,
     MAX_RESULTS,
     MAX_SEEN_PER_CHANNEL,
     OUTPUT_FILE,
@@ -22,6 +25,33 @@ from .config import (
 )
 from .logging_setup import log
 from .timeutils import today_msk
+
+
+def ensure_data_dir() -> list[str]:
+    """Создаёт DATA_DIR и переносит туда файлы состояния из старых версий.
+
+    До версии 2.x состояние лежало в корне репозитория. Без переноса
+    обновившийся пользователь потерял бы seen_ids.json — и получил бы
+    шквал «новых» уведомлений по всем старым постам. Возвращает имена
+    перенесённых файлов (для лога).
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    moved: list[str] = []
+    targets = [OUTPUT_FILE, SEEN_FILE, BOT_STATE_FILE, REMOVED_WHEELS_FILE, LOG_FILE]
+    # Бэкапы ротации лога (parser.log.1 ...) переносим вместе с логом.
+    targets.extend(
+        LOG_FILE.with_suffix(LOG_FILE.suffix + f".{index}") for index in range(1, 4)
+    )
+    for target in targets:
+        legacy = BASE_DIR / target.name
+        if legacy == target or target.exists() or not legacy.exists():
+            continue
+        try:
+            legacy.replace(target)
+            moved.append(target.name)
+        except OSError as error:
+            log.warning("Не удалось перенести %s в %s: %s", legacy.name, DATA_DIR, error)
+    return moved
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -144,14 +174,26 @@ def load_removed_wheels() -> dict[str, str]:
     }
 
 
-REMOVED_WHEELS: dict[str, str] = load_removed_wheels()
+# Ленивая загрузка (а не при импорте): файл читается после ensure_data_dir(),
+# иначе перенос removed_wheels.json из корня прошёл бы мимо уже загруженного
+# пустого словаря и удалённые колёса «воскресли» бы после обновления.
+REMOVED_WHEELS: dict[str, str] | None = None
+
+
+def _removed_wheels_locked() -> dict[str, str]:
+    """Возвращает словарь, загружая при первом обращении. Только под локом."""
+    global REMOVED_WHEELS
+    if REMOVED_WHEELS is None:
+        REMOVED_WHEELS = load_removed_wheels()
+    return REMOVED_WHEELS
 
 
 def _prune_removed_wheels_locked(today: str) -> None:
     """Убирает записи прошлых суток. Вызывать только под REMOVED_WHEELS_LOCK."""
-    stale = [url for url, day in REMOVED_WHEELS.items() if day != today]
+    removed = _removed_wheels_locked()
+    stale = [url for url, day in removed.items() if day != today]
     for url in stale:
-        del REMOVED_WHEELS[url]
+        del removed[url]
 
 
 def removed_wheels_today() -> set[str]:
@@ -159,7 +201,7 @@ def removed_wheels_today() -> set[str]:
     today = today_msk()
     with REMOVED_WHEELS_LOCK:
         _prune_removed_wheels_locked(today)
-        return set(REMOVED_WHEELS)
+        return set(_removed_wheels_locked())
 
 
 def mark_wheel_removed(url: str) -> bool:
@@ -171,10 +213,11 @@ def mark_wheel_removed(url: str) -> bool:
     today = today_msk()
     with REMOVED_WHEELS_LOCK:
         _prune_removed_wheels_locked(today)
-        if url in REMOVED_WHEELS:
+        removed = _removed_wheels_locked()
+        if url in removed:
             return False
-        REMOVED_WHEELS[url] = today
-        snapshot = dict(REMOVED_WHEELS)
+        removed[url] = today
+        snapshot = dict(removed)
     atomic_write_json(REMOVED_WHEELS_FILE, snapshot)
     return True
 

@@ -14,21 +14,27 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Файлы состояния лежат в корне репозитория, на уровень выше каталога
-# пакета. Так пути не изменились после разбиения на модули и существующие
-# channels.txt/freebets.json продолжают работать.
+# Корень репозитория — на уровень выше каталога пакета. Здесь живут
+# редактируемые руками файлы: .env и списки каналов/слов (channels.txt,
+# keywords.txt, twitch_channels.txt).
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
+
+# Машинное состояние (JSON, лог, lock) — в отдельном каталоге data/, чтобы
+# не смешиваться с исходниками. Путь переопределяется WHEELSPARSER_DATA_DIR.
+# Каталог создаётся, а старые файлы из корня переносятся в app.main()
+# (см. storage.ensure_data_dir) — сам импорт пакета диск не трогает.
+DATA_DIR = Path(os.getenv("WHEELSPARSER_DATA_DIR", "") or (BASE_DIR / "data"))
 
 CHANNELS_FILE = BASE_DIR / "channels.txt"
 KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 TWITCH_CHANNELS_FILE = BASE_DIR / "twitch_channels.txt"
-OUTPUT_FILE = BASE_DIR / "freebets.json"
-SEEN_FILE = BASE_DIR / "seen_ids.json"
-BOT_STATE_FILE = BASE_DIR / "bot_state.json"
-REMOVED_WHEELS_FILE = BASE_DIR / "removed_wheels.json"
-LOG_FILE = BASE_DIR / "parser.log"
-LOCK_FILE = BASE_DIR / "wheelsparser.lock"
+OUTPUT_FILE = DATA_DIR / "freebets.json"
+SEEN_FILE = DATA_DIR / "seen_ids.json"
+BOT_STATE_FILE = DATA_DIR / "bot_state.json"
+REMOVED_WHEELS_FILE = DATA_DIR / "removed_wheels.json"
+LOG_FILE = DATA_DIR / "parser.log"
+LOCK_FILE = DATA_DIR / "wheelsparser.lock"
 
 DEFAULT_CHANNELS = [
     "amam0610", "aunkereEZ", "risenhaha", "zaykapoehali", "AdamStaya",

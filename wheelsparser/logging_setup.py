@@ -1,8 +1,9 @@
 """Логирование: цветная консоль, ротация файла, маскировка токена бота.
 
-Логгер создаётся при импорте — все модули пользуются одним объектом
-``log``. Импортировать модуль повторно безопасно: setup_logging()
-вызывается один раз.
+Все модули пользуются одним объектом ``log``. При импорте у логгера нет
+обработчиков — файлы не создаются, пока :func:`setup_logging` не вызван
+явно из ``app.main()``. Так ``import wheelsparser`` (в том числе в тестах)
+не оставляет parser.log на диске.
 """
 
 from __future__ import annotations
@@ -56,6 +57,12 @@ class ConsoleFormatter(logging.Formatter):
 
 
 def setup_logging() -> logging.Logger:
+    """Подключает обработчики (консоль + файл) к логгеру ``log``.
+
+    Вызывается один раз из ``app.main()`` ПОСЛЕ создания каталога данных:
+    RotatingFileHandler открывает LOG_FILE сразу, каталог обязан существовать.
+    Повторный вызов безопасен — старые обработчики снимаются.
+    """
     logger = logging.getLogger("wheelsparser")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -70,6 +77,8 @@ def setup_logging() -> logging.Logger:
         LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    for existing in list(logger.filters):
+        logger.removeFilter(existing)
     logger.addFilter(RedactTokenFilter())
     logger.addHandler(console)
     logger.addHandler(file_handler)
@@ -91,5 +100,6 @@ def force_utf8_console() -> None:
             continue
 
 
-force_utf8_console()
-log = setup_logging()
+# Без обработчиков до setup_logging(): импорт пакета не трогает диск.
+# Сообщения, отправленные до настройки, уходят в logging.lastResort (stderr).
+log = logging.getLogger("wheelsparser")
