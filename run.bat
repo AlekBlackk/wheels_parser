@@ -37,7 +37,7 @@ if not exist "%VENV_PYTHON%" (
 )
 
 echo Starting WheelsParser from the virtual environment...
-"%VENV_PYTHON%" betboom_web_parser.py
+"%VENV_PYTHON%" -m wheelsparser
 if errorlevel 1 (
     echo.
     echo Parser exited with an error.

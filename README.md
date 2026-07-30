@@ -40,7 +40,8 @@ WheelsParser отслеживает публичные Telegram-каналы и 
 
 ## Файлы
 
-- `betboom_web_parser.py` — основной скрипт;
+- `wheelsparser/` — код парсера и точка входа `python -m wheelsparser` (структура ниже);
+- `tests/` — тесты (`python -m pytest tests`);
 - `requirements.txt` — зависимости Python;
 - `run.bat` — установка и запуск в Windows;
 - `.env.example` — шаблон настроек: скопируйте в `.env` и заполните;
@@ -54,6 +55,32 @@ WheelsParser отслеживает публичные Telegram-каналы и 
 - `removed_wheels.json` — колёса, удалённые из `/active` командой `/removewheel` (создаётся автоматически);
 - `parser.log` — создаётся автоматически при запуске.
 
+## Структура кода
+
+Все файлы состояния лежат в корне репозитория рядом с точкой входа, код — в пакете `wheelsparser/`:
+
+| Модуль | Отвечает за |
+|---|---|
+| `config.py` | пути, переменные окружения, константы, регэкспы, значки |
+| `logging_setup.py` | логгер: цветная консоль, ротация `parser.log`, маскировка токена |
+| `timeutils.py` | московское время: `now_msk`, разбор и формат `found_at` |
+| `net.py` | HTTP-сессии и их владельцы (по одной на поток) |
+| `runtime.py` | `STOP_EVENT`, обработчики сигналов, блокировка второго экземпляра |
+| `registry.py` | списки каналов, ключевых слов и Twitch-каналов + их файлы |
+| `storage.py` | состояние на диске: `seen_ids.json`, `freebets.json`, удалённые колёса, offset бота |
+| `urls.py` | канонизация ссылок и хэш содержимого поста |
+| `keywords.py` | поиск ключевых слов с учётом русских окончаний |
+| `alerts.py` | кулдаун повторных уведомлений, общий для Telegram и Twitch |
+| `betboom.py` | API BetBoom: статус колеса, параллельная проверка, кэш завершившихся |
+| `telegram_api.py` | отправка уведомлений и ответов бота |
+| `active_report.py` | команда `/active`: фоновая проверка и формат ответа |
+| `bot.py` | команды бота и цикл `getUpdates` |
+| `twitch.py` | чтение Twitch-чатов по IRC |
+| `parser.py` | обход Telegram-каналов, разбор постов, рассылка находок |
+| `app.py` | инициализация и запуск потоков (`main`) |
+
+Зависимости направлены сверху вниз по таблице, циклов нет.
+
 ## Быстрый запуск в Windows
 
 1. Установите Python 3.10 или новее.
@@ -66,7 +93,7 @@ WheelsParser отслеживает публичные Telegram-каналы и 
 
 ```bash
 python -m pip install -r requirements.txt
-python betboom_web_parser.py
+python -m wheelsparser
 ```
 
 ## Настройки

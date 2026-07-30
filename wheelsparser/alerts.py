@@ -1,0 +1,58 @@
+"""Кулдаун повторных уведомлений — общий для Telegram и Twitch.
+
+Одно и то же колесо, найденное в двух источниках, не рассылается дважды.
+Состояние живёт в памяти и восстанавливается из freebets.json при старте.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import threading
+
+from .config import OUTPUT_FILE, REALERT_COOLDOWN_MINUTES
+from .storage import read_json
+from .timeutils import parse_found_at
+from .urls import normalize_url
+
+# url -> время последнего отправленного уведомления (МСК).
+LAST_URL_ALERT: dict[str, datetime] = {}
+LAST_URL_ALERT_LOCK = threading.Lock()
+
+
+def cooldown_active(url: str, now: datetime) -> bool:
+    """True, если об этом колесе уже оповещали в пределах кулдауна."""
+    with LAST_URL_ALERT_LOCK:
+        previous = LAST_URL_ALERT.get(url)
+    return bool(
+        previous
+        and now - previous <= timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    )
+
+
+def last_alert(url: str) -> datetime | None:
+    with LAST_URL_ALERT_LOCK:
+        return LAST_URL_ALERT.get(url)
+
+
+def mark_url_alert(url: str, when: datetime) -> None:
+    with LAST_URL_ALERT_LOCK:
+        existing = LAST_URL_ALERT.get(url)
+        if existing is None or when > existing:
+            LAST_URL_ALERT[url] = when
+
+
+def seed_url_alerts_from_history() -> None:
+    """Восстанавливает кулдаун уведомлений из freebets.json после рестарта.
+
+    Без этого Twitch-кулдаун жил только в памяти: после перезапуска парсера
+    та же ссылка могла уйти в Telegram повторно раньше времени.
+    """
+    for item in read_json(OUTPUT_FILE, []):
+        if not isinstance(item, dict):
+            continue
+        url = normalize_url(str(item.get("url", "")))
+        if not url:
+            continue
+        found = parse_found_at(item.get("found_at"))
+        if found is not None:
+            mark_url_alert(url, found)
