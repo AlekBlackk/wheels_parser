@@ -1,17 +1,28 @@
+# Машинное состояние (см. wheelsparser/config.py: DATA_DIR)
+data/
 *.lock
 parser.log
 seen_ids.json
 freebets.json
+bot_state.json
+removed_wheels.json
+
+# Секреты
 .env
+
+# Списки-источники правды, изменяемые на лету (команды бота)
 keywords.txt
 channels.txt
+twitch_channels.txt
+
+# Python / инструменты
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.tmp
-.venv/
 *.egg-info/
 build/
 dist/
+.venv/
+*.tmp
