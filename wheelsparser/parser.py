@@ -254,6 +254,11 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
     ссылки доходят, что важнее для этого редкого повторного случая.
     Лимит и окно ограничивают стоимость длительного сбоя: не тратим
     весь цикл на HTTP-ретраи по всему бэклогу разом.
+
+    Записи с delivery_unknown пропускаются: sendMessage не идемпотентен,
+    и при таймауте чтения или 5xx сообщение могло уже уйти в чат —
+    повтор такой отправки рассылал бы дубликаты (см.
+    telegram_api.delivery_unknown).
     """
     if not notifications_enabled():
         return 0
@@ -262,6 +267,8 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
         if retried >= NOTIFY_RETRY_MAX_PER_CYCLE:
             break
         if entry.get("notified") or not entry.get("url"):
+            continue
+        if entry.get("delivery_unknown"):
             continue
         found = parse_found_at(entry.get("found_at"))
         if found is None or now - found > timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES):

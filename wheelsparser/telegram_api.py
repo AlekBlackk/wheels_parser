@@ -43,6 +43,39 @@ def notifications_enabled() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
+def delivery_unknown(error: requests.RequestException) -> bool:
+    """True, если по ошибке нельзя понять, доставлено сообщение или нет.
+
+    sendMessage не идемпотентен: повторная отправка — это второе сообщение
+    в чате. Таймаут чтения (запрос сервер уже принял) и 5xx от шлюза
+    Telegram не доказывают, что сообщение не дошло, поэтому такие записи
+    ретраю не подлежат — см. parser.retry_failed_notifications.
+    """
+    response = getattr(error, "response", None)
+    if response is not None:
+        # Ответ получен: 5xx мог прийти уже после приёма сообщения,
+        # 4xx (включая 429) — гарантированный отказ до обработки.
+        return int(getattr(response, "status_code", 0)) >= 500
+    # Ответа нет. Ошибка соединения означает, что запрос не ушёл;
+    # таймаут чтения — что ушёл и остался без ответа.
+    return isinstance(error, requests.Timeout) and not isinstance(
+        error, requests.ConnectTimeout
+    )
+
+
+def _mark_delivery(entries: list[dict[str, Any]], error: requests.RequestException) -> None:
+    if not delivery_unknown(error):
+        return
+    for entry in entries:
+        entry["delivery_unknown"] = True
+    log.warning(
+        "%s Статус доставки уведомления неизвестен (%s) — повтор не отправляю, "
+        "чтобы не продублировать сообщение; проверьте чат",
+        icon("warn"),
+        error,
+    )
+
+
 def _post_message(
     session: requests.Session,
     chat_id: str,
@@ -100,6 +133,7 @@ def send_telegram_notification(
         return True
     except requests.RequestException as error:
         log.error("Не удалось отправить Telegram-уведомление: %s", error)
+        _mark_delivery([entry], error)
         return False
 
 
@@ -140,6 +174,7 @@ def send_multi_telegram_notification(
         log.error(
             "Не удалось отправить Telegram-уведомление (несколько ссылок): %s", error
         )
+        _mark_delivery(entries, error)
         return False
 
 

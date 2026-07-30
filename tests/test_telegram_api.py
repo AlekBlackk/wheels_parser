@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
+
 from wheelsparser import telegram_api
 
 
@@ -189,6 +191,81 @@ class KeywordNotificationTests(unittest.TestCase):
         fallback = session.post.call_args.kwargs["json"]
         self.assertNotIn("parse_mode", fallback)
         self.assertIn("будет колесо", fallback["text"])
+
+
+class DeliveryUnknownTests(unittest.TestCase):
+    """Ошибка отправки не всегда значит «сообщение не доставлено».
+
+    Telegram мог принять sendMessage и не донести ответ (таймаут чтения,
+    502 от шлюза). Повтор такой отправки шлёт дубликат, поэтому такие
+    случаи помечаются delivery_unknown и ретраю не подлежат.
+    """
+
+    def setUp(self):
+        for name, value in (
+            ("TELEGRAM_BOT_TOKEN", "token"),
+            ("TELEGRAM_CHAT_ID", "42"),
+        ):
+            patcher = patch.object(telegram_api, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def entry(self):
+        return {
+            "url": "https://betboom.ru/freestream/a",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "message_url": "https://t.me/demo/1",
+            "status": "active",
+        }
+
+    def failing_session(self, error):
+        session = Mock()
+        session.post.side_effect = error
+        return session
+
+    def test_read_timeout_marks_delivery_unknown(self):
+        entry = self.entry()
+        session = self.failing_session(requests.ReadTimeout("read timed out"))
+
+        self.assertFalse(telegram_api.send_telegram_notification(entry, session))
+        self.assertTrue(entry["delivery_unknown"])
+
+    def test_server_error_marks_delivery_unknown(self):
+        entry = self.entry()
+        response = Mock(status_code=502)
+        error = requests.HTTPError("502 Server Error", response=response)
+        response.raise_for_status.side_effect = error
+        session = Mock()
+        session.post.return_value = response
+
+        self.assertFalse(telegram_api.send_telegram_notification(entry, session))
+        self.assertTrue(entry["delivery_unknown"])
+
+    def test_connection_error_keeps_entry_retriable(self):
+        entry = self.entry()
+        session = self.failing_session(requests.ConnectionError("dns failure"))
+
+        self.assertFalse(telegram_api.send_telegram_notification(entry, session))
+        self.assertFalse(entry.get("delivery_unknown"))
+
+    def test_rate_limit_keeps_entry_retriable(self):
+        entry = self.entry()
+        response = Mock(status_code=429)
+        error = requests.HTTPError("429 Too Many Requests", response=response)
+        response.raise_for_status.side_effect = error
+        session = Mock()
+        session.post.return_value = response
+
+        self.assertFalse(telegram_api.send_telegram_notification(entry, session))
+        self.assertFalse(entry.get("delivery_unknown"))
+
+    def test_multi_notification_marks_every_entry(self):
+        entries = [self.entry(), self.entry()]
+        session = self.failing_session(requests.ReadTimeout("read timed out"))
+
+        self.assertFalse(telegram_api.send_multi_telegram_notification(entries, session))
+        self.assertTrue(all(entry["delivery_unknown"] for entry in entries))
 
 
 if __name__ == "__main__":

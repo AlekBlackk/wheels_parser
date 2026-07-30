@@ -224,6 +224,19 @@ class RetryFailedNotificationsTests(unittest.TestCase):
 
         self.assertFalse(results[0]["notified"])
 
+    def test_entries_with_unknown_delivery_are_not_retried(self):
+        # Telegram мог принять сообщение и не донести ответ — повтор
+        # такой отправки рассылает дубликат.
+        send = self._start(patch.object(parser, "send_telegram_notification"))
+        entry = self.entry()
+        entry["delivery_unknown"] = True
+        results = [entry]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 0)
+        send.assert_not_called()
+
     def test_respects_max_per_cycle_limit(self):
         send = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)

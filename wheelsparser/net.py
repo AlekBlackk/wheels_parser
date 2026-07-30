@@ -23,6 +23,12 @@ from .config import HEADERS
 
 
 def build_session() -> requests.Session:
+    # allowed_methods только для GET: повтор POST — это повторная отправка
+    # сообщения в Telegram. Ни read-таймаут, ни 5xx/429 не доказывают, что
+    # sendMessage не выполнен: запрос сервер уже принял, потерян лишь ответ,
+    # и «прозрачный» повтор рассылает дубликат уведомления (тихо — вызывающий
+    # код видит успех последней попытки). Ошибки соединения urllib3 повторяет
+    # независимо от allowed_methods, и это безопасно: запрос не был отправлен.
     retry = Retry(
         total=4,
         connect=4,
@@ -30,7 +36,7 @@ def build_session() -> requests.Session:
         status=4,
         backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "POST"}),
+        allowed_methods=frozenset({"GET"}),
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
