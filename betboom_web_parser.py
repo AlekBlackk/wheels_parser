@@ -883,6 +883,55 @@ def send_telegram_notification(
         return False
 
 
+def send_multi_telegram_notification(
+    entries: list[dict[str, Any]], session: requests.Session | None = None
+) -> bool:
+    """Одно уведомление о нескольких новых ссылках из ОДНОГО поста.
+
+    Пост может содержать «хвост» — старый href, оставшийся от копипасты
+    прошлого поста, рядом с актуальной ссылкой. API BetBoom не всегда
+    отличает такой хвост от активного колеса (см. _api_info_to_status —
+    fail-open по дизайну), поэтому вместо N отдельных «Новая ссылка»
+    шлём одно сообщение со списком: какая ссылка настоящая, решает человек.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    first = entries[0]
+    source_note = " (пост отредактирован)" if first.get("edited") else ""
+    status_notes = {
+        "active": "колесо активно",
+        "soon": "розыгрыш ещё не начался",
+        "expired": "уже завершилось",
+        "unknown": "не удалось проверить",
+    }
+    lines = [
+        f"{icon('start')} Новая ссылка WheelsParser{source_note}",
+        f"Канал: @{first['channel']}",
+        f"Найдено: {format_found_at(first['found_at'])}",
+        f"{icon('warn')} В посте несколько ссылок — уточните вручную, какая актуальна:",
+    ]
+    for entry in entries:
+        note = status_notes.get(str(entry.get("status", "")), "")
+        suffix = f" ({note})" if note else ""
+        lines.append(f"{entry['url']}{suffix}")
+    lines.append(f"Пост: {first['message_url']}")
+    text = "\n".join(lines)
+    endpoint = f"{BOT_API}/sendMessage"
+    try:
+        response = (session or SESSION).post(
+            endpoint,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        log.error(
+            "Не удалось отправить Telegram-уведомление (несколько ссылок): %s", error
+        )
+        return False
+
+
 def send_keyword_notification(entry: dict[str, Any]) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
@@ -2206,6 +2255,7 @@ def process_cycle(
             channel_seen[message["id"]] = message["hash"]
             if channel_baseline or not (is_new_message or is_edited_message):
                 continue
+            pending_entries: list[dict[str, Any]] = []
             for url in message["urls"]:
                 previous = last_found.get(url)
                 # Кулдаун общий с Twitch: находки twitch-потока с момента
@@ -2234,7 +2284,7 @@ def process_cycle(
                     last_found[url] = now
                     _mark_url_alert(url, now)
                     continue
-                entry = {
+                pending_entries.append({
                     "url": url,
                     "found_at": now_msk().isoformat(timespec="seconds"),
                     "channel": channel,
@@ -2244,18 +2294,43 @@ def process_cycle(
                     "edited": is_edited_message,
                     "status": status,
                     "notified": False,
-                }
+                })
+
+            # Один пост может дать несколько «новых» ссылок — например,
+            # «хвост»: старый href от копипасты прошлого поста рядом с
+            # актуальной ссылкой. Статус API их не всегда различает
+            # (см. _api_info_to_status — fail-open по дизайну), поэтому
+            # вместо N отдельных «Новая ссылка» шлём одно сообщение со
+            # списком: какая ссылка настоящая, решает человек.
+            if len(pending_entries) == 1:
+                entry = pending_entries[0]
                 entry["notified"] = send_telegram_notification(entry)
                 results.append(entry)
                 new_entries.append(entry)
-                last_found[url] = now
-                _mark_url_alert(url, now)
+                last_found[entry["url"]] = now
+                _mark_url_alert(entry["url"], now)
                 log.info(
                     "%s %s [@%s]: %s",
                     icon("link"),
                     "Ссылка из правки поста" if is_edited_message else "Новая ссылка",
                     channel,
-                    url,
+                    entry["url"],
+                    extra={"highlight": True},
+                )
+            elif pending_entries:
+                sent = send_multi_telegram_notification(pending_entries)
+                for entry in pending_entries:
+                    entry["notified"] = sent
+                    results.append(entry)
+                    new_entries.append(entry)
+                    last_found[entry["url"]] = now
+                    _mark_url_alert(entry["url"], now)
+                log.info(
+                    "%s %s ссылок в одном посте [@%s]: %s",
+                    icon("link"),
+                    len(pending_entries),
+                    channel,
+                    ", ".join(entry["url"] for entry in pending_entries),
                     extra={"highlight": True},
                 )
             # Поиск по ключевым словам — только для новых сообщений без ссылок:
