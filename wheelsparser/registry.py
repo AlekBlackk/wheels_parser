@@ -171,16 +171,41 @@ def load_twitch_channels() -> tuple[list[str], bool]:
 # ----------------------------------------------------------------------------
 # Состояние в памяти
 # ----------------------------------------------------------------------------
+# Списки пустые до вызова init() из app.main(): импорт пакета не читает
+# файлы с диска (и тесты не зависят от реальных channels.txt/keywords.txt).
+# init() наполняет списки НА МЕСТЕ (slice-присваивание), не подменяя объект:
+# другие модули уже могли захватить ссылку через registry.CHANNELS.
 
-CHANNELS, SEED_CHANNELS_FILE = load_channels()
+CHANNELS: list[str] = []
+SEED_CHANNELS_FILE = False
 CHANNELS_LOCK = threading.RLock()
-KEYWORDS, SEED_KEYWORDS_FILE = load_keywords()
+KEYWORDS: list[str] = []
+SEED_KEYWORDS_FILE = False
 KEYWORDS_LOCK = threading.RLock()
-TWITCH_CHANNELS, SEED_TWITCH_FILE = load_twitch_channels()
+TWITCH_CHANNELS: list[str] = []
+SEED_TWITCH_FILE = False
 TWITCH_CHANNELS_LOCK = threading.RLock()
 
 # Сигнал twitch-потоку переподключиться (список каналов изменился на лету).
 TWITCH_RELOAD = threading.Event()
+
+
+def init() -> None:
+    """Загружает списки из файлов (или значений по умолчанию/env).
+
+    Вызывается один раз из ``app.main()`` до старта потоков. Повторный
+    вызов безопасен: списки перечитываются заново.
+    """
+    global SEED_CHANNELS_FILE, SEED_KEYWORDS_FILE, SEED_TWITCH_FILE
+    channels, SEED_CHANNELS_FILE = load_channels()
+    with CHANNELS_LOCK:
+        CHANNELS[:] = channels
+    keywords, SEED_KEYWORDS_FILE = load_keywords()
+    with KEYWORDS_LOCK:
+        KEYWORDS[:] = keywords
+    twitch, SEED_TWITCH_FILE = load_twitch_channels()
+    with TWITCH_CHANNELS_LOCK:
+        TWITCH_CHANNELS[:] = twitch
 
 
 def channels_snapshot() -> list[str]:

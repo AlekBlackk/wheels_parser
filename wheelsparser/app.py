@@ -180,6 +180,7 @@ def main() -> int:
         return 1
 
     install_signal_handlers()
+    registry.init()
     _seed_registry_files()
 
     seen, has_state = load_seen()
