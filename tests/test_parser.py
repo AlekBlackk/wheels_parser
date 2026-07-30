@@ -78,7 +78,7 @@ class ProcessMessageTests(unittest.TestCase):
     def setUp(self):
         # Кулдаун глобален для процесса — изолируем тесты друг от друга.
         self._start(patch.dict(alerts.LAST_URL_ALERT, clear=True))
-        self._start(patch.object(parser, "precheck_wheel_status", return_value="active"))
+        self._start(patch.object(parser, "precheck_wheel", return_value=("active", False)))
         self.single = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)
         )
@@ -149,7 +149,7 @@ class ProcessMessageTests(unittest.TestCase):
 
     def test_expired_wheel_is_not_notified(self):
         message = make_message("demo/1", "колесо", ["https://betboom.ru/freestream/a"])
-        with patch.object(parser, "precheck_wheel_status", return_value="expired"):
+        with patch.object(parser, "precheck_wheel", return_value=("expired", False)):
             self.assertEqual(self.process(message, {}), [])
         self.single.assert_not_called()
 
@@ -176,7 +176,7 @@ class ProcessCycleTests(unittest.TestCase):
 
         with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
              patch.object(registry, "CHANNELS", ["demo"]), \
-             patch.object(parser, "precheck_wheel_status", return_value="active"), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False)), \
              patch.object(parser, "fetch_channel", side_effect=[[first], [second]]), \
              patch.object(parser, "send_telegram_notification", return_value=True), \
              patch.object(parser, "save_seen"), \

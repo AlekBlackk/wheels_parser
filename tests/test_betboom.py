@@ -69,6 +69,74 @@ class ApiCheckTests(unittest.TestCase):
         )
 
 
+class ReferralDetectionTests(unittest.TestCase):
+    def test_detects_referral_from_api_description(self):
+        info = {
+            "title": "AUNKERE КОЛЕСО ФРИБЕТОВ",
+            "description": "Розыгрыш фрибетов для рефералов",
+        }
+        self.assertTrue(
+            betboom.is_referral_wheel("https://betboom.ru/freestream/aunkere", info)
+        )
+
+    def test_detects_referral_from_url_slug_without_info(self):
+        self.assertTrue(
+            betboom.is_referral_wheel(
+                "https://betboom.ru/freestream/aunkereref", None
+            )
+        )
+
+    def test_regular_wheel_is_not_referral(self):
+        info = {
+            "title": "ZONER КОЛЕСО ФРИБЕТОВ TG",
+            "description": "УЧАСТВУЙ В РОЗЫГРЫШЕ ФРИБЕТОВ",
+        }
+        self.assertFalse(
+            betboom.is_referral_wheel("https://betboom.ru/freestream/zonertg4", info)
+        )
+
+    def test_ignores_ref_inside_longer_word(self):
+        info = {"title": "", "description": "префикс не считается"}
+        self.assertFalse(
+            betboom.is_referral_wheel("https://betboom.ru/freestream/zoner", info)
+        )
+
+
+class PrecheckWheelTests(unittest.TestCase):
+    def test_precheck_returns_status_and_referral_flag(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "code": 200,
+            "status": "OK",
+            "info": {
+                "is_ended": False,
+                "is_early": False,
+                "title": "КОЛЕСО",
+                "description": "Розыгрыш для рефералов",
+            },
+        }
+        session = Mock()
+        session.post.return_value = response
+
+        status, referral = betboom.precheck_wheel(
+            "https://betboom.ru/freestream/plainslug", session
+        )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(referral)
+
+    def test_precheck_falls_back_to_slug_when_api_fails(self):
+        session = Mock()
+        session.post.side_effect = OSError("down")
+
+        status, referral = betboom.precheck_wheel(
+            "https://betboom.ru/freestream/someref", session
+        )
+
+        self.assertEqual(status, "unknown")
+        self.assertTrue(referral)
+
+
 class RegressionTests(unittest.TestCase):
     def test_active_check_does_not_require_playwright(self):
         self.assertFalse(hasattr(betboom, "async_playwright"))

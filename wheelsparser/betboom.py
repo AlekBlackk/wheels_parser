@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,28 @@ from .urls import normalize_url
 # active-api-потока, поэтому доступ — только под _expired_cache_lock.
 _expired_cache: dict[str, str] = {}
 _expired_cache_lock = threading.Lock()
+
+
+# У API BetBoom нет флага «колесо для рефералов» — стример помечает это
+# только текстом («Розыгрыш фрибетов для рефералов») или «ref» в адресе.
+# \bреф ловит «рефералов», «рефы», «рефовод», «рефка»; граница слова
+# отсекает «префикс» и т.п.
+REFERRAL_TEXT_RE = re.compile(r"\bреф", re.IGNORECASE)
+
+
+def is_referral_wheel(url: str, info: dict[str, Any] | None) -> bool:
+    """True, если колесо предназначено для рефералов.
+
+    Два сигнала (OR): текст title/description из API и подстрока «ref»
+    в slug URL. Slug — запасной сигнал: работает при сбое API и при
+    выключенном precheck.
+    """
+    if info:
+        text = f"{info.get('title', '')} {info.get('description', '')}"
+        if REFERRAL_TEXT_RE.search(text):
+            return True
+    slug = normalize_url(url).rsplit("/", 1)[-1]
+    return "ref" in slug.lower()
 
 
 def api_info_to_status(info: dict[str, Any]) -> str:
@@ -75,15 +98,18 @@ def api_info_to_status(info: dict[str, Any]) -> str:
     return "active"
 
 
-def check_wheel_status(url: str, session: requests.Session) -> str:
-    """Запрашивает статус одного колеса через BetBoom API без браузера.
+def fetch_wheel_info(
+    url: str, session: requests.Session
+) -> dict[str, Any] | None:
+    """Запрашивает info одного колеса через BetBoom API без браузера.
 
-    Возвращает 'active', 'soon', 'expired' или 'unknown' при любой ошибке.
-    Сессия передаётся явно: у каждого потока она своя (см. net.py).
+    Возвращает словарь info или None при любой ошибке (сеть, не-200,
+    неожиданный формат). Сессия передаётся явно: у каждого потока она
+    своя (см. net.py).
     """
     canonical = normalize_url(url)
     if not canonical:
-        return "unknown"
+        return None
     try:
         response = session.post(
             STREAMER_WHEEL_INFO_API,
@@ -100,12 +126,20 @@ def check_wheel_status(url: str, session: requests.Session) -> str:
             log.debug(
                 "active-check API: HTTP %s для %s", response.status_code, canonical
             )
-            return "unknown"
-        payload = response.json()
-        return api_info_to_status(payload.get("info", {}))
+            return None
+        info = response.json().get("info", {})
+        return info if isinstance(info, dict) else None
     except Exception as error:
         log.debug("active-check API: ошибка для %s: %s", canonical, error)
+        return None
+
+
+def check_wheel_status(url: str, session: requests.Session) -> str:
+    """Статус одного колеса: 'active', 'soon', 'expired' или 'unknown'."""
+    info = fetch_wheel_info(url, session)
+    if info is None:
         return "unknown"
+    return api_info_to_status(info)
 
 
 def _prune_expired_cache(today: str) -> None:
@@ -126,29 +160,37 @@ def _cache_expired(url: str, today: str) -> None:
         _expired_cache[url] = today
 
 
-def precheck_wheel_status(
+def precheck_wheel(
     url: str, session: requests.Session | None = None
-) -> str:
-    """Статус колеса перед отправкой уведомления.
+) -> tuple[str, bool]:
+    """Статус колеса и реф-флаг перед отправкой уведомления.
 
-    Возвращает 'active', 'soon', 'expired' или 'unknown'. При 'unknown'
-    уведомление всё равно отправляется (fail-open): лучше лишний раз
-    оповестить, чем пропустить живое колесо из-за сбоя API.
+    Возвращает ('active'/'soon'/'expired'/'unknown', is_referral).
+    При 'unknown' уведомление всё равно отправляется (fail-open): лучше
+    лишний раз оповестить, чем пропустить живое колесо из-за сбоя API.
+    Реф-флаг при недоступном info считается по slug URL.
     По умолчанию используется PARSER_SESSION — вызывающему из другого
     потока нужно передать свою сессию.
     """
     canonical = normalize_url(url)
     if not canonical:
-        return "unknown"
+        return "unknown", False
     today = today_msk()
     if _is_cached_expired(canonical, today):
         log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
-        return "expired"
-    status = check_wheel_status(canonical, session or PARSER_SESSION)
-    log.info("precheck [api]: %s → %s", canonical, status)
+        return "expired", is_referral_wheel(canonical, None)
+    info = fetch_wheel_info(canonical, session or PARSER_SESSION)
+    status = "unknown" if info is None else api_info_to_status(info)
+    referral = is_referral_wheel(canonical, info)
+    log.info(
+        "precheck [api]: %s → %s%s",
+        canonical,
+        status,
+        " (для рефералов)" if referral else "",
+    )
     if status == "expired":
         _cache_expired(canonical, today)
-    return status
+    return status, referral
 
 
 def classify_wheels(
@@ -192,7 +234,12 @@ def classify_wheels(
             with lock:
                 results.append((index, "expired"))
             return
-        status = check_wheel_status(url, worker_session())
+        info = fetch_wheel_info(url, worker_session())
+        status = "unknown" if info is None else api_info_to_status(info)
+        # Реф-флаг обновляется по свежему info: старые записи (до появления
+        # поля referral) получают пометку прямо при /active.
+        if not item.get("referral") and is_referral_wheel(url, info):
+            item["referral"] = True
         log.info("active-check [api]: %s → %s", url, status)
         if status == "expired":
             _cache_expired(url, today)

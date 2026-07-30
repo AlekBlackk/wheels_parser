@@ -70,6 +70,9 @@ def send_telegram_notification(
     source_note = " (пост отредактирован)" if entry.get("edited") else ""
     status_note = STATUS_NOTES.get(str(entry.get("status", "")))
     status_line = f"Статус: {status_note}\n" if status_note else ""
+    referral_line = (
+        f"{icon('warn')} Колесо для рефералов\n" if entry.get("referral") else ""
+    )
     if entry.get("source") == "twitch":
         badge_icons = "".join(
             TWITCH_ROLE_ICONS.get(role, "")
@@ -88,6 +91,7 @@ def send_telegram_notification(
         f"{origin_line}"
         f"Найдено: {format_found_at(entry['found_at'])}\n"
         f"Ссылка: {entry['url']}\n"
+        f"{referral_line}"
         f"{status_line}"
         f"{post_line}"
     )
@@ -122,6 +126,8 @@ def send_multi_telegram_notification(
     ]
     for entry in entries:
         note = MULTI_STATUS_NOTES.get(str(entry.get("status", "")), "")
+        if entry.get("referral"):
+            note = f"{note}, для рефералов" if note else "для рефералов"
         suffix = f" ({note})" if note else ""
         lines.append(f"{entry['url']}{suffix}")
     lines.append(f"Пост: {first['message_url']}")

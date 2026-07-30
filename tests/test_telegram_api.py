@@ -62,6 +62,60 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("🤖", text)
         self.assertIn("розыгрыш ещё не начался", text)
 
+    def test_notification_marks_referral_wheel(self):
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/a",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "message_url": "https://t.me/demo/1",
+            "status": "active",
+            "referral": True,
+        }
+
+        self.assertTrue(telegram_api.send_telegram_notification(entry, session))
+        self.assertIn("Колесо для рефералов", self.sent_text(session))
+
+    def test_notification_without_flag_has_no_referral_line(self):
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/a",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "message_url": "https://t.me/demo/1",
+            "status": "active",
+        }
+
+        self.assertTrue(telegram_api.send_telegram_notification(entry, session))
+        self.assertNotIn("рефералов", self.sent_text(session))
+
+    def test_multi_notification_marks_referral_urls(self):
+        session = fake_session()
+        entries = [
+            {
+                "url": "https://betboom.ru/freestream/a",
+                "found_at": "2026-07-30T20:40:31+03:00",
+                "channel": "demo",
+                "message_url": "https://t.me/demo/1",
+                "status": "active",
+                "referral": True,
+            },
+            {
+                "url": "https://betboom.ru/freestream/b",
+                "found_at": "2026-07-30T20:40:31+03:00",
+                "channel": "demo",
+                "message_url": "https://t.me/demo/1",
+                "status": "expired",
+            },
+        ]
+
+        self.assertTrue(telegram_api.send_multi_telegram_notification(entries, session))
+        text = self.sent_text(session)
+        self.assertIn(
+            "https://betboom.ru/freestream/a (колесо активно, для рефералов)", text
+        )
+        self.assertIn("https://betboom.ru/freestream/b (уже завершилось)", text)
+
     def test_multi_notification_lists_every_url_with_status_note(self):
         session = fake_session()
         entries = [

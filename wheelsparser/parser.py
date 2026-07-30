@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 
 from . import registry
 from .alerts import last_alert, mark_url_alert
-from .betboom import precheck_wheel_status
+from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
     ALERT_ON_FIRST_RUN,
     CHANNEL_FAIL_THRESHOLD,
@@ -272,7 +272,10 @@ def collect_pending_entries(
         # старые href на прошлые (уже завершившиеся) колёса — молча
         # пропускаем. Статусы 'active'/'soon'/'unknown' рассылаются,
         # unknown — fail-open, чтобы не терять живые колёса при сбое API.
-        status = precheck_wheel_status(url) if PRECHECK_WHEELS else ""
+        if PRECHECK_WHEELS:
+            status, referral = precheck_wheel(url)
+        else:
+            status, referral = "", is_referral_wheel(url, None)
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [@%s]: колесо уже завершилось (API BetBoom)",
@@ -291,6 +294,7 @@ def collect_pending_entries(
             "preview": message["text"][:200],
             "edited": is_edited_message,
             "status": status,
+            "referral": referral,
             "notified": False,
         })
     return pending

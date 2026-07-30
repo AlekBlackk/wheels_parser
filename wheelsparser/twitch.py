@@ -18,7 +18,7 @@ from typing import Any
 
 from . import registry
 from .alerts import cooldown_active, mark_url_alert
-from .betboom import precheck_wheel_status
+from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
     FREESTREAM_RE,
     PRECHECK_WHEELS,
@@ -90,9 +90,10 @@ def handle_twitch_message(
         now = now_msk()
         if cooldown_active(url, now):
             continue  # недавно уже оповещали об этом колесе (TG или Twitch)
-        status = (
-            precheck_wheel_status(url, TWITCH_SESSION) if PRECHECK_WHEELS else ""
-        )
+        if PRECHECK_WHEELS:
+            status, referral = precheck_wheel(url, TWITCH_SESSION)
+        else:
+            status, referral = "", is_referral_wheel(url, None)
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [twitch #%s]: колесо уже завершилось (API BetBoom)",
@@ -114,6 +115,7 @@ def handle_twitch_message(
             "preview": text[:200],
             "edited": False,
             "status": status,
+            "referral": referral,
             "notified": False,
         }
         # Помечаем ДО отправки: даже при сбое уведомления повторной

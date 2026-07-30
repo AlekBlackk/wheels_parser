@@ -58,7 +58,8 @@ def format_active_item(item: dict[str, Any], number: int) -> str:
         channel_label = f"@{channel}"
     # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
     url = html.escape(normalize_url(str(item.get("url", ""))))
-    return f"{number}. {found_time} — {channel_label}\n{url}"
+    referral_mark = " ⚠️ для рефералов" if item.get("referral") else ""
+    return f"{number}. {found_time} — {channel_label}{referral_mark}\n{url}"
 
 
 def format_active_result(

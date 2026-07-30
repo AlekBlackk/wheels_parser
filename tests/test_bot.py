@@ -86,6 +86,26 @@ class TwitchCommandTests(unittest.TestCase):
         save.assert_called_once_with()
 
 
+class ActiveReportFormatTests(unittest.TestCase):
+    def test_referral_wheel_is_marked_in_active_list(self):
+        item = {
+            "url": "https://betboom.ru/freestream/one",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "referral": True,
+        }
+        line = active_report.format_active_item(item, 1)
+        self.assertIn("рефералов", line)
+
+    def test_regular_wheel_has_no_referral_mark(self):
+        item = {
+            "url": "https://betboom.ru/freestream/one",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+        }
+        self.assertNotIn("реф", active_report.format_active_item(item, 1))
+
+
 class RemoveWheelCommandTests(unittest.TestCase):
     def test_removes_wheel_by_number_from_last_active_answer(self):
         active_report.remember_active_numbers(
