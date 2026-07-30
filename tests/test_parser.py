@@ -262,6 +262,125 @@ class RetryFailedNotificationsTests(unittest.TestCase):
         send.assert_not_called()
 
 
+class EmptyChannelDetectionTests(unittest.TestCase):
+    """Страница канала отдалась, но постов в ней нет.
+
+    Единственный отказ, который иначе не виден: канал засчитывается
+    успешным, в логе «каналов N/N», новых ссылок ноль — и так до тех пор,
+    пока кто-нибудь не заметит, что колёса перестали приходить.
+    """
+
+    def _start(self, patcher):
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    def setUp(self):
+        self._start(patch.dict(parser.CHANNEL_EMPTY_STREAK, clear=True))
+        self._start(patch.object(parser, "CHANNEL_EMPTY_ALERTED", set()))
+        self._start(patch.object(parser, "LAYOUT_ALERTED", False))
+        self._start(patch.object(parser, "CHANNEL_EMPTY_THRESHOLD", 3))
+        self.notify = self._start(patch.object(parser, "send_service_notification"))
+
+    def run_cycles(self, checked, failed, empty, times=1):
+        for _ in range(times):
+            parser.update_channel_empty_streaks(checked, failed, empty)
+            parser.report_empty_channels(checked, failed)
+
+    def test_streak_grows_and_alerts_only_at_threshold(self):
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], [], ["a"], times=2)
+            self.notify.assert_not_called()
+
+            self.run_cycles(["a", "b"], [], ["a"])
+
+        self.notify.assert_called_once()
+        self.assertIn("@a", self.notify.call_args.args[0])
+
+    def test_alert_is_sent_once_per_series(self):
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], [], ["a"], times=5)
+
+        self.notify.assert_called_once()
+
+    def test_posts_reset_streak_and_allow_new_alert(self):
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], [], ["a"], times=3)
+            self.assertEqual(self.notify.call_count, 1)
+
+            self.run_cycles(["a", "b"], [], [])  # канал снова отдал посты
+            self.assertEqual(parser.CHANNEL_EMPTY_STREAK.get("a", 0), 0)
+
+            self.run_cycles(["a", "b"], [], ["a"], times=3)
+
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_unreachable_channel_is_not_counted_as_empty(self):
+        """Недоступность — забота fail-streak, смешивать счётчики нельзя."""
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], ["a"], [], times=5)
+
+        self.notify.assert_not_called()
+        self.assertNotIn("a", parser.CHANNEL_EMPTY_STREAK)
+
+    def test_all_channels_empty_reports_layout_change_once(self):
+        with patch.object(registry, "CHANNELS", ["a", "b", "c"]):
+            self.run_cycles(["a", "b", "c"], [], ["a", "b", "c"], times=4)
+
+        # Одно сообщение про вёрстку, а не по одному на каждый канал.
+        self.notify.assert_called_once()
+        message = self.notify.call_args.args[0]
+        self.assertIn("вёрстка t.me/s", message)
+
+    def test_layout_alert_repeats_after_recovery(self):
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], [], ["a", "b"], times=3)
+            self.assertEqual(self.notify.call_count, 1)
+
+            self.run_cycles(["a", "b"], [], [])  # разбор починился
+            self.run_cycles(["a", "b"], [], ["a", "b"], times=3)
+
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_single_channel_setup_reports_channel_not_layout(self):
+        """С одним каналом «сломалась вёрстка» и «канал опустел» неразличимы."""
+        with patch.object(registry, "CHANNELS", ["a"]):
+            self.run_cycles(["a"], [], ["a"], times=3)
+
+        self.notify.assert_called_once()
+        self.assertIn("@a", self.notify.call_args.args[0])
+
+    def test_streaks_of_removed_channels_are_dropped(self):
+        with patch.object(registry, "CHANNELS", ["a", "b"]):
+            self.run_cycles(["a", "b"], [], ["a"], times=2)
+        with patch.object(registry, "CHANNELS", ["b"]):  # /remove a
+            self.run_cycles(["b"], [], [])
+
+        self.assertNotIn("a", parser.CHANNEL_EMPTY_STREAK)
+
+    def test_process_cycle_counts_channel_without_posts_as_empty(self):
+        seen: dict[str, dict[str, str]] = {}
+        with patch.dict(parser.CHANNEL_EMPTY_STREAK, clear=True), \
+             patch.object(registry, "CHANNELS", ["a", "b"]), \
+             patch.object(parser, "fetch_channel", return_value=[]), \
+             patch.object(parser, "save_seen"), \
+             patch.object(parser, "save_results"):
+            parser.process_cycle(seen, [], baseline=True)
+
+            self.assertEqual(parser.CHANNEL_EMPTY_STREAK, {"a": 1, "b": 1})
+
+    def test_process_cycle_does_not_count_unreachable_channel_as_empty(self):
+        seen: dict[str, dict[str, str]] = {}
+        with patch.dict(parser.CHANNEL_EMPTY_STREAK, clear=True), \
+             patch.object(registry, "CHANNELS", ["a"]), \
+             patch.object(parser, "fetch_channel", return_value=None), \
+             patch.object(parser, "save_seen"), \
+             patch.object(parser, "save_results"):
+            parser.process_cycle(seen, [], baseline=True)
+
+            self.assertEqual(parser.CHANNEL_EMPTY_STREAK, {})
+
+
 class ProcessCycleTests(unittest.TestCase):
     def test_same_url_from_two_new_messages_is_saved_once(self):
         first = make_message("demo/2", "колесо", ["https://betboom.ru/freestream/same"])

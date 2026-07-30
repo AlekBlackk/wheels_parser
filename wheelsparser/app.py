@@ -1,9 +1,14 @@
 """Точка входа: инициализация состояния и запуск потоков.
 
 Потоки:
-    parser — обход Telegram-каналов раз в CHECK_INTERVAL;
-    bot    — приём команд Telegram (если заданы токен и chat_id);
-    twitch — чтение Twitch-чатов по IRC (если TWITCH_ENABLED).
+    parser        — обход Telegram-каналов раз в CHECK_INTERVAL;
+    bot           — приём команд Telegram (если заданы токен и chat_id);
+    twitch-irc    — чтение Twitch-чатов по IRC (если TWITCH_ENABLED);
+    twitch-worker — обработка сообщений из чатов (precheck, уведомления).
+
+Все рабочие потоки запускаются через runtime.supervise: необработанное
+исключение перезапускает поток и уходит сервисным уведомлением, а не
+оставляет процесс «живым, но неработающим».
 
 Главный поток только ждёт STOP_EVENT: обработчик Ctrl+C выполняется
 именно в нём и не может прервать блокирующий сетевой вызов.
@@ -11,9 +16,11 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
+from collections.abc import Callable
 
 from . import registry
 from .alerts import seed_url_alerts_from_history
@@ -29,12 +36,14 @@ from .config import (
     TWITCH_ENABLED,
     icon,
 )
-from .logging_setup import force_utf8_console, log, setup_logging
+from .logging_setup import force_utf8_console, log, redact_token, setup_logging
+from .net import SUPERVISOR_SESSION
 from .parser import process_cycle
 from .runtime import (
     STOP_EVENT,
     acquire_single_instance_lock,
     install_signal_handlers,
+    supervise,
 )
 from .storage import (
     atomic_write_json,
@@ -43,7 +52,41 @@ from .storage import (
     load_seen,
     save_seen,
 )
-from .twitch import twitch_loop
+from .telegram_api import send_service_notification
+from .twitch import twitch_loop, twitch_worker_loop
+
+# Сообщения о падении потоков шлются из самого упавшего потока, каким бы он
+# ни был, поэтому у SUPERVISOR_SESSION нет владельца: сериализуем обращения
+# к ней локом (requests.Session не потокобезопасна — см. net.py).
+_CRASH_NOTICE_LOCK = threading.Lock()
+
+
+def _notify_thread_crash(name: str, error: BaseException, backoff: float) -> None:
+    """Сервисное уведомление о падении рабочего потока (см. runtime.supervise).
+
+    Текст исключения проходит через redact_token: ошибки requests содержат
+    URL вида https://api.telegram.org/bot<TOKEN>/..., и пересылать такое
+    в чат нельзя.
+    """
+    reason = redact_token(f"{type(error).__name__}: {error}")
+    with _CRASH_NOTICE_LOCK:
+        send_service_notification(
+            f"{icon('warn')} Поток «{name}» аварийно завершился: {reason}\n"
+            f"Перезапускаю автоматически (пауза {backoff:.0f} с). "
+            "Подробности — в parser.log.",
+            SUPERVISOR_SESSION,
+        )
+
+
+def _start_supervised(target: Callable[[], None], name: str) -> threading.Thread:
+    """Запускает daemon-поток под супервизором и возвращает его."""
+    thread = threading.Thread(
+        target=supervise(target, name, _notify_thread_crash),
+        name=name,
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _seed_registry_files() -> None:
@@ -86,7 +129,7 @@ def _seed_registry_files() -> None:
 
 def _start_bot_thread() -> None:
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        threading.Thread(target=bot_loop, name="bot", daemon=True).start()
+        _start_supervised(bot_loop, "bot")
         command_list = " ".join(f"/{item['command']}" for item in BOT_COMMANDS)
         log.info("%s Команды бота активны: %s", icon("bot"), command_list)
     elif TELEGRAM_BOT_TOKEN:
@@ -102,7 +145,10 @@ def _start_twitch_thread() -> None:
         log.info("%s Twitch-мониторинг выключен (TWITCH_ENABLED=false)", icon("bell"))
         return
     seed_url_alerts_from_history()
-    threading.Thread(target=twitch_loop, name="twitch", daemon=True).start()
+    # Два потока: чтение сокета и обработка сообщений. Сеть — только в
+    # обработчике, иначе IRC-поток пропускает PING (см. twitch.py).
+    _start_supervised(twitch_worker_loop, "twitch-worker")
+    _start_supervised(twitch_loop, "twitch-irc")
     twitch_total = len(registry.twitch_channels_snapshot())
     if twitch_total:
         log.info(
@@ -213,13 +259,10 @@ def main() -> int:
     # выполняется только в главном потоке и не может прервать блокирующий
     # сетевой вызов (особенно на Windows), поэтому главный поток должен
     # только ждать STOP_EVENT — тогда сигнал обрабатывается мгновенно.
-    parser_thread = threading.Thread(
-        target=_run_parse_loop,
-        args=(seen, results, baseline),
-        name="parser",
-        daemon=True,
+    parser_thread = _start_supervised(
+        functools.partial(_run_parse_loop, seen, results, baseline),
+        "parser",
     )
-    parser_thread.start()
 
     while not STOP_EVENT.is_set():
         STOP_EVENT.wait(1)

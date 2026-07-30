@@ -211,12 +211,21 @@ def send_keyword_notification(entry: dict[str, Any]) -> bool:
         return False
 
 
-def send_service_notification(text: str) -> bool:
-    """Сервисное сообщение в доверенный чат (вызывается из parser-потока)."""
+def send_service_notification(
+    text: str, session: requests.Session | None = None
+) -> bool:
+    """Сервисное сообщение в доверенный чат.
+
+    По умолчанию отправляется из parser-потока его сессией. Вызывающему из
+    другого потока нужно передать свою сессию: requests.Session не
+    потокобезопасна (см. net.py).
+    """
     if not notifications_enabled():
         return False
     try:
-        _post_message(PARSER_SESSION, TELEGRAM_CHAT_ID, text).raise_for_status()
+        _post_message(
+            session or PARSER_SESSION, TELEGRAM_CHAT_ID, text
+        ).raise_for_status()
         return True
     except requests.RequestException as error:
         log.error("Не удалось отправить сервисное уведомление: %s", error)

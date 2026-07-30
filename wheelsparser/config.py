@@ -105,6 +105,11 @@ NOTIFY_RETRY_MAX_PER_CYCLE = env_int("NOTIFY_RETRY_MAX_PER_CYCLE", 10, 1)
 STALE_COMMAND_SECONDS = env_int("STALE_COMMAND_SECONDS", 120, 10)
 # Уведомление о «мёртвом» канале после N подряд неудачных циклов.
 CHANNEL_FAIL_THRESHOLD = env_int("CHANNEL_FAIL_THRESHOLD", 5, 2)
+# Уведомление о «пустой ленте» после N подряд циклов, в которых страница
+# канала отдалась с HTTP 200, но ни одного поста распознать не удалось.
+# Это единственный отказ, который иначе не виден вообще: при смене вёрстки
+# t.me парсер продолжает считать каналы исправными и молча ничего не находит.
+CHANNEL_EMPTY_THRESHOLD = env_int("CHANNEL_EMPTY_THRESHOLD", 3, 2)
 ALERT_ON_FIRST_RUN = env_bool("ALERT_ON_FIRST_RUN", False)
 USE_COLORS = env_bool("USE_COLORS", True)
 USE_ICONS = env_bool("USE_ICONS", True)
@@ -127,6 +132,12 @@ TWITCH_IRC_PORT = 6697
 # переподключаемся. Twitch шлёт PING каждые ~5 минут даже в тихом чате,
 # поэтому порог должен быть заметно больше этого интервала.
 TWITCH_IDLE_TIMEOUT_SECONDS = env_int("TWITCH_IDLE_TIMEOUT_SECONDS", 360, 60)
+# Очередь сообщений с ссылками между IRC-потоком и обработчиком. IRC-поток
+# обязан только читать сокет: любой сетевой вызов в нём задерживает ответ на
+# PING, и Twitch рвёт соединение. Очередь ограничена, чтобы затянувшийся сбой
+# API BetBoom не съедал память; в неё попадают только сообщения со ссылкой,
+# поэтому обычный чат её не наполняет.
+TWITCH_QUEUE_MAXSIZE = env_int("TWITCH_QUEUE_MAXSIZE", 500, 10)
 TWITCH_USERNAME_RE = re.compile(r"^@?#?([A-Za-z0-9][A-Za-z0-9_]{2,24})$")
 # Известные чат-боты, чьим ссылкам доверяем: обычно колесо публикует бот
 # по команде стримера. Как правило, боты и так имеют бейдж модератора,

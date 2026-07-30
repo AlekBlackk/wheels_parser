@@ -6,8 +6,14 @@ requests.Session НЕ потокобезопасна, поэтому одна о
 
     PARSER_SESSION       — поток parser: обход каналов, precheck, уведомления;
     BOT_SESSION          — поток bot: getUpdates и ответы на команды;
-    TWITCH_SESSION       — поток twitch: precheck и уведомления из чатов;
-    ACTIVE_CHECK_SESSION — фоновый поток active-api: отправка результата /active.
+    TWITCH_SESSION       — поток twitch-worker: precheck и уведомления из чатов
+                           (поток twitch-irc в сеть не ходит вообще — см.
+                           :mod:`wheelsparser.twitch`);
+    ACTIVE_CHECK_SESSION — фоновый поток active-api: отправка результата /active;
+    SUPERVISOR_SESSION   — сообщения о падении потоков (см. runtime.supervise):
+                           отправляются из упавшего потока, каким бы он ни был,
+                           поэтому владельца у этой сессии нет и обращения к ней
+                           сериализуются локом в :mod:`wheelsparser.app`.
 
 Рабочие потоки пула /active создают собственные сессии через
 threading.local (см. :mod:`wheelsparser.betboom`).
@@ -51,3 +57,4 @@ PARSER_SESSION = build_session()
 BOT_SESSION = build_session()
 TWITCH_SESSION = build_session()
 ACTIVE_CHECK_SESSION = build_session()
+SUPERVISOR_SESSION = build_session()

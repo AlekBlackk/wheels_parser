@@ -6,6 +6,18 @@
 
 У IRC нет истории: читаются только сообщения, пришедшие пока парсер
 запущен. Ссылки из времени простоя не восстанавливаются.
+
+Работа разнесена на два потока:
+
+    twitch-irc    — только читает сокет и складывает сообщения со ссылкой
+                    в TWITCH_JOBS. Никаких сетевых вызовов: пока поток ждёт
+                    HTTP-ответ, он не читает сокет и не отвечает на PING,
+                    а Twitch за это рвёт соединение (precheck при недоступном
+                    API BetBoom блокировал поток до ~70 с — этого достаточно,
+                    чтобы вылететь из чата);
+    twitch-worker — забирает сообщения из очереди, ходит в API BetBoom
+                    (precheck) и шлёт уведомления. Он один, поэтому порядок
+                    сообщений сохраняется, а параллельных запросов к API нет.
 """
 
 from __future__ import annotations
@@ -15,6 +27,7 @@ import random
 import socket
 import ssl
 import time
+from datetime import datetime
 from typing import Any
 
 from . import registry
@@ -28,6 +41,7 @@ from .config import (
     TWITCH_IDLE_TIMEOUT_SECONDS,
     TWITCH_IRC_HOST,
     TWITCH_IRC_PORT,
+    TWITCH_QUEUE_MAXSIZE,
     icon,
 )
 from .logging_setup import log
@@ -41,6 +55,13 @@ from .urls import normalize_url
 # забирает записи в начале каждого цикла и сохраняет их в freebets.json
 # (results принадлежит parser-потоку, трогать его из другого потока нельзя).
 TWITCH_NEW_ENTRIES: queue.Queue[dict[str, Any]] = queue.Queue()
+
+# Сообщения со ссылкой, ждущие обработки: (канал, автор, теги, текст, время).
+# Время фиксируется в момент получения сообщения, а не обработки: found_at
+# и кулдаун должны считаться от момента, когда ссылка появилась в чате.
+# Очередь ограничена: затянувшийся сбой API BetBoom не должен съедать память.
+TwitchJob = tuple[str, str, dict[str, str], str, datetime]
+TWITCH_JOBS: queue.Queue[TwitchJob] = queue.Queue(maxsize=TWITCH_QUEUE_MAXSIZE)
 
 
 def parse_irc_line(line: str) -> tuple[dict[str, str], str, str, str]:
@@ -70,9 +91,19 @@ def author_roles(tags: dict[str, str], login: str) -> list[str]:
 
 
 def handle_twitch_message(
-    channel: str, login: str, tags: dict[str, str], text: str
+    channel: str,
+    login: str,
+    tags: dict[str, str],
+    text: str,
+    received_at: datetime | None = None,
 ) -> None:
-    """Обрабатывает одно сообщение Twitch-чата (вызывается из twitch-потока)."""
+    """Обрабатывает одно сообщение Twitch-чата.
+
+    Ходит в сеть (precheck и отправка уведомления), поэтому вызывается
+    ТОЛЬКО из потока twitch-worker — см. модульную документацию.
+    received_at — время получения сообщения; по умолчанию текущее.
+    """
+    received_at = received_at or now_msk()
     urls: list[str] = []
     for candidate in FREESTREAM_RE.findall(text):
         normalized = normalize_url(candidate)
@@ -89,7 +120,7 @@ def handle_twitch_message(
         )
         return
     for url in urls:
-        now = now_msk()
+        now = received_at
         if cooldown_active(url, now):
             continue  # недавно уже оповещали об этом колесе (TG или Twitch)
         if PRECHECK_WHEELS:
@@ -107,7 +138,7 @@ def handle_twitch_message(
             continue
         entry = {
             "url": url,
-            "found_at": now_msk().isoformat(timespec="seconds"),
+            "found_at": now.isoformat(timespec="seconds"),
             "channel": channel,
             "source": "twitch",
             "author": login,
@@ -133,6 +164,50 @@ def handle_twitch_message(
             url,
             extra={"highlight": True},
         )
+
+
+def enqueue_twitch_message(
+    channel: str, login: str, tags: dict[str, str], text: str
+) -> bool:
+    """Ставит сообщение в очередь обработки (вызывается из потока twitch-irc).
+
+    Делает только дешёвую работу: сообщения без ссылки на колесо (а это
+    практически весь чат) отсеиваются регэкспом здесь же, поэтому очередь
+    наполняется единицами сообщений и не растёт от обычной болтовни.
+    Возвращает True, если сообщение принято в обработку.
+    """
+    if not FREESTREAM_RE.search(text):
+        return False
+    try:
+        TWITCH_JOBS.put_nowait((channel, login, tags, text, now_msk()))
+    except queue.Full:
+        # Очередь переполняется только при долгом сбое обработчика. Ссылка
+        # теряется, поэтому это ошибка, а не предупреждение.
+        log.error(
+            "%s Twitch [#%s]: очередь обработки переполнена (%s), "
+            "сообщение от @%s пропущено",
+            icon("warn"),
+            channel,
+            TWITCH_QUEUE_MAXSIZE,
+            login,
+        )
+        return False
+    return True
+
+
+def twitch_worker_loop() -> None:
+    """Поток twitch-worker: precheck и уведомления по сообщениям из очереди."""
+    while not STOP_EVENT.is_set():
+        try:
+            job = TWITCH_JOBS.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            handle_twitch_message(*job)
+        except Exception:
+            log.exception("Twitch: ошибка обработки сообщения")
+        finally:
+            TWITCH_JOBS.task_done()
 
 
 def _connect(channels: list[str]) -> ssl.SSLSocket:
@@ -211,10 +286,12 @@ def _read_stream(sock: ssl.SSLSocket) -> None:
             login = prefix.split("!", 1)[0].lower()
             target, _, message_text = rest.partition(" :")
             chat = target.strip().lstrip("#").lower()
+            # Только постановка в очередь: обработка (и любой сетевой
+            # вызов) — в потоке twitch-worker, иначе пропустим PING.
             try:
-                handle_twitch_message(chat, login, tags, message_text)
+                enqueue_twitch_message(chat, login, tags, message_text)
             except Exception:
-                log.exception("Twitch: ошибка обработки сообщения")
+                log.exception("Twitch: ошибка постановки сообщения в очередь")
 
 
 def twitch_loop() -> None:

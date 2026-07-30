@@ -1,7 +1,9 @@
+import queue
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
-from wheelsparser import alerts, twitch
+from wheelsparser import alerts, registry, twitch
 
 WHEEL = "https://betboom.ru/freestream/stream1"
 
@@ -138,6 +140,144 @@ class HandleMessageTests(unittest.TestCase):
         )
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
+
+
+class EnqueueTests(unittest.TestCase):
+    """IRC-поток обязан только читать сокет: любой сетевой вызов в нём
+    задерживает ответ на PING, и Twitch выбрасывает парсер из чата."""
+
+    def setUp(self):
+        patcher = patch.object(twitch, "TWITCH_JOBS", queue.Queue(maxsize=2))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_message_with_link_is_queued(self):
+        before = twitch.now_msk()
+
+        self.assertTrue(
+            twitch.enqueue_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, f"колесо {WHEEL}"
+            )
+        )
+
+        channel, login, tags, text, received_at = twitch.TWITCH_JOBS.get_nowait()
+        self.assertEqual((channel, login), ("demo", "streamer"))
+        self.assertEqual(tags, {"badges": "broadcaster/1"})
+        self.assertIn(WHEEL, text)
+        self.assertGreaterEqual(received_at, before)
+
+    def test_message_without_link_is_not_queued(self):
+        """Обычная болтовня не должна попадать в очередь вообще."""
+        self.assertFalse(
+            twitch.enqueue_twitch_message("demo", "viewer", {}, "го колесо когда")
+        )
+        self.assertTrue(twitch.TWITCH_JOBS.empty())
+
+    def test_full_queue_drops_message_without_raising(self):
+        for _ in range(2):
+            twitch.enqueue_twitch_message("demo", "streamer", {}, WHEEL)
+
+        self.assertFalse(
+            twitch.enqueue_twitch_message("demo", "streamer", {}, WHEEL)
+        )
+        self.assertEqual(twitch.TWITCH_JOBS.qsize(), 2)
+
+
+class WorkerLoopTests(unittest.TestCase):
+    def setUp(self):
+        twitch.STOP_EVENT.clear()
+        self.addCleanup(twitch.STOP_EVENT.clear)
+        patcher = patch.object(twitch, "TWITCH_JOBS", queue.Queue())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_worker_processes_queued_message(self):
+        received_at = twitch.now_msk()
+        twitch.TWITCH_JOBS.put(("demo", "streamer", {}, WHEEL, received_at))
+
+        with patch.object(
+            twitch,
+            "handle_twitch_message",
+            side_effect=lambda *_args: twitch.STOP_EVENT.set(),
+        ) as handle:
+            twitch.twitch_worker_loop()
+
+        handle.assert_called_once_with("demo", "streamer", {}, WHEEL, received_at)
+
+    def test_worker_survives_failing_message(self):
+        for index in range(2):
+            twitch.TWITCH_JOBS.put(("demo", "streamer", {}, f"{WHEEL}/{index}", None))
+        calls = {"n": 0}
+
+        def explode(*_args):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                twitch.STOP_EVENT.set()
+            raise RuntimeError("сбой обработки")
+
+        with patch.object(twitch, "handle_twitch_message", side_effect=explode):
+            twitch.twitch_worker_loop()
+
+        self.assertEqual(calls["n"], 2)
+
+
+class ReadStreamRoutingTests(unittest.TestCase):
+    def setUp(self):
+        twitch.STOP_EVENT.clear()
+        registry.TWITCH_RELOAD.clear()
+        self.addCleanup(twitch.STOP_EVENT.clear)
+
+    def test_privmsg_is_queued_and_not_processed_inline(self):
+        line = (
+            "@badges=broadcaster/1 :streamer!streamer@streamer.tmi.twitch.tv "
+            f"PRIVMSG #demo :колесо {WHEEL}\r\n"
+        ).encode()
+        chunks = [line]
+
+        def fake_recv(_size):
+            if chunks:
+                return chunks.pop(0)
+            twitch.STOP_EVENT.set()
+            raise TimeoutError
+
+        socket_stub = type("Sock", (), {"recv": staticmethod(fake_recv)})()
+
+        with patch.object(twitch, "enqueue_twitch_message") as enqueue, \
+             patch.object(twitch, "handle_twitch_message") as handle:
+            twitch._read_stream(socket_stub)
+
+        enqueue.assert_called_once_with(
+            "demo", "streamer", {"badges": "broadcaster/1"}, f"колесо {WHEEL}"
+        )
+        # Регрессия: обработка (и поход в сеть) в IRC-потоке недопустима.
+        handle.assert_not_called()
+
+
+class ReceivedAtTests(unittest.TestCase):
+    """found_at и кулдаун считаются от момента получения сообщения, а не
+    от момента, когда до него добрался обработчик."""
+
+    def setUp(self):
+        patcher = patch.dict(alerts.LAST_URL_ALERT, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        while not twitch.TWITCH_NEW_ENTRIES.empty():
+            twitch.TWITCH_NEW_ENTRIES.get_nowait()
+
+    def test_found_at_uses_message_time_not_processing_time(self):
+        received_at = twitch.now_msk() - timedelta(minutes=5)
+
+        with patch.object(twitch, "precheck_wheel", return_value=("active", False)), \
+             patch.object(twitch, "send_telegram_notification", return_value=True):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL, received_at
+            )
+
+        entry = twitch.TWITCH_NEW_ENTRIES.get_nowait()
+        self.assertEqual(
+            entry["found_at"], received_at.isoformat(timespec="seconds")
+        )
+        self.assertEqual(alerts.last_alert(WHEEL), received_at)
 
 
 if __name__ == "__main__":

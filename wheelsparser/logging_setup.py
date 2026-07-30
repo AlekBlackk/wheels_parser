@@ -23,19 +23,26 @@ except ImportError:
     HAS_COLOR = False
 
 
-class RedactTokenFilter(logging.Filter):
-    """Маскирует токен бота в сообщениях лога.
+def redact_token(text: str) -> str:
+    """Заменяет токен бота на «***TOKEN***».
 
     Ошибки requests содержат полный URL вида
-    https://api.telegram.org/bot<TOKEN>/... — без фильтра токен
-    попадает в parser.log (например, при 409 Conflict).
+    https://api.telegram.org/bot<TOKEN>/... — такой текст нельзя ни писать
+    в parser.log, ни пересылать в чат (см. app._notify_thread_crash).
     """
+    if not TELEGRAM_BOT_TOKEN:
+        return text
+    return text.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+
+
+class RedactTokenFilter(logging.Filter):
+    """Маскирует токен бота в сообщениях лога."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if TELEGRAM_BOT_TOKEN:
             message = record.getMessage()
             if TELEGRAM_BOT_TOKEN in message:
-                record.msg = message.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+                record.msg = redact_token(message)
                 record.args = None
         return True
 

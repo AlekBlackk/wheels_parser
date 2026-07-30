@@ -18,6 +18,7 @@ from .alerts import last_alert, mark_url_alert
 from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
     ALERT_ON_FIRST_RUN,
+    CHANNEL_EMPTY_THRESHOLD,
     CHANNEL_FAIL_THRESHOLD,
     CHECK_INTERVAL,
     MESSAGES_PER_CHANNEL,
@@ -112,6 +113,9 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
     """Последние сообщения канала через веб-превью t.me/s/<channel>.
 
     None означает, что канал прочитать не удалось (404 или сетевая ошибка).
+    Пустой список — страница получена, но ни одного поста распознать не
+    удалось: это не то же самое, что «нет новых сообщений», и вызывающий
+    обязан различать эти случаи (см. update_channel_empty_streaks).
     """
     url = f"https://t.me/s/{channel}"
     try:
@@ -164,6 +168,14 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
 
 CHANNEL_FAIL_STREAK: dict[str, int] = {}
 CHANNEL_FAIL_ALERTED: set[str] = set()
+# Счётчики подряд «пустых» циклов: страница канала отдалась (HTTP 200),
+# но ни одного поста распознать не удалось. Отдельно от FAIL_STREAK:
+# недоступный канал — это одна проблема, разобранная в ноль лента — другая.
+CHANNEL_EMPTY_STREAK: dict[str, int] = {}
+CHANNEL_EMPTY_ALERTED: set[str] = set()
+# Латч уведомления о смене разметки t.me: одно сообщение на серию, а не
+# по одному на каждый из десятков каналов.
+LAYOUT_ALERTED = False
 
 
 def update_channel_fail_streaks(
@@ -202,6 +214,114 @@ def update_channel_fail_streaks(
         if channel not in current:
             CHANNEL_FAIL_STREAK.pop(channel, None)
             CHANNEL_FAIL_ALERTED.discard(channel)
+
+
+def update_channel_empty_streaks(
+    checked_channels: list[str],
+    failed_channels: list[str],
+    empty_channels: list[str],
+) -> None:
+    """Обновляет счётчики «страница есть, постов нет».
+
+    Недоступные каналы пропускаются: у них своя серия (FAIL_STREAK), и
+    смешивать эти счётчики нельзя — иначе сетевой сбой выглядел бы как
+    поломка разбора.
+    """
+    failed = set(failed_channels)
+    empty = set(empty_channels)
+    for channel in checked_channels:
+        if channel in failed:
+            continue
+        if channel in empty:
+            CHANNEL_EMPTY_STREAK[channel] = CHANNEL_EMPTY_STREAK.get(channel, 0) + 1
+        else:
+            # Пришли посты — разбор работает, серия сбрасывается.
+            CHANNEL_EMPTY_STREAK.pop(channel, None)
+            CHANNEL_EMPTY_ALERTED.discard(channel)
+    current = set(registry.channels_snapshot())
+    for channel in list(CHANNEL_EMPTY_STREAK):
+        if channel not in current:
+            CHANNEL_EMPTY_STREAK.pop(channel, None)
+            CHANNEL_EMPTY_ALERTED.discard(channel)
+
+
+def _alert_layout_change(stalled_channels: list[str]) -> None:
+    """Уведомляет о вероятной смене разметки t.me (один раз на серию)."""
+    global LAYOUT_ALERTED
+    # Помечаем каналы уведомлёнными: частичное восстановление не должно
+    # прислать ещё и по отдельному сообщению на каждый из них.
+    CHANNEL_EMPTY_ALERTED.update(stalled_channels)
+    if LAYOUT_ALERTED:
+        return
+    LAYOUT_ALERTED = True
+    log.error(
+        "%s Ни один из %s каналов не отдал постов %s циклов подряд — "
+        "похоже, изменилась разметка t.me/s",
+        icon("warn"),
+        len(stalled_channels),
+        CHANNEL_EMPTY_THRESHOLD,
+    )
+    send_service_notification(
+        f"{icon('warn')} Парсер получает страницы каналов, но не может "
+        f"разобрать ни одного поста: пусто во всех "
+        f"{len(stalled_channels)} каналах {CHANNEL_EMPTY_THRESHOLD} циклов подряд.\n"
+        "Скорее всего изменилась вёрстка t.me/s и парсер нужно обновить.\n"
+        "Пока это не исправлено, новые колёса из Telegram НЕ находятся."
+    )
+
+
+def _alert_empty_channel(channel: str) -> None:
+    """Уведомляет о канале, чья лента разбирается в ноль (один раз на серию)."""
+    if channel in CHANNEL_EMPTY_ALERTED:
+        return
+    CHANNEL_EMPTY_ALERTED.add(channel)
+    log.warning(
+        "%s Канал @%s открывается, но постов в ленте нет %s циклов подряд",
+        icon("warn"),
+        channel,
+        CHANNEL_EMPTY_STREAK.get(channel, 0),
+    )
+    send_service_notification(
+        f"{icon('warn')} Канал @{channel} открывается, но ни одного поста "
+        f"в ленте t.me/s распознать не удалось "
+        f"({CHANNEL_EMPTY_STREAK.get(channel, 0)} циклов подряд).\n"
+        "Возможно, канал очищен или у него отключено веб-превью — "
+        "новые сообщения из него не отслеживаются.\n"
+        f"Убрать из списка: /remove {channel}"
+    )
+
+
+def report_empty_channels(
+    checked_channels: list[str], failed_channels: list[str]
+) -> None:
+    """Уведомляет о «тихом» отказе разбора: страница есть, постов нет.
+
+    Это единственный сбой, который иначе не виден вообще: канал считается
+    успешно проверенным, в логе «каналов N/N», и парсер молча ничего не
+    находит. Разом опустевшие ленты ВСЕХ читаемых каналов означают не
+    проблему каналов, а смену разметки t.me — про неё сообщение одно,
+    а не по одному на канал.
+    """
+    global LAYOUT_ALERTED
+    failed = set(failed_channels)
+    readable = [channel for channel in checked_channels if channel not in failed]
+    stalled = [
+        channel
+        for channel in readable
+        if CHANNEL_EMPTY_STREAK.get(channel, 0) >= CHANNEL_EMPTY_THRESHOLD
+    ]
+    # Одного канала мало: отличить сломанный разбор от просто пустого
+    # канала можно только по тому, что молчат сразу все.
+    layout_broken = len(readable) >= 2 and len(stalled) == len(readable)
+    if not layout_broken:
+        LAYOUT_ALERTED = False
+    if not stalled:
+        return
+    if layout_broken:
+        _alert_layout_change(stalled)
+        return
+    for channel in stalled:
+        _alert_empty_channel(channel)
 
 
 # ----------------------------------------------------------------------------
@@ -472,6 +592,7 @@ def process_cycle(
     last_found = index_last_found(results)
     new_entries: list[dict[str, Any]] = []
     failed_channels: list[str] = []
+    empty_channels: list[str] = []
     checked_channels: list[str] = []
 
     for index, channel in enumerate(channels):
@@ -482,6 +603,10 @@ def process_cycle(
         if messages is None:
             failed_channels.append(channel)
             messages = []
+        elif not messages:
+            # HTTP 200, но ни одного поста: разбор ленты сломан или канал
+            # пуст. Молча считать такой канал исправным нельзя.
+            empty_channels.append(channel)
         channel_seen = seen.setdefault(channel, {})
         # Канал, добавленный через /add на лету, сначала проходит «тихий» цикл,
         # чтобы не рассылать уведомления по его старым сообщениям.
@@ -496,10 +621,13 @@ def process_cycle(
             STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
 
     update_channel_fail_streaks(checked_channels, failed_channels)
+    update_channel_empty_streaks(checked_channels, failed_channels, empty_channels)
+    report_empty_channels(checked_channels, failed_channels)
     save_seen(seen)
     if new_entries or twitch_entries or retried:
         save_results(results)
-    status_icon = icon("warn") if failed_channels else icon("ok")
+    status_icon = icon("warn") if failed_channels or empty_channels else icon("ok")
+    empty_note = f" · пустых лент: {len(empty_channels)}" if empty_channels else ""
     # Следующий запуск отсчитывается от НАЧАЛА цикла (см. app.parse_loop).
     elapsed = time.monotonic() - cycle_started
     next_at = (
@@ -507,13 +635,20 @@ def process_cycle(
     ).strftime("%H:%M:%S")
     suffix = "" if STOP_EVENT.is_set() else f" · следующая проверка в {next_at}"
     log.info(
-        "%s Цикл завершён · каналы %s/%s · новых ссылок: %s%s",
+        "%s Цикл завершён · каналы %s/%s%s · новых ссылок: %s%s",
         status_icon,
         len(channels) - len(failed_channels),
         len(channels),
+        empty_note,
         len(new_entries),
         suffix,
     )
     if failed_channels:
         log.warning("%s Недоступные каналы: %s", icon("warn"), ", ".join(failed_channels))
+    if empty_channels:
+        log.warning(
+            "%s Каналы без распознанных постов: %s",
+            icon("warn"),
+            ", ".join(empty_channels),
+        )
     return len(new_entries)
