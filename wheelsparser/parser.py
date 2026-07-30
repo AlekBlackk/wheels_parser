@@ -21,6 +21,8 @@ from .config import (
     CHANNEL_FAIL_THRESHOLD,
     CHECK_INTERVAL,
     MESSAGES_PER_CHANNEL,
+    NOTIFY_RETRY_MAX_PER_CYCLE,
+    NOTIFY_RETRY_WINDOW_MINUTES,
     PRECHECK_WHEELS,
     REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
@@ -32,6 +34,7 @@ from .net import PARSER_SESSION
 from .runtime import STOP_EVENT
 from .storage import save_results, save_seen
 from .telegram_api import (
+    notifications_enabled,
     send_keyword_notification,
     send_multi_telegram_notification,
     send_service_notification,
@@ -239,6 +242,41 @@ def index_last_found(results: list[dict[str, Any]]) -> dict[str, datetime]:
     return last_found
 
 
+def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> int:
+    """Повторно отправляет уведомления, недоставленные в своём цикле.
+
+    Пост обрабатывается по хэшу содержимого только один раз (см.
+    process_message) — без ретрая сбой Telegram ровно в момент отправки
+    терял бы находку навсегда, хотя она и осталась в freebets.json с
+    notified=False. Записи из send_multi_telegram_notification (несколько
+    ссылок в одном посте) при ретрае отправляются по одной обычным
+    уведомлением — предупреждение «уточните вручную» теряется, но сами
+    ссылки доходят, что важнее для этого редкого повторного случая.
+    Лимит и окно ограничивают стоимость длительного сбоя: не тратим
+    весь цикл на HTTP-ретраи по всему бэклогу разом.
+    """
+    if not notifications_enabled():
+        return 0
+    retried = 0
+    for entry in results:
+        if retried >= NOTIFY_RETRY_MAX_PER_CYCLE:
+            break
+        if entry.get("notified") or not entry.get("url"):
+            continue
+        found = parse_found_at(entry.get("found_at"))
+        if found is None or now - found > timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES):
+            continue
+        entry["notified"] = send_telegram_notification(entry)
+        retried += 1
+        if entry["notified"]:
+            log.info(
+                "%s Уведомление доставлено повторной попыткой: %s",
+                icon("ok"),
+                entry.get("url"),
+            )
+    return retried
+
+
 def _is_on_cooldown(url: str, now: datetime, last_found: dict[str, datetime]) -> bool:
     previous = last_found.get(url)
     # Кулдаун общий с Twitch: находки twitch-потока с момента последнего
@@ -423,6 +461,7 @@ def process_cycle(
     twitch_entries = drain_twitch_entries()
     if twitch_entries:
         results.extend(twitch_entries)
+    retried = retry_failed_notifications(results, now)
     last_found = index_last_found(results)
     new_entries: list[dict[str, Any]] = []
     failed_channels: list[str] = []
@@ -451,7 +490,7 @@ def process_cycle(
 
     update_channel_fail_streaks(checked_channels, failed_channels)
     save_seen(seen)
-    if new_entries or twitch_entries:
+    if new_entries or twitch_entries or retried:
         save_results(results)
     status_icon = icon("warn") if failed_channels else icon("ok")
     # Следующий запуск отсчитывается от НАЧАЛА цикла (см. app.parse_loop).

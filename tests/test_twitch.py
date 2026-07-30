@@ -41,6 +41,39 @@ class AuthorRoleTests(unittest.TestCase):
         self.assertEqual(twitch.author_roles({}, "viewer"), [])
 
 
+class ReadStreamIdleTimeoutTests(unittest.TestCase):
+    class DeadSocket:
+        """Симулирует полуоткрытое TCP: recv() всегда таймаутится."""
+
+        def recv(self, _size):
+            raise TimeoutError
+
+    def test_raises_connection_error_after_idle_timeout(self):
+        with (
+            patch.object(twitch, "TWITCH_IDLE_TIMEOUT_SECONDS", 10),
+            patch("time.monotonic", side_effect=[0.0, 0.0, 20.0]),
+        ):
+            with self.assertRaises(ConnectionError):
+                twitch._read_stream(self.DeadSocket())
+
+    def test_does_not_raise_before_idle_timeout(self):
+        calls = {"n": 0}
+
+        def fake_recv(_size):
+            calls["n"] += 1
+            if calls["n"] > 2:
+                twitch.STOP_EVENT.set()
+            raise TimeoutError
+
+        socket_stub = type("Sock", (), {"recv": staticmethod(fake_recv)})()
+        self.addCleanup(twitch.STOP_EVENT.clear)
+        with (
+            patch.object(twitch, "TWITCH_IDLE_TIMEOUT_SECONDS", 10),
+            patch("time.monotonic", side_effect=[0.0, 1.0, 2.0, 3.0]),
+        ):
+            twitch._read_stream(socket_stub)  # не должно бросить исключение
+
+
 class HandleMessageTests(unittest.TestCase):
     def _start(self, patcher):
         mock = patcher.start()

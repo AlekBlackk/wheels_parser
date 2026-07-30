@@ -91,6 +91,15 @@ REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
 # в Telegram, но попадающие в HTML-разметку (стример скопировал прошлый пост
 # и обновил только видимый текст). Завершившиеся колёса не рассылаются.
 PRECHECK_WHEELS = env_bool("PRECHECK_WHEELS", True)
+# Каждый пост обрабатывается по хэшу содержимого только один раз (см.
+# parser.process_message), поэтому сбой отправки Telegram-уведомления в
+# момент обработки означает потерю находки навсегда, если её не повторить.
+# Записи с notified=False, найденные не позже этого окна (мин), повторно
+# отправляются в начале следующих циклов, пока не будут доставлены.
+NOTIFY_RETRY_WINDOW_MINUTES = env_int("NOTIFY_RETRY_WINDOW_MINUTES", 180, 1)
+# Лимит повторных отправок за один цикл — защита от долгого сбоя Telegram:
+# без него цикл тратил бы время на HTTP-ретраи по всему бэклогу разом.
+NOTIFY_RETRY_MAX_PER_CYCLE = env_int("NOTIFY_RETRY_MAX_PER_CYCLE", 10, 1)
 # Команды старше этого возраста (сек) подтверждаются, но не выполняются —
 # защита от бэклога getUpdates, накопившегося за время простоя парсера.
 STALE_COMMAND_SECONDS = env_int("STALE_COMMAND_SECONDS", 120, 10)
@@ -112,6 +121,12 @@ USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
 TWITCH_ENABLED = env_bool("TWITCH_ENABLED", True)
 TWITCH_IRC_HOST = "irc.chat.twitch.tv"
 TWITCH_IRC_PORT = 6697
+# Watchdog «мёртвого» IRC-соединения: если за это время не пришло ни байта,
+# считаем сокет зависшим (полуоткрытое TCP без RST от сервера — recv() даёт
+# только повторяющиеся таймауты, не ошибку и не пустые данные) и
+# переподключаемся. Twitch шлёт PING каждые ~5 минут даже в тихом чате,
+# поэтому порог должен быть заметно больше этого интервала.
+TWITCH_IDLE_TIMEOUT_SECONDS = env_int("TWITCH_IDLE_TIMEOUT_SECONDS", 360, 60)
 TWITCH_USERNAME_RE = re.compile(r"^@?#?([A-Za-z0-9][A-Za-z0-9_]{2,24})$")
 # Известные чат-боты, чьим ссылкам доверяем: обычно колесо публикует бот
 # по команде стримера. Как правило, боты и так имеют бейдж модератора,

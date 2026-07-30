@@ -1,4 +1,5 @@
 import unittest
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import requests
@@ -165,6 +166,87 @@ class ProcessMessageTests(unittest.TestCase):
                 {},
             )
             notify.assert_not_called()
+
+
+class RetryFailedNotificationsTests(unittest.TestCase):
+    """Пост обрабатывается по хэшу один раз — сбой отправки без ретрая
+    терял бы находку навсегда, поэтому retry_failed_notifications должен
+    подбирать записи с notified=False на следующих циклах."""
+
+    def _start(self, patcher):
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    def setUp(self):
+        self._start(patch.object(parser, "notifications_enabled", return_value=True))
+        self.now = parser.now_msk()
+
+    def entry(self, url="https://betboom.ru/freestream/a", notified=False, age_minutes=1):
+        found_at = (self.now - timedelta(minutes=age_minutes)).isoformat(timespec="seconds")
+        return {"url": url, "found_at": found_at, "channel": "demo", "notified": notified}
+
+    def test_retries_and_marks_notified_on_success(self):
+        send = self._start(
+            patch.object(parser, "send_telegram_notification", return_value=True)
+        )
+        results = [self.entry()]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 1)
+        self.assertTrue(results[0]["notified"])
+        send.assert_called_once()
+
+    def test_already_notified_entries_are_skipped(self):
+        send = self._start(patch.object(parser, "send_telegram_notification"))
+        results = [self.entry(notified=True)]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 0)
+        send.assert_not_called()
+
+    def test_entries_older_than_window_are_not_retried(self):
+        send = self._start(patch.object(parser, "send_telegram_notification"))
+        results = [self.entry(age_minutes=config.NOTIFY_RETRY_WINDOW_MINUTES + 1)]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 0)
+        send.assert_not_called()
+
+    def test_stays_false_when_retry_also_fails(self):
+        self._start(patch.object(parser, "send_telegram_notification", return_value=False))
+        results = [self.entry()]
+
+        parser.retry_failed_notifications(results, self.now)
+
+        self.assertFalse(results[0]["notified"])
+
+    def test_respects_max_per_cycle_limit(self):
+        send = self._start(
+            patch.object(parser, "send_telegram_notification", return_value=True)
+        )
+        results = [
+            self.entry(url=f"https://betboom.ru/freestream/{i}")
+            for i in range(config.NOTIFY_RETRY_MAX_PER_CYCLE + 3)
+        ]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, config.NOTIFY_RETRY_MAX_PER_CYCLE)
+        self.assertEqual(send.call_count, config.NOTIFY_RETRY_MAX_PER_CYCLE)
+
+    def test_noop_when_notifications_disabled(self):
+        with patch.object(parser, "notifications_enabled", return_value=False):
+            send = self._start(patch.object(parser, "send_telegram_notification"))
+            results = [self.entry()]
+
+            retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 0)
+        send.assert_not_called()
 
 
 class ProcessCycleTests(unittest.TestCase):

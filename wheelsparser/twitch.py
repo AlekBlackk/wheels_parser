@@ -14,6 +14,7 @@ import queue
 import random
 import socket
 import ssl
+import time
 from typing import Any
 
 from . import registry
@@ -24,6 +25,7 @@ from .config import (
     PRECHECK_WHEELS,
     REQUEST_TIMEOUT,
     TWITCH_BOTS,
+    TWITCH_IDLE_TIMEOUT_SECONDS,
     TWITCH_IRC_HOST,
     TWITCH_IRC_PORT,
     icon,
@@ -157,20 +159,41 @@ def _connect(channels: list[str]) -> ssl.SSLSocket:
     return sock
 
 
+def _idle_timeout_exceeded(last_activity: float) -> bool:
+    return time.monotonic() - last_activity > TWITCH_IDLE_TIMEOUT_SECONDS
+
+
 def _read_stream(sock: ssl.SSLSocket) -> None:
-    """Читает чат, пока не попросят остановиться или переподключиться."""
+    """Читает чат, пока не попросят остановиться или переподключиться.
+
+    Полуоткрытое TCP-соединение (сервер не шлёт RST) не даёт recv() ни
+    ошибки, ни данных — только повторяющиеся таймауты, и без вотчдога
+    поток крутился бы в continue бесконечно, не читая чат и не логируя
+    проблему. last_activity сбрасывается на каждый полученный чанк
+    (включая PING) — таймаут ловит только реально мёртвое соединение.
+    """
     buffer = b""
+    last_activity = time.monotonic()
     while not STOP_EVENT.is_set() and not registry.TWITCH_RELOAD.is_set():
         try:
             chunk = sock.recv(4096)
         except TimeoutError:
+            if _idle_timeout_exceeded(last_activity):
+                raise ConnectionError(
+                    f"нет данных от Twitch IRC дольше {TWITCH_IDLE_TIMEOUT_SECONDS} с"
+                ) from None
             continue
         except ssl.SSLError as error:
-            if "timed out" in str(error).lower():
-                continue
-            raise
+            if "timed out" not in str(error).lower():
+                raise
+            if _idle_timeout_exceeded(last_activity):
+                raise ConnectionError(
+                    f"нет данных от Twitch IRC дольше {TWITCH_IDLE_TIMEOUT_SECONDS} с"
+                ) from None
+            continue
         if not chunk:
             raise ConnectionError("соединение закрыто сервером")
+        last_activity = time.monotonic()
         buffer += chunk
         while b"\r\n" in buffer:
             raw_line, buffer = buffer.split(b"\r\n", 1)
