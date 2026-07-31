@@ -328,15 +328,6 @@ def _cutoff_key(cutoff: datetime) -> str:
     return cutoff.isoformat(timespec="seconds")
 
 
-def entries_since(cutoff: datetime) -> list[dict[str, Any]]:
-    """Все записи не старше cutoff, от старых к свежим."""
-    rows = connection().execute(
-        "SELECT * FROM wheels WHERE found_at >= ? ORDER BY found_at, id",
-        (_cutoff_key(cutoff),),
-    )
-    return [row_to_entry(row) for row in rows]
-
-
 def wheels_since(cutoff: datetime) -> list[dict[str, Any]]:
     """Находки со ссылкой не старше cutoff, от старых к свежим.
 
@@ -367,13 +358,6 @@ def pending_retry(cutoff: datetime, limit: int) -> list[dict[str, Any]]:
         (_cutoff_key(cutoff), limit),
     )
     return [row_to_entry(row) for row in rows]
-
-
-def total_wheels() -> int:
-    row = connection().execute(
-        "SELECT COUNT(*) AS total FROM wheels WHERE url != ''"
-    ).fetchone()
-    return int(row["total"])
 
 
 def wheel_stats() -> WheelStats:

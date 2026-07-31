@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from tests.dbfixture import use_temp_db
+from tests.dbfixture import entries_since, use_temp_db
 from wheelsparser import alerts, config, db, parser, registry, urls
 
 
@@ -477,7 +477,7 @@ class ProcessCycleTests(unittest.TestCase):
         self.now = parser.now_msk()
 
     def stored(self):
-        return db.entries_since(self.now - timedelta(hours=1))
+        return entries_since(self.now - timedelta(hours=1))
 
     def test_found_wheel_is_written_to_the_database(self):
         message = make_message(

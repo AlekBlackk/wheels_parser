@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
-from tests.dbfixture import use_temp_db
+from tests.dbfixture import entries_since, use_temp_db
 from wheelsparser import db
 from wheelsparser.timeutils import now_msk
 
@@ -50,7 +50,7 @@ class RoundTripTests(DbTestCase):
         entry = self.wheel(referral=True, ends_at=self.at(-30), edited=True)
 
         db.insert_entries([entry])
-        (stored,) = db.entries_since(self.now - timedelta(hours=1))
+        (stored,) = entries_since(self.now - timedelta(hours=1))
 
         for field in ("url", "channel", "msg_id", "message_url", "preview", "status"):
             self.assertEqual(stored[field], entry[field])
@@ -74,7 +74,7 @@ class RoundTripTests(DbTestCase):
         }
 
         db.insert_entries([entry])
-        (stored,) = db.entries_since(self.now - timedelta(hours=1))
+        (stored,) = entries_since(self.now - timedelta(hours=1))
 
         self.assertEqual(stored["keywords"], ["колесо", "*розыгрыш*"])
         self.assertEqual(stored["preview_html"], entry["preview_html"])
@@ -86,7 +86,7 @@ class RoundTripTests(DbTestCase):
         entry = self.wheel(source="twitch", author="bot", author_roles=["moderator", "bot"])
 
         db.insert_entries([entry])
-        (stored,) = db.entries_since(self.now - timedelta(hours=1))
+        (stored,) = entries_since(self.now - timedelta(hours=1))
 
         self.assertEqual(stored["source"], "twitch")
         self.assertEqual(stored["author"], "bot")
@@ -105,7 +105,7 @@ class RoundTripTests(DbTestCase):
         db.insert_entries([self.wheel()])
         db.init_db()
 
-        self.assertEqual(db.total_wheels(), 1)
+        self.assertEqual(db.wheel_stats().total, 1)
 
 
 class WindowQueryTests(DbTestCase):
@@ -119,7 +119,7 @@ class WindowQueryTests(DbTestCase):
             self.wheel(url="https://x/stale", found_at=self.at(120)),
         ])
 
-        fresh = db.entries_since(self.now - timedelta(minutes=30))
+        fresh = entries_since(self.now - timedelta(minutes=30))
 
         self.assertEqual([item["url"] for item in fresh], ["https://x/fresh"])
 
@@ -129,7 +129,7 @@ class WindowQueryTests(DbTestCase):
             self.wheel(url="https://x/first", found_at=self.at(9)),
         ])
 
-        found = db.entries_since(self.now - timedelta(minutes=30))
+        found = entries_since(self.now - timedelta(minutes=30))
 
         self.assertEqual(
             [item["url"] for item in found], ["https://x/first", "https://x/second"]
@@ -215,7 +215,7 @@ class UpdateDeliveryTests(DbTestCase):
         # twitch до вставки), обновлять нечего — это не ошибка.
         db.update_delivery({"url": "https://x/1", "notified": True})
 
-        self.assertEqual(db.total_wheels(), 0)
+        self.assertEqual(db.wheel_stats().total, 0)
 
 
 class PruneTests(DbTestCase):
@@ -227,7 +227,7 @@ class PruneTests(DbTestCase):
         ])
 
         removed = db.prune(2)
-        kept = [item["url"] for item in db.entries_since(self.now - timedelta(hours=1))]
+        kept = [item["url"] for item in entries_since(self.now - timedelta(hours=1))]
 
         self.assertEqual(removed, 3)
         self.assertEqual(kept, ["https://x/3", "https://x/4"])
@@ -332,7 +332,7 @@ class ConcurrencyTests(DbTestCase):
             thread.join()
 
         self.assertEqual(errors, [])
-        self.assertEqual(db.total_wheels(), 75)
+        self.assertEqual(db.wheel_stats().total, 75)
 
     def test_reader_thread_works_while_another_writes(self):
         # Ради этого включён WAL: /status и /active не должны падать с
@@ -359,7 +359,7 @@ class ConcurrencyTests(DbTestCase):
             thread.join()
 
         self.assertEqual(errors, [])
-        self.assertEqual(db.total_wheels(), 50)
+        self.assertEqual(db.wheel_stats().total, 50)
 
 
 class LegacyMigrationTests(DbTestCase):
@@ -371,7 +371,7 @@ class LegacyMigrationTests(DbTestCase):
 
         db.init_db()
 
-        (stored,) = db.entries_since(self.now - timedelta(hours=1))
+        (stored,) = entries_since(self.now - timedelta(hours=1))
         self.assertEqual(stored["url"], "https://x/legacy")
 
     def test_migrated_file_is_renamed_so_import_runs_once(self):
@@ -393,7 +393,7 @@ class LegacyMigrationTests(DbTestCase):
 
         db.init_db()
 
-        (stored,) = db.entries_since(self.now - timedelta(hours=1))
+        (stored,) = entries_since(self.now - timedelta(hours=1))
         self.assertEqual(
             stored["found_at"], self.now.isoformat(timespec="seconds")
         )
@@ -404,7 +404,7 @@ class LegacyMigrationTests(DbTestCase):
 
         db.init_db()
 
-        self.assertEqual(db.total_wheels(), 0)
+        self.assertEqual(db.wheel_stats().total, 0)
         self.assertFalse(self.legacy.exists())
         self.assertTrue(self.legacy.with_suffix(".json.broken").exists())
 

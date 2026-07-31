@@ -698,6 +698,16 @@ def process_cycle(
         db.prune(MAX_RESULTS)
     status_icon = icon("warn") if failed_channels or empty_channels else icon("ok")
     empty_note = f" · пустых лент: {len(empty_channels)}" if empty_channels else ""
+    # STOP_EVENT мог прервать обработку раньше, чем дошли до всех каналов
+    # (см. цикл выше) — тогда checked_channels короче channels, и "N/M"
+    # обязан отражать реально проверенные каналы, а не список из реестра:
+    # иначе прерванный на 3 каналах цикл рапортовал бы «28/28», как будто
+    # все они проверены и исправны.
+    stopped_note = (
+        f" · остановлено, пропущено {len(channels) - len(checked_channels)}"
+        if len(checked_channels) < len(channels)
+        else ""
+    )
     # Следующий запуск отсчитывается от НАЧАЛА цикла (см. app.parse_loop).
     elapsed = time.monotonic() - cycle_started
     next_at = (
@@ -718,11 +728,12 @@ def process_cycle(
             CHECK_INTERVAL,
         )
     log.info(
-        "%s Цикл завершён · каналы %s/%s%s · новых ссылок: %s%s",
+        "%s Цикл завершён · каналы %s/%s%s%s · новых ссылок: %s%s",
         status_icon,
-        len(channels) - len(failed_channels),
-        len(channels),
+        len(checked_channels) - len(failed_channels),
+        len(checked_channels),
         empty_note,
+        stopped_note,
         # Записи без url — посты с ключевыми словами; в счётчик ссылок
         # они не идут.
         sum(1 for entry in new_entries if entry.get("url")),
