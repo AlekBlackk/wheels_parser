@@ -93,7 +93,7 @@ def wheel_end_msk(info: dict[str, Any] | None) -> datetime | None:
 def wheel_ends_at(info: dict[str, Any] | None) -> str:
     """Дедлайн колеса как ISO-строка МСК (пустая, если срок неизвестен).
 
-    Строка, а не datetime: значение уезжает в freebets.json и обратно.
+    Строка, а не datetime: значение уезжает в базу находок и обратно.
     """
     end = wheel_end_msk(info)
     return end.isoformat(timespec="seconds") if end is not None else ""

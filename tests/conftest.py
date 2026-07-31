@@ -3,7 +3,7 @@
 config.py фиксирует пути при импорте, поэтому WHEELSPARSER_DATA_DIR
 нужно подменить ДО первого импорта wheelsparser — на уровне модуля
 conftest, а не в фикстуре. Все файлы состояния (seen_ids.json,
-freebets.json и т.д.) уходят во временный каталог и не трогают data/.
+wheels.db и т.д.) уходят во временный каталог и не трогают data/.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Кулдаун повторных уведомлений — общий для Telegram и Twitch.
 
 Одно и то же колесо, найденное в двух источниках, не рассылается дважды.
-Состояние живёт в памяти и восстанавливается из freebets.json при старте.
+Состояние живёт в памяти и восстанавливается из базы находок при старте.
 """
 
 from __future__ import annotations
@@ -9,8 +9,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta
 
-from .config import OUTPUT_FILE, REALERT_COOLDOWN_MINUTES
-from .storage import read_json
+from . import db
+from .config import REALERT_COOLDOWN_MINUTES
 from .timeutils import now_msk, parse_found_at
 from .urls import normalize_url
 
@@ -59,14 +59,15 @@ def mark_url_alert(url: str, when: datetime) -> None:
 
 
 def seed_url_alerts_from_history() -> None:
-    """Восстанавливает кулдаун уведомлений из freebets.json после рестарта.
+    """Восстанавливает кулдаун уведомлений из базы после рестарта.
 
     Без этого Twitch-кулдаун жил только в памяти: после перезапуска парсера
     та же ссылка могла уйти в Telegram повторно раньше времени.
+    Поднимается только окно кулдауна — записи старше него на повтор всё
+    равно не влияют.
     """
-    for item in read_json(OUTPUT_FILE, []):
-        if not isinstance(item, dict):
-            continue
+    cutoff = now_msk() - timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    for item in db.wheels_since(cutoff):
         url = normalize_url(str(item.get("url", "")))
         if not url:
             continue

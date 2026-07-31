@@ -2,6 +2,10 @@
 
 Всё пишется атомарно (запись во временный файл + replace), чтобы падение
 процесса посреди записи не оставило обрезанный JSON.
+
+Здесь живут только небольшие файлы, которые дёшево переписывать целиком:
+обработанные сообщения, удалённые вручную колёса и offset бота. История
+находок переехала в SQLite — см. db.py.
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ from .config import (
     BOT_STATE_FILE,
     DATA_DIR,
     LOG_FILE,
-    MAX_RESULTS,
     MAX_SEEN_PER_CHANNEL,
     OUTPUT_FILE,
     REMOVED_WHEELS_FILE,
@@ -130,26 +133,6 @@ def save_seen(seen: dict[str, dict[str, str]]) -> None:
         if channel in active
     }
     atomic_write_json(SEEN_FILE, serializable)
-
-
-# ----------------------------------------------------------------------------
-# История находок (freebets.json)
-# ----------------------------------------------------------------------------
-
-def load_results() -> list[dict[str, Any]]:
-    data = read_json(OUTPUT_FILE, [])
-    return data if isinstance(data, list) else []
-
-
-def save_results(results: list[dict[str, Any]]) -> None:
-    """Сохраняет историю, обрезая её до MAX_RESULTS записей.
-
-    Обрезка на месте (del, а не переприсваивание): список results общий
-    между циклами, терять ссылку на него нельзя.
-    """
-    if len(results) > MAX_RESULTS:
-        del results[: len(results) - MAX_RESULTS]
-    atomic_write_json(OUTPUT_FILE, results)
 
 
 # ----------------------------------------------------------------------------

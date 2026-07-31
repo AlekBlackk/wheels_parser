@@ -10,12 +10,12 @@ from __future__ import annotations
 import html
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import requests
 
-from . import registry
+from . import db, registry
 from .active_report import fire_active_check, lookup_active_number
 from .config import (
     ACTIVE_MAX_AGE_HOURS,
@@ -25,6 +25,7 @@ from .config import (
     REQUEST_TIMEOUT,
     STALE_COMMAND_SECONDS,
     TELEGRAM_CHAT_ID,
+    TOP_PERIOD_DAYS,
     TWITCH_USERNAME_RE,
     USERNAME_RE,
     WHEELS_WINDOW_MINUTES,
@@ -35,13 +36,12 @@ from .net import BOT_SESSION
 from .runtime import STOP_EVENT
 from .storage import (
     load_bot_offset,
-    load_results,
     mark_wheel_removed,
     removed_wheels_today,
     save_bot_offset,
 )
 from .telegram_api import bot_send
-from .timeutils import now_msk, parse_found_at
+from .timeutils import now_msk
 from .urls import normalize_url
 
 BOT_COMMANDS = [
@@ -50,6 +50,7 @@ BOT_COMMANDS = [
     {"command": "active", "description": "Живые колёса за сегодня (сброс в 00:00 МСК)"},
     {"command": "removewheel", "description": "Убрать колесо по номеру из /active: /removewheel 2"},
     {"command": "status", "description": "Статистика: всего / за сегодня / последняя"},
+    {"command": "top", "description": f"Каналы по числу колёс за {TOP_PERIOD_DAYS} дн."},
     {"command": "channels", "description": "Список каналов"},
     {"command": "add", "description": "Добавить канал: /add @channel"},
     {"command": "remove", "description": "Убрать канал: /remove @channel"},
@@ -103,6 +104,8 @@ def help_text() -> str:
         "/removewheel номер — убрать колесо из /active до конца суток\n"
         "    (номер — из последнего ответа /active; можно и ссылкой)\n"
         "/status — статистика найденных ссылок\n"
+        f"/top — какие каналы дают колёса чаще (за {TOP_PERIOD_DAYS} дн.)\n"
+        "    (период задаётся числом дней: <code>/top 7</code>)\n"
         "/channels — список отслеживаемых каналов\n"
         "/add @channel — добавить канал\n"
         "/remove @channel — убрать канал\n"
@@ -122,54 +125,57 @@ def help_text() -> str:
 
 
 def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
-    now = now_msk()
-    fresh: list[dict[str, Any]] = []
-    for item in load_results():
-        # Записи без url — посты с ключевыми словами: они лежат в том же
-        # файле ради ретрая недоставленных уведомлений, но колёсами не
-        # являются и в списки ссылок не попадают.
-        if not item.get("url"):
-            continue
-        found = parse_found_at(item.get("found_at"))
-        if found is None:
-            continue
-        if now - found <= timedelta(minutes=minutes):
-            fresh.append(item)
-    fresh.sort(key=lambda item: str(item.get("found_at", "")), reverse=True)
-    return fresh
+    """Колёса за последние minutes минут, от свежих к старым.
+
+    Записи без url — посты с ключевыми словами: они лежат в той же
+    таблице ради ретрая недоставленных уведомлений, но колёсами не
+    являются и в списки ссылок не попадают (их отсекает wheels_since).
+    """
+    cutoff = now_msk() - timedelta(minutes=minutes)
+    return list(reversed(db.wheels_since(cutoff)))
+
+
+def channel_label(item: dict[str, Any]) -> str:
+    """Подпись источника находки: @канал или twitch.tv/канал."""
+    channel = html.escape(str(item.get("channel", "?")))
+    if item.get("source") == "twitch":
+        return f"twitch.tv/{channel}"
+    return f"@{channel}"
 
 
 def status_text() -> str:
     # Только находки со ссылкой: записи о ключевых словах хранятся рядом
     # ради ретрая уведомлений, но статистика тут — про колёса.
-    items = [item for item in load_results() if item.get("url")]
-    total = len(items)
-    today = now_msk().date()
-    today_count = 0
-    last_item: dict[str, Any] | None = None
-    last_found: datetime | None = None
-    for item in items:
-        found = parse_found_at(item.get("found_at"))
-        if found is None:
-            continue
-        if found.date() == today:
-            today_count += 1
-        if last_found is None or found > last_found:
-            last_found = found
-            last_item = item
-
+    stats = db.wheel_stats()
     lines = [
-        f"🎁 Найдено ссылок всего: {total}",
-        f"📅 За сегодня: {today_count}",
+        f"🎁 Найдено ссылок всего: {stats.total}",
+        f"📅 За сегодня: {stats.today}",
     ]
-    if last_item and last_found:
-        channel = html.escape(str(last_item.get("channel", "?")))
-        url = html.escape(normalize_url(str(last_item.get("url", ""))))
-        lines.append(f"🕑 Последняя ссылка: {last_found.strftime('%H:%M')} (@{channel})")
-        if url:
-            lines.append(url)
-    else:
+    if stats.last is None:
         lines.append("🕑 Последняя ссылка: пока нет")
+        return "\n".join(lines)
+    found_at = str(stats.last.get("found_at", ""))
+    found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+    url = html.escape(normalize_url(str(stats.last.get("url", ""))))
+    lines.append(
+        f"🕑 Последняя ссылка: {found_time} ({channel_label(stats.last)})"
+    )
+    if url:
+        lines.append(url)
+    return "\n".join(lines)
+
+
+def top_text(days: int = TOP_PERIOD_DAYS) -> str:
+    """Рейтинг каналов по числу найденных колёс за последние days суток."""
+    counts = db.channel_counts(now_msk() - timedelta(days=days))
+    if not counts:
+        return f"За последние {days} дн. находок пока нет."
+    lines = [f"📊 <b>Колёс за {days} дн. по каналам:</b>"]
+    lines.extend(
+        f"{position}. {channel_label({'channel': row.channel, 'source': row.source})}"
+        f" — {row.wheels}"
+        for position, row in enumerate(counts, start=1)
+    )
     return "\n".join(lines)
 
 
@@ -185,14 +191,7 @@ def wheels_for_active() -> list[dict[str, Any]]:
     now = now_msk()
     day_cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
     age_cutoff = now - timedelta(hours=ACTIVE_MAX_AGE_HOURS)
-    cutoff = max(day_cutoff, age_cutoff)
-    fresh_items: list[dict[str, Any]] = []
-    for item in load_results():
-        found = parse_found_at(item.get("found_at"))
-        if found is None:
-            continue
-        if found >= cutoff:
-            fresh_items.append(item)
+    fresh_items = db.wheels_since(max(day_cutoff, age_cutoff))
 
     removed_today = removed_wheels_today()
     seen_urls: set[str] = set()
@@ -237,6 +236,21 @@ def cmd_help(chat_id: str, _argument: str) -> None:
 
 def cmd_status(chat_id: str, _argument: str) -> None:
     bot_send(chat_id, status_text())
+
+
+def cmd_top(chat_id: str, argument: str) -> None:
+    raw = argument.strip()
+    if raw and not raw.isdigit():
+        bot_send(
+            chat_id,
+            "Укажите период в днях: <code>/top 7</code> "
+            f"(без аргумента — за {TOP_PERIOD_DAYS} дн.)",
+        )
+        return
+    # Верхняя граница — чтобы «/top 100000» не выглядел осмысленным
+    # периодом: истории всё равно не больше MAX_RESULTS записей.
+    days = min(max(int(raw), 1), 365) if raw else TOP_PERIOD_DAYS
+    bot_send(chat_id, top_text(days))
 
 
 def cmd_wheels(chat_id: str, _argument: str) -> None:
@@ -549,6 +563,7 @@ COMMAND_HANDLERS: dict[str, Callable[[str, str], None]] = {
     "/start": cmd_start,
     "/help": cmd_help,
     "/status": cmd_status,
+    "/top": cmd_top,
     "/wheels": cmd_wheels,
     "/active": cmd_active,
     "/removewheel": cmd_removewheel,

@@ -29,13 +29,13 @@ from .config import (
     ALERT_ON_FIRST_RUN,
     CHECK_INTERVAL,
     LOCK_FILE,
-    OUTPUT_FILE,
     REQUEST_TIMEOUT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TWITCH_ENABLED,
     icon,
 )
+from .db import close_connection, init_db
 from .logging_setup import force_utf8_console, log, redact_token, setup_logging
 from .net import SUPERVISOR_SESSION
 from .parser import process_cycle
@@ -45,13 +45,7 @@ from .runtime import (
     install_signal_handlers,
     supervise,
 )
-from .storage import (
-    atomic_write_json,
-    ensure_data_dir,
-    load_results,
-    load_seen,
-    save_seen,
-)
+from .storage import ensure_data_dir, load_seen, save_seen
 from .telegram_api import send_service_notification
 from .twitch import twitch_loop, twitch_worker_loop
 
@@ -165,11 +159,7 @@ def _start_twitch_thread() -> None:
         )
 
 
-def _run_parse_loop(
-    seen: dict[str, dict[str, str]],
-    results: list[dict],
-    baseline: bool,
-) -> None:
+def _run_parse_loop(seen: dict[str, dict[str, str]], baseline: bool) -> None:
     """Цикл парсинга (daemon-поток).
 
     Интервал отсчитывается от НАЧАЛА цикла: иначе реальный период равен
@@ -179,7 +169,7 @@ def _run_parse_loop(
     """
     cycle_started = time.monotonic()
     try:
-        process_cycle(seen, results, baseline=baseline)
+        process_cycle(seen, baseline=baseline)
     except Exception:
         log.exception(
             "%s Необработанная ошибка в цикле парсинга — жду следующий цикл",
@@ -191,7 +181,7 @@ def _run_parse_loop(
             break
         cycle_started = time.monotonic()
         try:
-            process_cycle(seen, results)
+            process_cycle(seen)
         except Exception:
             log.exception(
                 "%s Необработанная ошибка в цикле парсинга — жду следующий цикл",
@@ -229,10 +219,10 @@ def main() -> int:
     registry.init()
     _seed_registry_files()
 
+    # База находок открывается после ensure_data_dir(): к этому моменту
+    # старый freebets.json из корня уже лежит в data/ и его можно перенести.
+    init_db()
     seen, has_state = load_seen()
-    results = load_results()
-    if not OUTPUT_FILE.exists():
-        atomic_write_json(OUTPUT_FILE, results)
 
     notifications = (
         "включены" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "выключены"
@@ -260,7 +250,7 @@ def main() -> int:
     # сетевой вызов (особенно на Windows), поэтому главный поток должен
     # только ждать STOP_EVENT — тогда сигнал обрабатывается мгновенно.
     parser_thread = _start_supervised(
-        functools.partial(_run_parse_loop, seen, results, baseline),
+        functools.partial(_run_parse_loop, seen, baseline),
         "parser",
     )
 
@@ -277,5 +267,9 @@ def main() -> int:
         )
     else:
         save_seen(seen)
+    # Закрываем соединение главного потока: SQLite сливает WAL в основной
+    # файл базы. Соединения рабочих потоков закрывать некому — они daemon,
+    # но их WAL восстанавливается при следующем открытии базы.
+    close_connection()
     log.info("%s WheelsParser остановлен", icon("stop"))
     return 0

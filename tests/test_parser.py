@@ -4,7 +4,8 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from wheelsparser import alerts, config, parser, registry, urls
+from tests.dbfixture import use_temp_db
+from wheelsparser import alerts, config, db, parser, registry, urls
 
 
 def make_message(message_id, text, links):
@@ -191,7 +192,7 @@ class ProcessMessageTests(unittest.TestCase):
 class RetryFailedNotificationsTests(unittest.TestCase):
     """Пост обрабатывается по хэшу один раз — сбой отправки без ретрая
     терял бы находку навсегда, поэтому retry_failed_notifications должен
-    подбирать записи с notified=False на следующих циклах."""
+    подбирать из базы записи с notified=0 на следующих циклах."""
 
     def _start(self, patcher):
         mock = patcher.start()
@@ -199,74 +200,112 @@ class RetryFailedNotificationsTests(unittest.TestCase):
         return mock
 
     def setUp(self):
+        use_temp_db(self)
         self._start(patch.object(parser, "notifications_enabled", return_value=True))
         self.now = parser.now_msk()
 
-    def entry(self, url="https://betboom.ru/freestream/a", notified=False, age_minutes=1):
-        found_at = (self.now - timedelta(minutes=age_minutes)).isoformat(timespec="seconds")
-        return {"url": url, "found_at": found_at, "channel": "demo", "notified": notified}
+    def store(self, url="https://betboom.ru/freestream/a", notified=False,
+              age_minutes=1, **overrides):
+        """Кладёт запись в базу и возвращает её (с проставленным id)."""
+        entry = {
+            "url": url,
+            "found_at": (self.now - timedelta(minutes=age_minutes)).isoformat(
+                timespec="seconds"
+            ),
+            "channel": "demo",
+            "notified": notified,
+        }
+        entry.update(overrides)
+        db.insert_entries([entry])
+        return entry
+
+    def pending_urls(self):
+        window = self.now - timedelta(minutes=config.NOTIFY_RETRY_WINDOW_MINUTES)
+        return [item.get("url") for item in db.pending_retry(window, 100)]
 
     def test_retries_and_marks_notified_on_success(self):
         send = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)
         )
-        results = [self.entry()]
+        self.store()
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 1)
-        self.assertTrue(results[0]["notified"])
         send.assert_called_once()
+
+    def test_successful_retry_is_persisted_and_not_repeated(self):
+        # Без записи в базу следующий цикл отправил бы то же уведомление снова.
+        self._start(
+            patch.object(parser, "send_telegram_notification", return_value=True)
+        )
+        self.store()
+
+        parser.retry_failed_notifications(self.now)
+
+        self.assertEqual(self.pending_urls(), [])
 
     def test_already_notified_entries_are_skipped(self):
         send = self._start(patch.object(parser, "send_telegram_notification"))
-        results = [self.entry(notified=True)]
+        self.store(notified=True)
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 0)
         send.assert_not_called()
 
     def test_entries_older_than_window_are_not_retried(self):
         send = self._start(patch.object(parser, "send_telegram_notification"))
-        results = [self.entry(age_minutes=config.NOTIFY_RETRY_WINDOW_MINUTES + 1)]
+        self.store(age_minutes=config.NOTIFY_RETRY_WINDOW_MINUTES + 1)
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 0)
         send.assert_not_called()
 
-    def test_stays_false_when_retry_also_fails(self):
+    def test_stays_pending_when_retry_also_fails(self):
         self._start(patch.object(parser, "send_telegram_notification", return_value=False))
-        results = [self.entry()]
+        self.store()
 
-        parser.retry_failed_notifications(results, self.now)
+        parser.retry_failed_notifications(self.now)
 
-        self.assertFalse(results[0]["notified"])
+        self.assertEqual(self.pending_urls(), ["https://betboom.ru/freestream/a"])
 
     def test_entries_with_unknown_delivery_are_not_retried(self):
         # Telegram мог принять сообщение и не донести ответ — повтор
         # такой отправки рассылает дубликат.
         send = self._start(patch.object(parser, "send_telegram_notification"))
-        entry = self.entry()
-        entry["delivery_unknown"] = True
-        results = [entry]
+        self.store(delivery_unknown=True)
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 0)
         send.assert_not_called()
+
+    def test_unknown_delivery_during_retry_stops_further_attempts(self):
+        # Отправка могла дойти, а ответ — нет: флаг должен попасть в базу,
+        # иначе следующий цикл продублирует сообщение.
+        def mark_unknown(entry, *_args, **_kwargs):
+            entry["delivery_unknown"] = True
+            return False
+
+        self._start(
+            patch.object(parser, "send_telegram_notification", side_effect=mark_unknown)
+        )
+        self.store()
+
+        parser.retry_failed_notifications(self.now)
+
+        self.assertEqual(self.pending_urls(), [])
 
     def test_respects_max_per_cycle_limit(self):
         send = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)
         )
-        results = [
-            self.entry(url=f"https://betboom.ru/freestream/{i}")
-            for i in range(config.NOTIFY_RETRY_MAX_PER_CYCLE + 3)
-        ]
+        for index in range(config.NOTIFY_RETRY_MAX_PER_CYCLE + 3):
+            self.store(url=f"https://betboom.ru/freestream/{index}")
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, config.NOTIFY_RETRY_MAX_PER_CYCLE)
         self.assertEqual(send.call_count, config.NOTIFY_RETRY_MAX_PER_CYCLE)
@@ -278,27 +317,25 @@ class RetryFailedNotificationsTests(unittest.TestCase):
             patch.object(parser, "send_keyword_notification", return_value=True)
         )
         link_send = self._start(patch.object(parser, "send_telegram_notification"))
-        entry = self.entry()
-        entry.pop("url")
-        entry["keywords"] = ["колесо"]
-        entry["message_url"] = "https://t.me/demo/1"
-        results = [entry]
+        self.store(
+            url="",
+            keywords=["колесо"],
+            message_url="https://t.me/demo/1",
+        )
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 1)
-        self.assertTrue(results[0]["notified"])
+        self.assertEqual(self.pending_urls(), [])
         keyword_send.assert_called_once()
         link_send.assert_not_called()
 
     def test_entries_without_url_and_keywords_are_skipped(self):
         keyword_send = self._start(patch.object(parser, "send_keyword_notification"))
         link_send = self._start(patch.object(parser, "send_telegram_notification"))
-        entry = self.entry()
-        entry.pop("url")
-        results = [entry]
+        self.store(url="")
 
-        retried = parser.retry_failed_notifications(results, self.now)
+        retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 0)
         keyword_send.assert_not_called()
@@ -307,9 +344,9 @@ class RetryFailedNotificationsTests(unittest.TestCase):
     def test_noop_when_notifications_disabled(self):
         with patch.object(parser, "notifications_enabled", return_value=False):
             send = self._start(patch.object(parser, "send_telegram_notification"))
-            results = [self.entry()]
+            self.store()
 
-            retried = parser.retry_failed_notifications(results, self.now)
+            retried = parser.retry_failed_notifications(self.now)
 
         self.assertEqual(retried, 0)
         send.assert_not_called()
@@ -412,47 +449,142 @@ class EmptyChannelDetectionTests(unittest.TestCase):
         self.assertNotIn("a", parser.CHANNEL_EMPTY_STREAK)
 
     def test_process_cycle_counts_channel_without_posts_as_empty(self):
+        use_temp_db(self)
         seen: dict[str, dict[str, str]] = {}
         with patch.dict(parser.CHANNEL_EMPTY_STREAK, clear=True), \
              patch.object(registry, "CHANNELS", ["a", "b"]), \
              patch.object(parser, "fetch_channel", return_value=[]), \
-             patch.object(parser, "save_seen"), \
-             patch.object(parser, "save_results"):
-            parser.process_cycle(seen, [], baseline=True)
+             patch.object(parser, "save_seen"):
+            parser.process_cycle(seen, baseline=True)
 
             self.assertEqual(parser.CHANNEL_EMPTY_STREAK, {"a": 1, "b": 1})
 
     def test_process_cycle_does_not_count_unreachable_channel_as_empty(self):
+        use_temp_db(self)
         seen: dict[str, dict[str, str]] = {}
         with patch.dict(parser.CHANNEL_EMPTY_STREAK, clear=True), \
              patch.object(registry, "CHANNELS", ["a"]), \
              patch.object(parser, "fetch_channel", return_value=None), \
-             patch.object(parser, "save_seen"), \
-             patch.object(parser, "save_results"):
-            parser.process_cycle(seen, [], baseline=True)
+             patch.object(parser, "save_seen"):
+            parser.process_cycle(seen, baseline=True)
 
             self.assertEqual(parser.CHANNEL_EMPTY_STREAK, {})
 
 
 class ProcessCycleTests(unittest.TestCase):
+    def setUp(self):
+        use_temp_db(self)
+        self.now = parser.now_msk()
+
+    def stored(self):
+        return db.entries_since(self.now - timedelta(hours=1))
+
+    def test_found_wheel_is_written_to_the_database(self):
+        message = make_message(
+            "demo/1", "колесо", ["https://betboom.ru/freestream/new"]
+        )
+
+        with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
+             patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "fetch_channel", return_value=[message]), \
+             patch.object(parser, "send_telegram_notification", return_value=True), \
+             patch.object(parser, "save_seen"):
+            # Непустой seen: у канала уже есть история, значит «тихий»
+            # первый цикл ему не положен и уведомление уходит сразу.
+            parser.process_cycle({"demo": {"demo/0": "hash"}}, baseline=False)
+
+        (entry,) = self.stored()
+        self.assertEqual(entry["url"], "https://betboom.ru/freestream/new")
+        self.assertEqual(entry["channel"], "demo")
+        self.assertTrue(entry["notified"])
+
     def test_same_url_from_two_new_messages_is_saved_once(self):
         first = make_message("demo/2", "колесо", ["https://betboom.ru/freestream/same"])
         second = make_message("demo/3", "колесо", ["https://betboom.ru/freestream/same"])
         seen: dict[str, dict[str, str]] = {"demo": {}}
-        results: list[dict] = []
 
         with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
              patch.object(registry, "CHANNELS", ["demo"]), \
              patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
              patch.object(parser, "fetch_channel", side_effect=[[first], [second]]), \
              patch.object(parser, "send_telegram_notification", return_value=True), \
-             patch.object(parser, "save_seen"), \
-             patch.object(parser, "save_results"):
-            parser.process_cycle(seen, results, baseline=True)
-            parser.process_cycle(seen, results, baseline=False)
+             patch.object(parser, "save_seen"):
+            parser.process_cycle(seen, baseline=True)
+            parser.process_cycle(seen, baseline=False)
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["url"], "https://betboom.ru/freestream/same")
+        stored = self.stored()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["url"], "https://betboom.ru/freestream/same")
+
+    def test_cooldown_survives_restart_because_history_is_in_the_database(self):
+        # Кулдаун восстанавливается запросом к базе, а не из списка в
+        # памяти: после рестарта та же ссылка не должна уйти повторно.
+        message = make_message(
+            "demo/9", "колесо", ["https://betboom.ru/freestream/again"]
+        )
+        db.insert_entries([{
+            "url": "https://betboom.ru/freestream/again",
+            "found_at": (self.now - timedelta(minutes=1)).isoformat(timespec="seconds"),
+            "channel": "demo",
+            "notified": True,
+        }])
+
+        with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
+             patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "fetch_channel", return_value=[message]), \
+             patch.object(parser, "send_telegram_notification", return_value=True) as send, \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle({"demo": {}}, baseline=False)
+
+        send.assert_not_called()
+        self.assertEqual(len(self.stored()), 1)
+
+    def test_twitch_findings_from_the_queue_are_stored(self):
+        parser.TWITCH_NEW_ENTRIES.put({
+            "url": "https://betboom.ru/freestream/twitch",
+            "found_at": self.now.isoformat(timespec="seconds"),
+            "channel": "streamer",
+            "source": "twitch",
+            "notified": True,
+        })
+
+        with patch.object(registry, "CHANNELS", []), \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle({}, baseline=False)
+
+        (entry,) = self.stored()
+        self.assertEqual(entry["source"], "twitch")
+
+    def test_cycle_trims_history_to_max_results(self):
+        for index in range(3):
+            db.insert_entries([{
+                "url": f"https://betboom.ru/freestream/{index}",
+                "found_at": (self.now - timedelta(minutes=10 - index)).isoformat(
+                    timespec="seconds"
+                ),
+                "channel": "demo",
+                "notified": True,
+            }])
+        # Обрезка выполняется в циклах с находкой: новая приходит из Twitch.
+        parser.TWITCH_NEW_ENTRIES.put({
+            "url": "https://betboom.ru/freestream/fresh",
+            "found_at": self.now.isoformat(timespec="seconds"),
+            "channel": "streamer",
+            "source": "twitch",
+            "notified": True,
+        })
+
+        with patch.object(registry, "CHANNELS", []), \
+             patch.object(parser, "MAX_RESULTS", 2), \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle({}, baseline=False)
+
+        self.assertEqual(
+            [entry["url"] for entry in self.stored()],
+            ["https://betboom.ru/freestream/2", "https://betboom.ru/freestream/fresh"],
+        )
 
 
 if __name__ == "__main__":

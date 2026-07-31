@@ -2,7 +2,8 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
-from wheelsparser import active_report, bot, registry
+from tests.dbfixture import use_temp_db
+from wheelsparser import active_report, bot, db, registry
 from wheelsparser.timeutils import now_msk
 
 
@@ -159,6 +160,108 @@ class RemoveWheelCommandTests(unittest.TestCase):
             )
 
         mark.assert_called_once_with("https://betboom.ru/freestream/two")
+
+
+class HistoryReportTests(unittest.TestCase):
+    """Отчёты бота читают историю запросами к базе, а не всем файлом."""
+
+    def setUp(self):
+        use_temp_db(self)
+        self.now = now_msk()
+
+    def store(self, url="https://betboom.ru/freestream/a", minutes_ago=1, **overrides):
+        entry = {
+            "url": url,
+            "found_at": (self.now - timedelta(minutes=minutes_ago)).isoformat(
+                timespec="seconds"
+            ),
+            "channel": "demo",
+            "notified": True,
+        }
+        entry.update(overrides)
+        db.insert_entries([entry])
+        return entry
+
+    def test_recent_wheels_keeps_only_the_window_newest_first(self):
+        self.store(url="https://betboom.ru/freestream/old", minutes_ago=9)
+        self.store(url="https://betboom.ru/freestream/new", minutes_ago=1)
+        self.store(url="https://betboom.ru/freestream/ancient", minutes_ago=60)
+
+        wheels = bot.recent_wheels(minutes=10)
+
+        self.assertEqual(
+            [item["url"] for item in wheels],
+            ["https://betboom.ru/freestream/new", "https://betboom.ru/freestream/old"],
+        )
+
+    def test_recent_wheels_skips_keyword_records(self):
+        db.insert_entries([{
+            "found_at": self.now.isoformat(timespec="seconds"),
+            "channel": "demo",
+            "keywords": ["колесо"],
+        }])
+
+        self.assertEqual(bot.recent_wheels(minutes=10), [])
+
+    def test_status_reports_totals_and_last_wheel(self):
+        self.store(url="https://betboom.ru/freestream/first", minutes_ago=30)
+        self.store(url="https://betboom.ru/freestream/last", minutes_ago=1)
+
+        text = bot.status_text()
+
+        self.assertIn("всего: 2", text)
+        self.assertIn("https://betboom.ru/freestream/last", text)
+        self.assertIn("@demo", text)
+
+    def test_status_without_wheels_says_so(self):
+        self.assertIn("пока нет", bot.status_text())
+
+    def test_active_deduplicates_by_canonical_url(self):
+        self.store(url="https://betboom.ru/freestream/one?utm_source=tg", minutes_ago=5)
+        self.store(url="https://www.betboom.ru/freestream/one/", minutes_ago=1)
+
+        items = bot.wheels_for_active()
+
+        self.assertEqual(len(items), 1)
+
+    def test_active_skips_manually_removed_wheels(self):
+        self.store(url="https://betboom.ru/freestream/gone")
+
+        with patch.object(
+            bot, "removed_wheels_today", return_value={"https://betboom.ru/freestream/gone"}
+        ):
+            self.assertEqual(bot.wheels_for_active(), [])
+
+    def test_top_ranks_channels_by_number_of_wheels(self):
+        self.store(url="https://betboom.ru/freestream/1", channel="often")
+        self.store(url="https://betboom.ru/freestream/2", channel="often")
+        self.store(url="https://betboom.ru/freestream/3", channel="rare")
+
+        text = bot.top_text(days=30)
+
+        self.assertLess(text.index("often"), text.index("rare"))
+        self.assertIn("@often", text)
+
+    def test_top_marks_twitch_channels(self):
+        self.store(url="https://betboom.ru/freestream/1", channel="streamer",
+                   source="twitch")
+
+        self.assertIn("twitch.tv/streamer", bot.top_text(days=30))
+
+    def test_top_without_history_says_so(self):
+        self.assertIn("пока нет", bot.top_text(days=30))
+
+    def test_top_command_accepts_period_in_days(self):
+        self.store(url="https://betboom.ru/freestream/1", minutes_ago=60 * 24 * 5)
+
+        with patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/top 3")
+            recent = send.call_args.args[1]
+            bot.handle_command("1", "/top 30")
+            older = send.call_args.args[1]
+
+        self.assertIn("пока нет", recent)
+        self.assertIn("@demo", older)
 
 
 class DispatchTests(unittest.TestCase):

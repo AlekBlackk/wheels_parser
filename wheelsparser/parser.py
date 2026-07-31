@@ -13,7 +13,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-from . import registry
+from . import db, registry
 from .alerts import last_alert, mark_url_alert
 from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
@@ -21,6 +21,7 @@ from .config import (
     CHANNEL_EMPTY_THRESHOLD,
     CHANNEL_FAIL_THRESHOLD,
     CHECK_INTERVAL,
+    MAX_RESULTS,
     MESSAGES_PER_CHANNEL,
     NOTIFY_RETRY_MAX_PER_CYCLE,
     NOTIFY_RETRY_WINDOW_MINUTES,
@@ -33,7 +34,7 @@ from .keywords import find_keywords
 from .logging_setup import log
 from .net import PARSER_SESSION
 from .runtime import STOP_EVENT
-from .storage import save_results, save_seen
+from .storage import save_seen
 from .telegram_api import (
     notifications_enabled,
     send_keyword_notification,
@@ -330,13 +331,22 @@ def report_empty_channels(
 
 def drain_twitch_entries() -> list[dict[str, Any]]:
     """Забирает находки twitch-потока: уведомления по ним уже отправлены,
-    осталось сохранить их в freebets.json и учесть в дедупликации."""
+    осталось сохранить их в базу и учесть в дедупликации."""
     entries: list[dict[str, Any]] = []
     while True:
         try:
             entries.append(TWITCH_NEW_ENTRIES.get_nowait())
         except queue.Empty:
             return entries
+
+
+def load_cooldown_window(now: datetime) -> list[dict[str, Any]]:
+    """Находки, способные подавить повтор: только они и нужны кулдауну.
+
+    Старше REALERT_COOLDOWN_MINUTES кулдаун не смотрит, поэтому вся
+    история из базы не поднимается — берётся окно.
+    """
+    return db.wheels_since(now - timedelta(minutes=REALERT_COOLDOWN_MINUTES))
 
 
 def index_last_found(results: list[dict[str, Any]]) -> dict[str, datetime]:
@@ -349,8 +359,8 @@ def index_last_found(results: list[dict[str, Any]]) -> dict[str, datetime]:
     """
     last_found: dict[str, datetime] = {}
     for item in results:
-        # Канонизация и здесь: старые записи freebets.json могли сохранить
-        # URL с query-параметрами — без нормализации кулдаун их не увидит.
+        # Канонизация и здесь: записи, перенесённые из freebets.json, могли
+        # сохранить URL с query-параметрами — без неё кулдаун их не увидит.
         item_url = normalize_url(str(item.get("url", "")))
         if not item_url:
             continue
@@ -362,13 +372,13 @@ def index_last_found(results: list[dict[str, Any]]) -> dict[str, datetime]:
     return last_found
 
 
-def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> int:
+def retry_failed_notifications(now: datetime) -> int:
     """Повторно отправляет уведомления, недоставленные в своём цикле.
 
     Пост обрабатывается по хэшу содержимого только один раз (см.
     process_message) — без ретрая сбой Telegram ровно в момент отправки
-    терял бы находку навсегда, хотя она и осталась в freebets.json с
-    notified=False. Ретраятся оба вида находок: ссылки на колёса и посты
+    терял бы находку навсегда, хотя она и осталась в базе с
+    notified=0. Ретраятся оба вида находок: ссылки на колёса и посты
     с ключевыми словами (у последних url нет — их узнаём по полю
     keywords). Записи из send_multi_telegram_notification (несколько
     ссылок в одном посте) при ретрае отправляются по одной обычным
@@ -377,22 +387,17 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
     Лимит и окно ограничивают стоимость длительного сбоя: не тратим
     весь цикл на HTTP-ретраи по всему бэклогу разом.
 
-    Записи с delivery_unknown пропускаются: sendMessage не идемпотентен,
-    и при таймауте чтения или 5xx сообщение могло уже уйти в чат —
-    повтор такой отправки рассылал бы дубликаты (см.
-    telegram_api.delivery_unknown).
+    Записи с delivery_unknown в выборку не попадают: sendMessage не
+    идемпотентен, и при таймауте чтения или 5xx сообщение могло уже уйти
+    в чат — повтор такой отправки рассылал бы дубликаты (см.
+    telegram_api.delivery_unknown). Результат каждой попытки сразу
+    пишется в базу: иначе следующий цикл отправил бы то же самое ещё раз.
     """
     if not notifications_enabled():
         return 0
+    cutoff = now - timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES)
     retried = 0
-    for entry in results:
-        if retried >= NOTIFY_RETRY_MAX_PER_CYCLE:
-            break
-        if entry.get("notified") or entry.get("delivery_unknown"):
-            continue
-        found = parse_found_at(entry.get("found_at"))
-        if found is None or now - found > timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES):
-            continue
+    for entry in db.pending_retry(cutoff, NOTIFY_RETRY_MAX_PER_CYCLE):
         if entry.get("url"):
             entry["notified"] = send_telegram_notification(entry)
             target = str(entry.get("url"))
@@ -402,6 +407,9 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
         else:
             continue
         retried += 1
+        # Пишем и успех, и delivery_unknown: отправка могла дойти, а ответ
+        # — нет, и тогда повторять её нельзя (см. telegram_api._mark_delivery).
+        db.update_delivery(entry)
         if entry["notified"]:
             log.info(
                 "%s Уведомление доставлено повторной попыткой: %s",
@@ -597,7 +605,6 @@ def process_message(
 
 def process_cycle(
     seen: dict[str, dict[str, str]],
-    results: list[dict[str, Any]],
     baseline: bool = False,
 ) -> int:
     cycle_started = time.monotonic()
@@ -605,10 +612,11 @@ def process_cycle(
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), len(channels))
     now = now_msk()
     twitch_entries = drain_twitch_entries()
-    if twitch_entries:
-        results.extend(twitch_entries)
-    retried = retry_failed_notifications(results, now)
-    last_found = index_last_found(results)
+    db.insert_entries(twitch_entries)
+    # Результат ретрая пишется в базу внутри самой функции, поэтому
+    # возвращённое число здесь больше ни на что не влияет.
+    retry_failed_notifications(now)
+    last_found = index_last_found(load_cooldown_window(now))
     new_entries: list[dict[str, Any]] = []
     failed_channels: list[str] = []
     empty_channels: list[str] = []
@@ -634,7 +642,10 @@ def process_cycle(
             entries = process_message(
                 message, channel, channel_seen, channel_baseline, now, last_found
             )
-            results.extend(entries)
+            # Пишем сразу, а не в конце цикла: находки следующих каналов
+            # ещё впереди, а падение процесса не должно терять уже
+            # разосланные уведомления.
+            db.insert_entries(entries)
             new_entries.extend(entries)
         if index < len(channels) - 1:
             STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
@@ -643,8 +654,8 @@ def process_cycle(
     update_channel_empty_streaks(checked_channels, failed_channels, empty_channels)
     report_empty_channels(checked_channels, failed_channels)
     save_seen(seen)
-    if new_entries or twitch_entries or retried:
-        save_results(results)
+    if new_entries or twitch_entries:
+        db.prune(MAX_RESULTS)
     status_icon = icon("warn") if failed_channels or empty_channels else icon("ok")
     empty_note = f" · пустых лент: {len(empty_channels)}" if empty_channels else ""
     # Следующий запуск отсчитывается от НАЧАЛА цикла (см. app.parse_loop).

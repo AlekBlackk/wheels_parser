@@ -9,7 +9,7 @@
            → keywords/alerts/betboom/telegram_api
            → active_report → bot / twitch / parser → app
 
-Файлы состояния (channels.txt, freebets.json, seen_ids.json и прочие)
+Файлы состояния (channels.txt, wheels.db, seen_ids.json и прочие)
 лежат в корне репозитория, на уровень выше каталога пакета:
 см. ``config.BASE_DIR``.
 """

@@ -4,6 +4,11 @@ data/
 parser.log
 seen_ids.json
 freebets.json
+freebets.json.migrated
+freebets.json.broken
+wheels.db
+wheels.db-wal
+wheels.db-shm
 bot_state.json
 removed_wheels.json
 

@@ -29,6 +29,9 @@ DATA_DIR = Path(os.getenv("WHEELSPARSER_DATA_DIR", "") or (BASE_DIR / "data"))
 CHANNELS_FILE = BASE_DIR / "channels.txt"
 KEYWORDS_FILE = BASE_DIR / "keywords.txt"
 TWITCH_CHANNELS_FILE = BASE_DIR / "twitch_channels.txt"
+# История находок. freebets.json остаётся только ради разового переноса
+# в базу при первом запуске новой версии (см. db.init_db).
+DB_FILE = DATA_DIR / "wheels.db"
 OUTPUT_FILE = DATA_DIR / "freebets.json"
 SEEN_FILE = DATA_DIR / "seen_ids.json"
 BOT_STATE_FILE = DATA_DIR / "bot_state.json"
@@ -72,10 +75,12 @@ CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
-# Максимум записей в freebets.json: без лимита файл и память растут бесконечно.
-# При превышении старые записи отбрасываются в конце цикла.
+# Максимум записей истории в wheels.db: без лимита база растёт бесконечно.
+# При превышении старые записи удаляются в конце цикла с находкой.
 MAX_RESULTS = env_int("MAX_RESULTS", 5000, 100)
 WHEELS_WINDOW_MINUTES = env_int("WHEELS_WINDOW_MINUTES", 10, 1)
+# Период по умолчанию для /top — рейтинга каналов по числу колёс.
+TOP_PERIOD_DAYS = env_int("TOP_PERIOD_DAYS", 30, 1)
 ACTIVE_MAX_AGE_HOURS = env_int("ACTIVE_MAX_AGE_HOURS", 20, 1)
 # /active смотрит только на колёса, найденные сегодня по МСК: счётчик «N из M»
 # сбрасывается каждый день в 00:00 по Москве (UTC+3, без летнего времени).
