@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -112,7 +113,11 @@ def acquire_single_instance_lock() -> Any | None:
     """
     lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
-        if os.name == "nt":
+        # sys.platform, а не os.name: mypy распознаёт именно sys.platform
+        # как условие платформы и не проверяет недостижимую на текущей ОС
+        # ветку — иначе mypy в CI на Linux спотыкался бы об отсутствующий
+        # msvcrt, а на Windows — об отсутствующий fcntl.
+        if sys.platform == "win32":
             import msvcrt
 
             lock_handle.seek(0)
@@ -120,11 +125,7 @@ def acquire_single_instance_lock() -> Any | None:
         else:
             import fcntl
 
-            # mypy проверяет эту ветку под платформу инструмента (Windows
-            # в CI/локально не имеет fcntl), хотя на POSIX атрибуты есть.
-            fcntl.flock(  # type: ignore[attr-defined]
-                lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB  # type: ignore[attr-defined]
-            )
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         lock_handle.close()
         return None
