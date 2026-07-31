@@ -84,7 +84,7 @@ class HandleMessageTests(unittest.TestCase):
 
     def setUp(self):
         self._start(patch.dict(alerts.LAST_URL_ALERT, clear=True))
-        self._start(patch.object(twitch, "precheck_wheel", return_value=("active", False)))
+        self._start(patch.object(twitch, "precheck_wheel", return_value=("active", False, "")))
         self.notify = self._start(
             patch.object(twitch, "send_telegram_notification", return_value=True)
         )
@@ -116,7 +116,7 @@ class HandleMessageTests(unittest.TestCase):
         self.notify.assert_not_called()
 
     def test_expired_wheel_is_not_notified_but_starts_cooldown(self):
-        with patch.object(twitch, "precheck_wheel", return_value=("expired", False)):
+        with patch.object(twitch, "precheck_wheel", return_value=("expired", False, "")):
             twitch.handle_twitch_message(
                 "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
             )
@@ -267,7 +267,7 @@ class ReceivedAtTests(unittest.TestCase):
     def test_found_at_uses_message_time_not_processing_time(self):
         received_at = twitch.now_msk() - timedelta(minutes=5)
 
-        with patch.object(twitch, "precheck_wheel", return_value=("active", False)), \
+        with patch.object(twitch, "precheck_wheel", return_value=("active", False, "")), \
              patch.object(twitch, "send_telegram_notification", return_value=True):
             twitch.handle_twitch_message(
                 "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL, received_at

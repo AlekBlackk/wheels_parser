@@ -124,9 +124,9 @@ def handle_twitch_message(
         if cooldown_active(url, now):
             continue  # недавно уже оповещали об этом колесе (TG или Twitch)
         if PRECHECK_WHEELS:
-            status, referral = precheck_wheel(url, TWITCH_SESSION)
+            status, referral, ends_at = precheck_wheel(url, TWITCH_SESSION)
         else:
-            status, referral = "", is_referral_wheel(url, None)
+            status, referral, ends_at = "", is_referral_wheel(url, None), ""
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [twitch #%s]: колесо уже завершилось (API BetBoom)",
@@ -149,6 +149,7 @@ def handle_twitch_message(
             "edited": False,
             "status": status,
             "referral": referral,
+            "ends_at": ends_at,
             "notified": False,
         }
         # Помечаем ДО отправки: даже при сбое уведомления повторной

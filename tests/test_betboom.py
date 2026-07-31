@@ -135,6 +135,31 @@ class ReferralDetectionTests(unittest.TestCase):
         )
 
 
+class WheelDeadlineTests(unittest.TestCase):
+    """Дедлайн (start_dttm + duration_min) показывается человеку, поэтому
+    считается по тем же правилам, что и статус."""
+
+    def test_end_time_is_start_plus_duration_in_msk(self):
+        start = datetime(2026, 7, 31, 18, 10, tzinfo=timezone.utc)
+        ends_at = betboom.wheel_ends_at({
+            "start_dttm": start.isoformat().replace("+00:00", "Z"),
+            "duration_min": 30,
+        })
+        # 18:10 UTC + 30 мин = 18:40 UTC = 21:40 МСК.
+        self.assertEqual(ends_at, "2026-07-31T21:40:00+03:00")
+
+    def test_end_time_is_empty_without_usable_start(self):
+        self.assertEqual(betboom.wheel_ends_at({"duration_min": 30}), "")
+        self.assertEqual(betboom.wheel_ends_at(None), "")
+        # Наивная метка: неизвестно, чьё это время — окно не считаем.
+        self.assertEqual(
+            betboom.wheel_ends_at(
+                {"start_dttm": "2026-07-31T18:10:00", "duration_min": 30}
+            ),
+            "",
+        )
+
+
 class PrecheckWheelTests(unittest.TestCase):
     def test_precheck_returns_status_and_referral_flag(self):
         response = Mock(status_code=200)
@@ -149,23 +174,25 @@ class PrecheckWheelTests(unittest.TestCase):
         session = Mock()
         session.post.return_value = response
 
-        status, referral = betboom.precheck_wheel(
+        status, referral, ends_at = betboom.precheck_wheel(
             "https://betboom.ru/freestream/plainslug", session
         )
 
         self.assertEqual(status, "active")
         self.assertTrue(referral)
+        self.assertTrue(ends_at)
 
     def test_precheck_falls_back_to_slug_when_api_fails(self):
         session = Mock()
         session.post.side_effect = OSError("down")
 
-        status, referral = betboom.precheck_wheel(
+        status, referral, ends_at = betboom.precheck_wheel(
             "https://betboom.ru/freestream/someref", session
         )
 
         self.assertEqual(status, "unknown")
         self.assertTrue(referral)
+        self.assertEqual(ends_at, "")
 
 
 class RegressionTests(unittest.TestCase):

@@ -1,9 +1,11 @@
 import unittest
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import requests
 
 from wheelsparser import telegram_api
+from wheelsparser.timeutils import now_msk
 
 
 def fake_session(status_code=200):
@@ -63,6 +65,37 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("@somebot", text)
         self.assertIn("🤖", text)
         self.assertIn("розыгрыш ещё не начался", text)
+
+    def test_notification_shows_deadline_with_time_left(self):
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/a",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "message_url": "https://t.me/demo/1",
+            "status": "active",
+            "ends_at": (
+                now_msk() + timedelta(minutes=12, seconds=30)
+            ).isoformat(timespec="seconds"),
+        }
+
+        self.assertTrue(telegram_api.send_telegram_notification(entry, session))
+        self.assertIn("Окончание: до", self.sent_text(session))
+        self.assertIn("осталось 12 мин", self.sent_text(session))
+
+    def test_notification_omits_deadline_when_unknown(self):
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/a",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "message_url": "https://t.me/demo/1",
+            "status": "unknown",
+            "ends_at": "",
+        }
+
+        self.assertTrue(telegram_api.send_telegram_notification(entry, session))
+        self.assertNotIn("Окончание", self.sent_text(session))
 
     def test_notification_marks_referral_wheel(self):
         session = fake_session()

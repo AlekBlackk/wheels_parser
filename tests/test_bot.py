@@ -1,7 +1,9 @@
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 from wheelsparser import active_report, bot, registry
+from wheelsparser.timeutils import now_msk
 
 
 class ChannelCommandTests(unittest.TestCase):
@@ -104,6 +106,26 @@ class ActiveReportFormatTests(unittest.TestCase):
             "channel": "demo",
         }
         self.assertNotIn("реф", active_report.format_active_item(item, 1))
+
+    def test_deadline_is_shown_with_time_left(self):
+        ends_at = (now_msk() + timedelta(minutes=12, seconds=30)).isoformat(timespec="seconds")
+        item = {
+            "url": "https://betboom.ru/freestream/one",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "ends_at": ends_at,
+        }
+        line = active_report.format_active_item(item, 1)
+        self.assertIn("осталось 12 мин", line)
+
+    def test_wheel_without_deadline_has_no_deadline_mark(self):
+        item = {
+            "url": "https://betboom.ru/freestream/one",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+            "ends_at": "",
+        }
+        self.assertNotIn("осталось", active_report.format_active_item(item, 1))
 
 
 class RemoveWheelCommandTests(unittest.TestCase):

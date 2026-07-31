@@ -15,6 +15,7 @@ from .betboom import classify_wheels
 from .config import icon
 from .logging_setup import log
 from .telegram_api import background_bot_send, bot_send
+from .timeutils import format_deadline
 from .urls import normalize_url
 
 # Один /active за раз (non-blocking acquire).
@@ -59,7 +60,13 @@ def format_active_item(item: dict[str, Any], number: int) -> str:
     # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
     url = html.escape(normalize_url(str(item.get("url", ""))))
     referral_mark = " ⚠️ для рефералов" if item.get("referral") else ""
-    return f"{number}. {found_time} — {channel_label}{referral_mark}\n{url}"
+    # Дедлайн обновлён свежим info в classify_wheels, поэтому «осталось N мин»
+    # считается от актуального конца розыгрыша, а не от момента находки.
+    deadline = format_deadline(item.get("ends_at"))
+    deadline_mark = f" · до {deadline}" if deadline else ""
+    return (
+        f"{number}. {found_time} — {channel_label}{referral_mark}{deadline_mark}\n{url}"
+    )
 
 
 def format_active_result(

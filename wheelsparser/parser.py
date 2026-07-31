@@ -368,7 +368,9 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
     Пост обрабатывается по хэшу содержимого только один раз (см.
     process_message) — без ретрая сбой Telegram ровно в момент отправки
     терял бы находку навсегда, хотя она и осталась в freebets.json с
-    notified=False. Записи из send_multi_telegram_notification (несколько
+    notified=False. Ретраятся оба вида находок: ссылки на колёса и посты
+    с ключевыми словами (у последних url нет — их узнаём по полю
+    keywords). Записи из send_multi_telegram_notification (несколько
     ссылок в одном посте) при ретрае отправляются по одной обычным
     уведомлением — предупреждение «уточните вручную» теряется, но сами
     ссылки доходят, что важнее для этого редкого повторного случая.
@@ -386,20 +388,25 @@ def retry_failed_notifications(results: list[dict[str, Any]], now: datetime) -> 
     for entry in results:
         if retried >= NOTIFY_RETRY_MAX_PER_CYCLE:
             break
-        if entry.get("notified") or not entry.get("url"):
-            continue
-        if entry.get("delivery_unknown"):
+        if entry.get("notified") or entry.get("delivery_unknown"):
             continue
         found = parse_found_at(entry.get("found_at"))
         if found is None or now - found > timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES):
             continue
-        entry["notified"] = send_telegram_notification(entry)
+        if entry.get("url"):
+            entry["notified"] = send_telegram_notification(entry)
+            target = str(entry.get("url"))
+        elif entry.get("keywords"):
+            entry["notified"] = send_keyword_notification(entry)
+            target = str(entry.get("message_url", ""))
+        else:
+            continue
         retried += 1
         if entry["notified"]:
             log.info(
                 "%s Уведомление доставлено повторной попыткой: %s",
                 icon("ok"),
-                entry.get("url"),
+                target,
             )
     return retried
 
@@ -438,9 +445,9 @@ def collect_pending_entries(
         # пропускаем. Статусы 'active'/'soon'/'unknown' рассылаются,
         # unknown — fail-open, чтобы не терять живые колёса при сбое API.
         if PRECHECK_WHEELS:
-            status, referral = precheck_wheel(url)
+            status, referral, ends_at = precheck_wheel(url)
         else:
-            status, referral = "", is_referral_wheel(url, None)
+            status, referral, ends_at = "", is_referral_wheel(url, None), ""
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [@%s]: колесо уже завершилось (API BetBoom)",
@@ -460,6 +467,7 @@ def collect_pending_entries(
             "edited": is_edited_message,
             "status": status,
             "referral": referral,
+            "ends_at": ends_at,
             "notified": False,
         })
     return pending
@@ -507,10 +515,19 @@ def notify_pending_entries(
         )
 
 
-def notify_keywords(message: dict[str, Any], channel: str) -> None:
+def notify_keywords(message: dict[str, Any], channel: str) -> list[dict[str, Any]]:
+    """Уведомление о ключевых словах и запись о нём для истории.
+
+    Запись возвращается (а не выбрасывается, как раньше) ради ретрая:
+    сообщение обрабатывается по хэшу один раз, поэтому сбой Telegram без
+    сохранённой записи с notified=False терял бы находку навсегда —
+    ссылки так уже не теряются (см. retry_failed_notifications).
+    Записи без url — «не колесо»: в /wheels, /status и /active они не
+    попадают, там учитываются только находки со ссылкой.
+    """
     matched = find_keywords(message["text"])
     if not matched:
-        return
+        return []
     entry = {
         "found_at": now_msk().isoformat(timespec="seconds"),
         "channel": channel,
@@ -519,8 +536,9 @@ def notify_keywords(message: dict[str, Any], channel: str) -> None:
         "preview": message["text"][:200],
         "preview_html": message.get("preview_html", ""),
         "keywords": matched,
+        "notified": False,
     }
-    send_keyword_notification(entry)
+    entry["notified"] = send_keyword_notification(entry)
     log.info(
         "%s Ключевые слова (%s) [@%s]: %s",
         icon("bell"),
@@ -529,6 +547,7 @@ def notify_keywords(message: dict[str, Any], channel: str) -> None:
         entry["message_url"],
         extra={"highlight": True},
     )
+    return [entry]
 
 
 def process_message(
@@ -568,7 +587,7 @@ def process_message(
     # постов проверяем лишь на ссылки — иначе каждая мелкая правка
     # текста с ключевым словом слала бы повторное уведомление.
     if is_new_message and not message["urls"]:
-        notify_keywords(message, channel)
+        pending.extend(notify_keywords(message, channel))
     return pending
 
 
@@ -640,7 +659,9 @@ def process_cycle(
         len(channels) - len(failed_channels),
         len(channels),
         empty_note,
-        len(new_entries),
+        # Записи без url — посты с ключевыми словами; в счётчик ссылок
+        # они не идут.
+        sum(1 for entry in new_entries if entry.get("url")),
         suffix,
     )
     if failed_channels:
@@ -651,4 +672,4 @@ def process_cycle(
             icon("warn"),
             ", ".join(empty_channels),
         )
-    return len(new_entries)
+    return sum(1 for entry in new_entries if entry.get("url"))

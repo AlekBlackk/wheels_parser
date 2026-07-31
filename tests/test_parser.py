@@ -79,7 +79,7 @@ class ProcessMessageTests(unittest.TestCase):
     def setUp(self):
         # Кулдаун глобален для процесса — изолируем тесты друг от друга.
         self._start(patch.dict(alerts.LAST_URL_ALERT, clear=True))
-        self._start(patch.object(parser, "precheck_wheel", return_value=("active", False)))
+        self._start(patch.object(parser, "precheck_wheel", return_value=("active", False, "")))
         self.single = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)
         )
@@ -150,7 +150,7 @@ class ProcessMessageTests(unittest.TestCase):
 
     def test_expired_wheel_is_not_notified(self):
         message = make_message("demo/1", "колесо", ["https://betboom.ru/freestream/a"])
-        with patch.object(parser, "precheck_wheel", return_value=("expired", False)):
+        with patch.object(parser, "precheck_wheel", return_value=("expired", False, "")):
             self.assertEqual(self.process(message, {}), [])
         self.single.assert_not_called()
 
@@ -166,6 +166,26 @@ class ProcessMessageTests(unittest.TestCase):
                 {},
             )
             notify.assert_not_called()
+
+    def test_failed_keyword_notification_is_recorded_for_retry(self):
+        # Пост обрабатывается по хэшу один раз: без записи в истории
+        # находка по ключевому слову терялась бы навсегда.
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "send_keyword_notification", return_value=False):
+            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+
+        self.assertEqual(len(entries), 1)
+        self.assertFalse(entries[0]["notified"])
+        self.assertEqual(entries[0]["keywords"], ["колесо"])
+        # Без url: это не колесо, и в /wheels, /status, /active запись не идёт.
+        self.assertNotIn("url", entries[0])
+
+    def test_delivered_keyword_notification_is_marked_notified(self):
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "send_keyword_notification", return_value=True):
+            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+
+        self.assertTrue(entries[0]["notified"])
 
 
 class RetryFailedNotificationsTests(unittest.TestCase):
@@ -250,6 +270,39 @@ class RetryFailedNotificationsTests(unittest.TestCase):
 
         self.assertEqual(retried, config.NOTIFY_RETRY_MAX_PER_CYCLE)
         self.assertEqual(send.call_count, config.NOTIFY_RETRY_MAX_PER_CYCLE)
+
+    def test_retries_keyword_notification_without_url(self):
+        # У находок по ключевым словам url нет — ретрай узнаёт их по
+        # keywords и шлёт своим отправителем.
+        keyword_send = self._start(
+            patch.object(parser, "send_keyword_notification", return_value=True)
+        )
+        link_send = self._start(patch.object(parser, "send_telegram_notification"))
+        entry = self.entry()
+        entry.pop("url")
+        entry["keywords"] = ["колесо"]
+        entry["message_url"] = "https://t.me/demo/1"
+        results = [entry]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 1)
+        self.assertTrue(results[0]["notified"])
+        keyword_send.assert_called_once()
+        link_send.assert_not_called()
+
+    def test_entries_without_url_and_keywords_are_skipped(self):
+        keyword_send = self._start(patch.object(parser, "send_keyword_notification"))
+        link_send = self._start(patch.object(parser, "send_telegram_notification"))
+        entry = self.entry()
+        entry.pop("url")
+        results = [entry]
+
+        retried = parser.retry_failed_notifications(results, self.now)
+
+        self.assertEqual(retried, 0)
+        keyword_send.assert_not_called()
+        link_send.assert_not_called()
 
     def test_noop_when_notifications_disabled(self):
         with patch.object(parser, "notifications_enabled", return_value=False):
@@ -390,7 +443,7 @@ class ProcessCycleTests(unittest.TestCase):
 
         with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
              patch.object(registry, "CHANNELS", ["demo"]), \
-             patch.object(parser, "precheck_wheel", return_value=("active", False)), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
              patch.object(parser, "fetch_channel", side_effect=[[first], [second]]), \
              patch.object(parser, "send_telegram_notification", return_value=True), \
              patch.object(parser, "save_seen"), \

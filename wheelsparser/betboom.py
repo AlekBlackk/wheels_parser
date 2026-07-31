@@ -18,6 +18,7 @@ import requests
 from .config import (
     ACTIVE_CHECK_CONCURRENCY,
     HEADERS,
+    MSK_TZ,
     REQUEST_TIMEOUT,
     STREAMER_WHEEL_INFO_API,
 )
@@ -57,6 +58,47 @@ def is_referral_wheel(url: str, info: dict[str, Any] | None) -> bool:
     return "ref" in slug.lower()
 
 
+def wheel_window(info: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    """Начало и конец розыгрыша по start_dttm + duration_min (обе метки — UTC).
+
+    (None, None), если поля отсутствуют, неразбираемы или без таймзоны:
+    считать окно по наивной метке нельзя — неизвестно, чьё это время.
+    """
+    start_raw = info.get("start_dttm")
+    duration = info.get("duration_min")
+    if not (
+        isinstance(start_raw, str)
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0
+    ):
+        return None, None
+    try:
+        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, None
+    if start.tzinfo is None:
+        return None, None
+    return start, start + timedelta(minutes=float(duration))
+
+
+def wheel_end_msk(info: dict[str, Any] | None) -> datetime | None:
+    """Момент окончания розыгрыша в МСК — дедлайн для показа человеку."""
+    if not info:
+        return None
+    _start, end = wheel_window(info)
+    return end.astimezone(MSK_TZ) if end is not None else None
+
+
+def wheel_ends_at(info: dict[str, Any] | None) -> str:
+    """Дедлайн колеса как ISO-строка МСК (пустая, если срок неизвестен).
+
+    Строка, а не datetime: значение уезжает в freebets.json и обратно.
+    """
+    end = wheel_end_msk(info)
+    return end.isoformat(timespec="seconds") if end is not None else ""
+
+
 def api_info_to_status(info: dict[str, Any]) -> str:
     is_ended = info.get("is_ended")
     if not isinstance(is_ended, bool):
@@ -67,23 +109,12 @@ def api_info_to_status(info: dict[str, Any]) -> str:
     # и колесо может часами числиться «не завершённым» после окончания.
     # Поэтому конец розыгрыша считаем сами: start_dttm + duration_min.
     time_status: str | None = None
-    start_raw = info.get("start_dttm")
-    duration = info.get("duration_min")
-    if (
-        isinstance(start_raw, str)
-        and isinstance(duration, (int, float))
-        and not isinstance(duration, bool)
-        and duration > 0
-    ):
-        try:
-            start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-        except ValueError:
-            start = None
-        if start is not None and start.tzinfo is not None:
-            now = datetime.now(timezone.utc)
-            if now >= start + timedelta(minutes=float(duration)):
-                return "expired"
-            time_status = "soon" if now < start else "active"
+    start, end = wheel_window(info)
+    if start is not None and end is not None:
+        now = datetime.now(timezone.utc)
+        if now >= end:
+            return "expired"
+        time_status = "soon" if now < start else "active"
     # «Акция скоро начнётся» на сайте показывается по флагу is_early,
     # поэтому он надёжнее расчёта по start_dttm: бывает, что start_dttm
     # уже в прошлом, а розыгрыш стример ещё не запустил. is_early=True
@@ -167,10 +198,12 @@ def _cache_expired(url: str, today: str) -> None:
 
 def precheck_wheel(
     url: str, session: requests.Session | None = None
-) -> tuple[str, bool]:
-    """Статус колеса и реф-флаг перед отправкой уведомления.
+) -> tuple[str, bool, str]:
+    """Статус колеса, реф-флаг и дедлайн перед отправкой уведомления.
 
-    Возвращает ('active'/'soon'/'expired'/'unknown', is_referral).
+    Возвращает ('active'/'soon'/'expired'/'unknown', is_referral, ends_at),
+    где ends_at — ISO-строка МСК с концом розыгрыша или "" если срок
+    неизвестен (сбой API или колесо без start_dttm).
     При 'unknown' уведомление всё равно отправляется (fail-open): лучше
     лишний раз оповестить, чем пропустить живое колесо из-за сбоя API.
     Реф-флаг при недоступном info считается по slug URL.
@@ -179,11 +212,11 @@ def precheck_wheel(
     """
     canonical = normalize_url(url)
     if not canonical:
-        return "unknown", False
+        return "unknown", False, ""
     today = today_msk()
     if _is_cached_expired(canonical, today):
         log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
-        return "expired", is_referral_wheel(canonical, None)
+        return "expired", is_referral_wheel(canonical, None), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
     status = "unknown" if info is None else api_info_to_status(info)
     referral = is_referral_wheel(canonical, info)
@@ -195,7 +228,7 @@ def precheck_wheel(
     )
     if status == "expired":
         _cache_expired(canonical, today)
-    return status, referral
+    return status, referral, wheel_ends_at(info)
 
 
 def classify_wheels(
@@ -241,10 +274,13 @@ def classify_wheels(
             return
         info = fetch_wheel_info(url, worker_session())
         status = "unknown" if info is None else api_info_to_status(info)
-        # Реф-флаг обновляется по свежему info: старые записи (до появления
-        # поля referral) получают пометку прямо при /active.
+        # Реф-флаг и дедлайн обновляются по свежему info: старые записи
+        # (до появления этих полей) получают их прямо при /active.
         if not item.get("referral") and is_referral_wheel(url, info):
             item["referral"] = True
+        ends_at = wheel_ends_at(info)
+        if ends_at:
+            item["ends_at"] = ends_at
         log.info("active-check [api]: %s → %s", url, status)
         if status == "expired":
             _cache_expired(url, today)

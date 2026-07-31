@@ -21,7 +21,7 @@ from .config import (
 )
 from .logging_setup import log
 from .net import ACTIVE_CHECK_SESSION, BOT_SESSION, PARSER_SESSION
-from .timeutils import format_found_at
+from .timeutils import format_deadline, format_found_at
 
 # Пояснение к статусу колеса в тексте уведомления.
 STATUS_NOTES = {
@@ -103,6 +103,10 @@ def send_telegram_notification(
     source_note = " (пост отредактирован)" if entry.get("edited") else ""
     status_note = STATUS_NOTES.get(str(entry.get("status", "")))
     status_line = f"Статус: {status_note}\n" if status_note else ""
+    # Дедлайн считается в момент отправки, поэтому «осталось N мин» верно
+    # и для повторной попытки спустя несколько циклов.
+    deadline = format_deadline(entry.get("ends_at"))
+    deadline_line = f"Окончание: до {deadline}\n" if deadline else ""
     referral_line = (
         f"{icon('warn')} Колесо для рефералов\n" if entry.get("referral") else ""
     )
@@ -126,6 +130,7 @@ def send_telegram_notification(
         f"Ссылка: {entry['url']}\n"
         f"{referral_line}"
         f"{status_line}"
+        f"{deadline_line}"
         f"{post_line}"
     )
     try:
@@ -162,6 +167,9 @@ def send_multi_telegram_notification(
         note = MULTI_STATUS_NOTES.get(str(entry.get("status", "")), "")
         if entry.get("referral"):
             note = f"{note}, для рефералов" if note else "для рефералов"
+        deadline = format_deadline(entry.get("ends_at"), remaining=False)
+        if deadline:
+            note = f"{note}, до {deadline}" if note else f"до {deadline}"
         suffix = f" ({note})" if note else ""
         lines.append(f"{entry['url']}{suffix}")
     lines.append(f"Пост: {first['message_url']}")
@@ -179,7 +187,12 @@ def send_multi_telegram_notification(
 
 
 def send_keyword_notification(entry: dict[str, Any]) -> bool:
-    """Уведомление о посте с ключевыми словами (вызывается из parser-потока)."""
+    """Уведомление о посте с ключевыми словами (вызывается из parser-потока).
+
+    Возвращает признак доставки: пост обрабатывается по хэшу один раз,
+    поэтому сбой здесь не должен молча терять находку — вызывающий
+    сохраняет запись и повторяет отправку (см. parser.retry_failed_notifications).
+    """
     if not notifications_enabled():
         return False
     plain_preview = str(entry.get("preview", ""))
@@ -208,6 +221,7 @@ def send_keyword_notification(entry: dict[str, Any]) -> bool:
         return True
     except requests.RequestException as error:
         log.error("Не удалось отправить уведомление о ключевых словах: %s", error)
+        _mark_delivery([entry], error)
         return False
 
 

@@ -30,11 +30,11 @@ def today_msk() -> str:
     return now_msk().strftime("%Y-%m-%d")
 
 
-def parse_found_at(value: Any) -> datetime | None:
-    """Разбирает found_at и приводит к МСК.
+def parse_msk(value: Any) -> datetime | None:
+    """Разбирает ISO-метку времени из freebets.json и приводит к МСК.
 
-    Наивные метки времени (без зоны) из старых версий freebets.json
-    считаются московскими. Возвращает None, если строку разобрать нельзя.
+    Наивные метки времени (без зоны) из старых версий файла считаются
+    московскими. Возвращает None, если строку разобрать нельзя.
     """
     try:
         moment = datetime.fromisoformat(str(value))
@@ -43,6 +43,36 @@ def parse_found_at(value: Any) -> datetime | None:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=MSK_TZ)
     return moment.astimezone(MSK_TZ)
+
+
+def parse_found_at(value: Any) -> datetime | None:
+    """Время находки (found_at) в МСК или None, если разобрать нельзя."""
+    return parse_msk(value)
+
+
+def format_deadline(value: Any, remaining: bool = True) -> str:
+    """Дедлайн колеса для человека: «21:40 (осталось 12 мин)».
+
+    Остаток считается от текущего момента, поэтому строка верна и при
+    повторной отправке уведомления спустя циклы. Пустая строка означает
+    «срок неизвестен» — вызывающий такую строку не показывает.
+    remaining=False даёт только время окончания: в списках, где строка
+    уже заключена в скобки, вложенные скобки читать невозможно.
+    """
+    end = parse_msk(value)
+    if end is None:
+        return ""
+    if not remaining:
+        return end.strftime("%H:%M")
+    seconds_left = (end - now_msk()).total_seconds()
+    if seconds_left <= 0:
+        return f"{end.strftime('%H:%M')} (время вышло)"
+    minutes_left = max(1, int(seconds_left // 60))
+    if minutes_left < 60:
+        left_note = f"осталось {minutes_left} мин"
+    else:
+        left_note = f"осталось {minutes_left // 60} ч {minutes_left % 60} мин"
+    return f"{end.strftime('%H:%M')} ({left_note})"
 
 
 def format_found_at(value: Any) -> str:

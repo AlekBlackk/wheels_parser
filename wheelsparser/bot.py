@@ -125,6 +125,11 @@ def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
     now = now_msk()
     fresh: list[dict[str, Any]] = []
     for item in load_results():
+        # Записи без url — посты с ключевыми словами: они лежат в том же
+        # файле ради ретрая недоставленных уведомлений, но колёсами не
+        # являются и в списки ссылок не попадают.
+        if not item.get("url"):
+            continue
         found = parse_found_at(item.get("found_at"))
         if found is None:
             continue
@@ -135,7 +140,9 @@ def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
 
 
 def status_text() -> str:
-    items = load_results()
+    # Только находки со ссылкой: записи о ключевых словах хранятся рядом
+    # ради ретрая уведомлений, но статистика тут — про колёса.
+    items = [item for item in load_results() if item.get("url")]
     total = len(items)
     today = now_msk().date()
     today_count = 0
