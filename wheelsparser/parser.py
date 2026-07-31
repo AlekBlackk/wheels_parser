@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import html
 import queue
-import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -20,6 +21,7 @@ from .config import (
     ALERT_ON_FIRST_RUN,
     CHANNEL_EMPTY_THRESHOLD,
     CHANNEL_FAIL_THRESHOLD,
+    CHANNEL_FETCH_CONCURRENCY,
     CHECK_INTERVAL,
     MAX_RESULTS,
     MESSAGES_PER_CHANNEL,
@@ -32,7 +34,7 @@ from .config import (
 )
 from .keywords import find_keywords
 from .logging_setup import log
-from .net import PARSER_SESSION
+from .net import PARSER_SESSION, build_session
 from .runtime import STOP_EVENT
 from .storage import save_seen
 from .telegram_api import (
@@ -110,17 +112,22 @@ def message_preview_html(text_element: Any, limit: int = 200) -> str:
     return " ".join(parts)
 
 
-def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
+def fetch_channel(
+    channel: str, session: requests.Session | None = None
+) -> list[dict[str, Any]] | None:
     """Последние сообщения канала через веб-превью t.me/s/<channel>.
 
     None означает, что канал прочитать не удалось (404 или сетевая ошибка).
     Пустой список — страница получена, но ни одного поста распознать не
     удалось: это не то же самое, что «нет новых сообщений», и вызывающий
     обязан различать эти случаи (см. update_channel_empty_streaks).
+    По умолчанию используется PARSER_SESSION — параллельный опрос каналов
+    (см. _fetch_all_channels) передаёт сессию своего воркера, так как
+    requests.Session не потокобезопасна.
     """
     url = f"https://t.me/s/{channel}"
     try:
-        response = PARSER_SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        response = (session or PARSER_SESSION).get(url, timeout=REQUEST_TIMEOUT)
         if response.status_code == 404:
             log.warning("[%s] канал не найден или приватный (404)", channel)
             return None
@@ -159,6 +166,37 @@ def fetch_channel(channel: str) -> list[dict[str, Any]] | None:
             "message_url": f"https://t.me/{message_id}",
         })
     return results
+
+
+def _fetch_all_channels(
+    channels: list[str],
+) -> list[tuple[str, list[dict[str, Any]] | None]]:
+    """Скачивает страницы всех каналов параллельно, возвращая результаты
+    в исходном порядке channels (не в порядке завершения запросов).
+
+    Одновременно выполняется не больше CHANNEL_FETCH_CONCURRENCY запросов.
+    Раньше каналы читались строго по одному с паузой между запросами —
+    цикл на несколько десятков каналов не укладывался в CHECK_INTERVAL, и
+    задержка обнаружения новой ссылки росла вместе со списком каналов.
+    У каждого воркера пула — своя requests.Session (как в
+    betboom.classify_wheels): Session не потокобезопасна, а общая
+    PARSER_SESSION занята основным потоком (precheck, отправка уведомлений,
+    ретраи) во время самого же fetch.
+    """
+    thread_local = threading.local()
+
+    def worker_session() -> requests.Session:
+        session = getattr(thread_local, "session", None)
+        if session is None:
+            session = build_session()
+            thread_local.session = session
+        return session
+
+    def fetch(channel: str) -> tuple[str, list[dict[str, Any]] | None]:
+        return channel, fetch_channel(channel, worker_session())
+
+    with ThreadPoolExecutor(max_workers=CHANNEL_FETCH_CONCURRENCY) as pool:
+        return list(pool.map(fetch, channels))
 
 
 # ----------------------------------------------------------------------------
@@ -622,10 +660,14 @@ def process_cycle(
     empty_channels: list[str] = []
     checked_channels: list[str] = []
 
-    for index, channel in enumerate(channels):
+    # Сеть — параллельно (см. _fetch_all_channels), обработка результатов —
+    # последовательно в этом потоке: она трогает seen/last_found/базу, а те
+    # локов не имеют и не должны их приобретать.
+    fetched = [] if STOP_EVENT.is_set() else _fetch_all_channels(channels)
+
+    for channel, messages in fetched:
         if STOP_EVENT.is_set():
             break
-        messages = fetch_channel(channel)
         checked_channels.append(channel)
         if messages is None:
             failed_channels.append(channel)
@@ -647,8 +689,6 @@ def process_cycle(
             # разосланные уведомления.
             db.insert_entries(entries)
             new_entries.extend(entries)
-        if index < len(channels) - 1:
-            STOP_EVENT.wait(1.5 + random.uniform(0.0, 1.0))
 
     update_channel_fail_streaks(checked_channels, failed_channels)
     update_channel_empty_streaks(checked_channels, failed_channels, empty_channels)
@@ -664,6 +704,19 @@ def process_cycle(
         now_msk() + timedelta(seconds=max(5.0, CHECK_INTERVAL - elapsed))
     ).strftime("%H:%M:%S")
     suffix = "" if STOP_EVENT.is_set() else f" · следующая проверка в {next_at}"
+    if elapsed > CHECK_INTERVAL:
+        # Цикл не уложился в CHECK_INTERVAL: следующий стартует немедленно
+        # (см. app._run_parse_loop), а не по расписанию. Один цикл сам по
+        # себе не страшен, но серия таких означает, что либо каналов стало
+        # слишком много для CHANNEL_FETCH_CONCURRENCY, либо t.me отвечает
+        # медленнее REQUEST_TIMEOUT.
+        log.warning(
+            "%s Цикл занял %.1fс — дольше CHECK_INTERVAL (%sс); "
+            "следующий начинается без паузы",
+            icon("warn"),
+            elapsed,
+            CHECK_INTERVAL,
+        )
     log.info(
         "%s Цикл завершён · каналы %s/%s%s · новых ссылок: %s%s",
         status_icon,

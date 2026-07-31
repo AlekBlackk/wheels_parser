@@ -47,6 +47,7 @@ python -m wheelsparser
 | `CHECK_INTERVAL` | `60` | Интервал проверки, сек (мин. 10) |
 | `REQUEST_TIMEOUT` | `15` | Тайм-аут HTTP-запроса |
 | `MESSAGES_PER_CHANNEL` | `50` | Сообщений на канал за проход |
+| `CHANNEL_FETCH_CONCURRENCY` | `4` | Каналов опрашивается одновременно (было — строго по одному) |
 | `MAX_SEEN_PER_CHANNEL` | `2000` | Максимум ID на канал |
 | `MAX_RESULTS` | `5000` | Максимум записей истории в `wheels.db` (старые отбрасываются) |
 | `WHEELS_WINDOW_MINUTES` | `10` | Окно `/wheels`, мин |

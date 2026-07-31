@@ -74,6 +74,11 @@ def env_bool(name: str, default: bool = False) -> bool:
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
+# Сколько каналов опрашивается одновременно. Раньше каналы читались строго
+# по одному с паузой между ними — при полусотне каналов цикл не укладывался
+# в CHECK_INTERVAL, и реальная задержка обнаружения ссылки росла вместе со
+# списком. У каждого воркера своя requests.Session (см. parser._fetch_all_channels).
+CHANNEL_FETCH_CONCURRENCY = env_int("CHANNEL_FETCH_CONCURRENCY", 4, 1)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
 # Максимум записей истории в wheels.db: без лимита база растёт бесконечно.
 # При превышении старые записи удаляются в конце цикла с находкой.
