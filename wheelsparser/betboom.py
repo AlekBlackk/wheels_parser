@@ -214,6 +214,7 @@ def precheck_wheel(
     if not canonical:
         return "unknown", False, ""
     today = today_msk()
+    _prune_expired_cache(today)
     if _is_cached_expired(canonical, today):
         log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
         return "expired", is_referral_wheel(canonical, None), ""

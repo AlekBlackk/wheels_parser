@@ -82,7 +82,9 @@ def parse_irc_line(line: str) -> tuple[dict[str, str], str, str, str]:
 def author_roles(tags: dict[str, str], login: str) -> list[str]:
     """Роли автора: broadcaster/moderator/vip/bot. Пустой список — обычный зритель."""
     badges = {badge.split("/", 1)[0] for badge in tags.get("badges", "").split(",")}
-    roles = [role for role in ("broadcaster", "moderator", "vip") if role in badges]
+    roles: list[str] = [
+        role for role in ("broadcaster", "moderator", "vip") if role in badges
+    ]
     if "moderator" not in roles and tags.get("mod") == "1":
         roles.append("moderator")
     if login in TWITCH_BOTS:

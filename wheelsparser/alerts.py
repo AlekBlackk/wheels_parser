@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from .config import OUTPUT_FILE, REALERT_COOLDOWN_MINUTES
 from .storage import read_json
-from .timeutils import parse_found_at
+from .timeutils import now_msk, parse_found_at
 from .urls import normalize_url
 
 # url -> время последнего отправленного уведомления (МСК).
@@ -34,11 +34,28 @@ def last_alert(url: str) -> datetime | None:
         return LAST_URL_ALERT.get(url)
 
 
+def _prune_stale_alerts() -> None:
+    """Убирает записи старше кулдауна — иначе LAST_URL_ALERT растёт бессрочно.
+
+    Сверяется с реальным «сейчас» (а не с `when` из mark_url_alert): при
+    сидировании из истории `when` — это старые found_at, и по ним нельзя
+    судить об актуальности других записей.
+    """
+    cutoff = timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    now = now_msk()
+    with LAST_URL_ALERT_LOCK:
+        for stale_url in [
+            url for url, when in LAST_URL_ALERT.items() if now - when > cutoff
+        ]:
+            LAST_URL_ALERT.pop(stale_url, None)
+
+
 def mark_url_alert(url: str, when: datetime) -> None:
     with LAST_URL_ALERT_LOCK:
         existing = LAST_URL_ALERT.get(url)
         if existing is None or when > existing:
             LAST_URL_ALERT[url] = when
+    _prune_stale_alerts()
 
 
 def seed_url_alerts_from_history() -> None:

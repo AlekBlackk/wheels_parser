@@ -21,6 +21,8 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.5",
     "mypy>=1.10",
+    "types-requests",
+    "types-colorama",
 ]
 
 [project.scripts]

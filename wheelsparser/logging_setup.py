@@ -102,7 +102,10 @@ def force_utf8_console() -> None:
     """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            # sys.stdout/stderr типизированы как TextIO, у которого нет
+            # reconfigure (он есть у TextIOWrapper) — оборачивающий except
+            # уже учитывает случаи, где атрибута не будет и в рантайме.
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         except (AttributeError, ValueError, OSError):
             continue
 

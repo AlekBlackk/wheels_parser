@@ -120,7 +120,11 @@ def acquire_single_instance_lock() -> Any | None:
         else:
             import fcntl
 
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # mypy проверяет эту ветку под платформу инструмента (Windows
+            # в CI/локально не имеет fcntl), хотя на POSIX атрибуты есть.
+            fcntl.flock(  # type: ignore[attr-defined]
+                lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB  # type: ignore[attr-defined]
+            )
     except OSError:
         lock_handle.close()
         return None
