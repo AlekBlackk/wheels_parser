@@ -121,14 +121,19 @@ def handle_twitch_message(
             login,
         )
         return
+    # Текст сообщения — сигнал «колесо для рефералов». Только для сообщения
+    # с одной ссылкой: иначе непонятно, к какому колесу относится «для рефов».
+    post_text = text if len(urls) == 1 else ""
     for url in urls:
         now = received_at
         if cooldown_active(url, now):
             continue  # недавно уже оповещали об этом колесе (TG или Twitch)
         if PRECHECK_WHEELS:
-            status, referral, ends_at = precheck_wheel(url, TWITCH_SESSION)
+            status, referral, ends_at = precheck_wheel(
+                url, TWITCH_SESSION, post_text=post_text
+            )
         else:
-            status, referral, ends_at = "", is_referral_wheel(url, None), ""
+            status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [twitch #%s]: колесо уже завершилось (API BetBoom)",

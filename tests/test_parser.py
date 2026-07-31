@@ -149,6 +149,36 @@ class ProcessMessageTests(unittest.TestCase):
         self.multi.assert_called_once()
         self.single.assert_not_called()
 
+    def test_post_text_is_used_as_referral_signal_for_single_link(self):
+        message = make_message(
+            "demo/1", "Колесо для рефов 🔥", ["https://betboom.ru/freestream/a"]
+        )
+        with patch.object(
+            parser, "precheck_wheel", return_value=("active", True, "")
+        ) as precheck:
+            entries = self.process(message, {})
+
+        self.assertEqual(precheck.call_args.kwargs["post_text"], "Колесо для рефов 🔥")
+        self.assertTrue(entries[0]["referral"])
+
+    def test_post_text_is_not_used_when_post_has_several_links(self):
+        # «для рефов» относится к одному из колёс — к какому, неизвестно,
+        # поэтому текст поста как сигнал не используется.
+        message = make_message(
+            "demo/1",
+            "Колесо для рефов 🔥",
+            [
+                "https://betboom.ru/freestream/a",
+                "https://betboom.ru/freestream/b",
+            ],
+        )
+        with patch.object(
+            parser, "precheck_wheel", return_value=("active", False, "")
+        ) as precheck:
+            self.process(message, {})
+
+        self.assertEqual(precheck.call_args.kwargs["post_text"], "")
+
     def test_expired_wheel_is_not_notified(self):
         message = make_message("demo/1", "колесо", ["https://betboom.ru/freestream/a"])
         with patch.object(parser, "precheck_wheel", return_value=("expired", False, "")):

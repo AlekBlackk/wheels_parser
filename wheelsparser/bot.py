@@ -269,7 +269,8 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
         channel = html.escape(str(item.get("channel", "")))
         # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
         url = html.escape(normalize_url(str(item.get("url", ""))))
-        lines.append(f"• {found_time} — @{channel}\n{url}")
+        referral_mark = " ⚠️ для рефералов" if item.get("referral") else ""
+        lines.append(f"• {found_time} — @{channel}{referral_mark}\n{url}")
     bot_send(chat_id, "\n".join(lines))
 
 

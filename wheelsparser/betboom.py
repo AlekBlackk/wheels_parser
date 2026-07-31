@@ -43,17 +43,25 @@ _expired_cache_lock = threading.Lock()
 REFERRAL_TEXT_RE = re.compile(r"\bреф", re.IGNORECASE)
 
 
-def is_referral_wheel(url: str, info: dict[str, Any] | None) -> bool:
+def is_referral_wheel(
+    url: str, info: dict[str, Any] | None, post_text: str = ""
+) -> bool:
     """True, если колесо предназначено для рефералов.
 
-    Два сигнала (OR): текст title/description из API и подстрока «ref»
-    в slug URL. Slug — запасной сигнал: работает при сбое API и при
-    выключенном precheck.
+    Три сигнала (OR): текст title/description из API, подстрока «ref»
+    в slug URL и текст поста/сообщения чата, где нашлась ссылка. Slug и
+    пост — запасные сигналы: работают при сбое API и при выключенном
+    precheck (стример не всегда пишет про рефералов в описании колеса).
+    post_text вызывающий передаёт только для поста с одной ссылкой:
+    в посте с несколькими колёсами неизвестно, к какому из них относится
+    «для рефов», и метка ушла бы на все.
     """
     if info:
         text = f"{info.get('title', '')} {info.get('description', '')}"
         if REFERRAL_TEXT_RE.search(text):
             return True
+    if post_text and REFERRAL_TEXT_RE.search(post_text):
+        return True
     slug = normalize_url(url).rsplit("/", 1)[-1]
     return "ref" in slug.lower()
 
@@ -197,7 +205,7 @@ def _cache_expired(url: str, today: str) -> None:
 
 
 def precheck_wheel(
-    url: str, session: requests.Session | None = None
+    url: str, session: requests.Session | None = None, post_text: str = ""
 ) -> tuple[str, bool, str]:
     """Статус колеса, реф-флаг и дедлайн перед отправкой уведомления.
 
@@ -206,7 +214,8 @@ def precheck_wheel(
     неизвестен (сбой API или колесо без start_dttm).
     При 'unknown' уведомление всё равно отправляется (fail-open): лучше
     лишний раз оповестить, чем пропустить живое колесо из-за сбоя API.
-    Реф-флаг при недоступном info считается по slug URL.
+    Реф-флаг при недоступном info считается по slug URL и тексту поста
+    (post_text, см. is_referral_wheel).
     По умолчанию используется PARSER_SESSION — вызывающему из другого
     потока нужно передать свою сессию.
     """
@@ -217,10 +226,10 @@ def precheck_wheel(
     _prune_expired_cache(today)
     if _is_cached_expired(canonical, today):
         log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
-        return "expired", is_referral_wheel(canonical, None), ""
+        return "expired", is_referral_wheel(canonical, None, post_text), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
     status = "unknown" if info is None else api_info_to_status(info)
-    referral = is_referral_wheel(canonical, info)
+    referral = is_referral_wheel(canonical, info, post_text)
     log.info(
         "precheck [api]: %s → %s%s",
         canonical,

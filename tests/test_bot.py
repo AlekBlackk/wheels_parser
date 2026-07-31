@@ -203,6 +203,24 @@ class HistoryReportTests(unittest.TestCase):
 
         self.assertEqual(bot.recent_wheels(minutes=10), [])
 
+    def test_wheels_command_marks_referral_wheel(self):
+        self.store(url="https://betboom.ru/freestream/ref", referral=True)
+        self.store(url="https://betboom.ru/freestream/plain")
+
+        with patch.object(bot, "bot_send") as send:
+            bot.cmd_wheels("1", "")
+        text = send.call_args.args[1]
+
+        # Метка стоит в заголовке своего колеса — строкой выше его ссылки.
+        lines = text.splitlines()
+        header = {
+            url_line.rsplit("/", 1)[-1]: lines[lines.index(url_line) - 1]
+            for url_line in lines
+            if url_line.startswith("https://")
+        }
+        self.assertIn("для рефералов", header["ref"])
+        self.assertNotIn("реф", header["plain"])
+
     def test_status_reports_totals_and_last_wheel(self):
         self.store(url="https://betboom.ru/freestream/first", minutes_ago=30)
         self.store(url="https://betboom.ru/freestream/last", minutes_ago=1)

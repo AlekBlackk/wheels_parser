@@ -128,6 +128,26 @@ class ReferralDetectionTests(unittest.TestCase):
             betboom.is_referral_wheel("https://betboom.ru/freestream/zonertg4", info)
         )
 
+    def test_detects_referral_from_post_text(self):
+        # Стример не написал про рефералов в описании колеса, а в посте —
+        # написал: без сигнала из поста колесо осталось бы непомеченным.
+        info = {"title": "КОЛЕСО ФРИБЕТОВ", "description": "УЧАСТВУЙ"}
+        self.assertTrue(
+            betboom.is_referral_wheel(
+                "https://betboom.ru/freestream/aunkere",
+                info,
+                "Колесо для рефов 🔥 https://betboom.ru/freestream/aunkere",
+            )
+        )
+
+    def test_post_text_without_referral_word_does_not_mark_wheel(self):
+        info = {"title": "КОЛЕСО ФРИБЕТОВ", "description": "УЧАСТВУЙ"}
+        self.assertFalse(
+            betboom.is_referral_wheel(
+                "https://betboom.ru/freestream/zoner", info, "КОЛЕСО ФРИБЕТА ❤️"
+            )
+        )
+
     def test_ignores_ref_inside_longer_word(self):
         info = {"title": "", "description": "префикс не считается"}
         self.assertFalse(
@@ -181,6 +201,24 @@ class PrecheckWheelTests(unittest.TestCase):
         self.assertEqual(status, "active")
         self.assertTrue(referral)
         self.assertTrue(ends_at)
+
+    def test_precheck_marks_referral_by_post_text(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "code": 200,
+            "status": "OK",
+            "info": running_info(title="КОЛЕСО", description="УЧАСТВУЙ"),
+        }
+        session = Mock()
+        session.post.return_value = response
+
+        _status, referral, _ends_at = betboom.precheck_wheel(
+            "https://betboom.ru/freestream/plainslug",
+            session,
+            post_text="Колесо для рефов",
+        )
+
+        self.assertTrue(referral)
 
     def test_precheck_falls_back_to_slug_when_api_fails(self):
         session = Mock()

@@ -483,6 +483,10 @@ def collect_pending_entries(
 ) -> list[dict[str, Any]]:
     """Ссылки поста, о которых нужно оповестить (с учётом кулдауна и precheck)."""
     pending: list[dict[str, Any]] = []
+    # Текст поста — сигнал «колесо для рефералов» (стример не всегда пишет
+    # об этом в описании колеса). Только для поста с одной ссылкой: иначе
+    # непонятно, к какому из колёс относится «для рефов».
+    post_text = message["text"] if len(message["urls"]) == 1 else ""
     for url in message["urls"]:
         if _is_on_cooldown(url, now, last_found):
             continue  # недавно уже оповещали об этом колесе
@@ -491,9 +495,9 @@ def collect_pending_entries(
         # пропускаем. Статусы 'active'/'soon'/'unknown' рассылаются,
         # unknown — fail-open, чтобы не терять живые колёса при сбое API.
         if PRECHECK_WHEELS:
-            status, referral, ends_at = precheck_wheel(url)
+            status, referral, ends_at = precheck_wheel(url, post_text=post_text)
         else:
-            status, referral, ends_at = "", is_referral_wheel(url, None), ""
+            status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
         if status == "expired":
             log.info(
                 "%s Пропускаю %s [@%s]: колесо уже завершилось (API BetBoom)",
