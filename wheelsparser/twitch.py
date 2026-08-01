@@ -36,6 +36,7 @@ from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
     FREESTREAM_RE,
     PRECHECK_WHEELS,
+    REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     TWITCH_BOTS,
     TWITCH_IDLE_TIMEOUT_SECONDS,
@@ -127,6 +128,16 @@ def handle_twitch_message(
     for url in urls:
         now = received_at
         if cooldown_active(url, now):
+            # Раньше это был continue без единой строки лога: если колесо
+            # перезапустили на том же адресе внутри REALERT_COOLDOWN_MINUTES,
+            # выяснить «почему не пришло уведомление» было неоткуда.
+            log.info(
+                "%s Пропускаю %s [twitch #%s]: недавно уже оповещали (кулдаун %s мин)",
+                icon("bell"),
+                url,
+                channel,
+                REALERT_COOLDOWN_MINUTES,
+            )
             continue  # недавно уже оповещали об этом колесе (TG или Twitch)
         if PRECHECK_WHEELS:
             status, referral, ends_at = precheck_wheel(
@@ -166,7 +177,21 @@ def handle_twitch_message(
         # Помечаем ДО отправки: даже при сбое уведомления повторной
         # рассылки того же колеса в течение кулдауна не будет.
         mark_url_alert(url, now)
-        entry["notified"] = send_telegram_notification(entry, TWITCH_SESSION)
+        try:
+            entry["notified"] = send_telegram_notification(entry, TWITCH_SESSION)
+        except Exception:
+            # send_telegram_notification сама ловит requests.RequestException
+            # и наружу не бросает — сюда попадают только неожиданные баги.
+            # entry обязана попасть в очередь несмотря ни на что: URL уже
+            # под кулдауном (mark_url_alert выше), и без записи в историю
+            # находка потерялась бы совсем — ни в базе, ни на ретрае.
+            log.exception(
+                "%s Twitch: не удалось отправить уведомление о %s [#%s]",
+                icon("warn"),
+                url,
+                channel,
+            )
+            entry["notified"] = False
         TWITCH_NEW_ENTRIES.put(entry)
         log.info(
             "%s Новая ссылка из Twitch [#%s, от @%s]: %s",

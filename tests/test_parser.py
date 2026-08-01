@@ -100,8 +100,10 @@ class ProcessMessageTests(unittest.TestCase):
         return mock
 
     def setUp(self):
-        # Кулдаун глобален для процесса — изолируем тесты друг от друга.
+        # Кулдаун и реестр ретрая expired-ссылок глобальны для процесса —
+        # изолируем тесты друг от друга.
         self._start(patch.dict(alerts.LAST_URL_ALERT, clear=True))
+        self._start(patch.dict(parser.PENDING_EXPIRED_RETRY, clear=True))
         self._start(patch.object(parser, "precheck_wheel", return_value=("active", False, "")))
         self.single = self._start(
             patch.object(parser, "send_telegram_notification", return_value=True)
@@ -207,6 +209,38 @@ class ProcessMessageTests(unittest.TestCase):
             self.assertEqual(self.process(message, {}), [])
         self.single.assert_not_called()
 
+    def test_expired_wheel_is_registered_for_retry(self):
+        # Пост уже помечен «увиденным» и правка его не перепроверит —
+        # единственный шанс поймать ошибочный precheck (ложный is_ended,
+        # неточный duration_min) — ретрай по PENDING_EXPIRED_RETRY.
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        with patch.object(parser, "precheck_wheel", return_value=("expired", False, "")):
+            self.process(message, {})
+
+        self.assertIn(url, parser.PENDING_EXPIRED_RETRY)
+        info = parser.PENDING_EXPIRED_RETRY[url]
+        self.assertEqual(info["channel"], "demo")
+        self.assertEqual(info["msg_id"], "demo/1")
+
+    def test_cooldown_skip_is_logged_for_diagnostics(self):
+        # Раньше подавление кулдауном было немым continue: перезапуск
+        # колеса на том же URL внутри REALERT_COOLDOWN_MINUTES проходил
+        # без единой строки в логе, и «почему не пришло» было неоткуда
+        # диагностировать.
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        last_found = {url: self.now}
+
+        with self.assertLogs(parser.log, level="INFO") as logs:
+            entries = parser.process_message(
+                message, "demo", {}, False, self.now, last_found
+            )
+
+        self.assertEqual(entries, [])
+        self.single.assert_not_called()
+        self.assertTrue(any(url in line and "кулдаун" in line for line in logs.output))
+
     def test_expired_wheel_does_not_block_later_restart_notification(self):
         # Пропуск expired-«хвоста» — не уведомление: кулдаун ставить нельзя,
         # иначе перезапуск того же колеса на том же адресе в пределах
@@ -279,6 +313,101 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertTrue(entries[0]["notified"])
 
 
+class RetryExpiredLinksTests(unittest.TestCase):
+    """Ссылка, ошибочно признанная expired, не должна теряться навсегда:
+    её пост уже помечен «увиденным», и правка поста её не перепроверит —
+    единственный путь назад — retry_expired_links (см. PENDING_EXPIRED_RETRY)."""
+
+    def setUp(self):
+        self.addCleanup(parser.PENDING_EXPIRED_RETRY.clear)
+        parser.PENDING_EXPIRED_RETRY.clear()
+        self.addCleanup(alerts.LAST_URL_ALERT.clear)
+        alerts.LAST_URL_ALERT.clear()
+        self.now = parser.now_msk()
+        self.url = "https://betboom.ru/freestream/a"
+
+    def _seed(self, **overrides):
+        info = {
+            "channel": "demo",
+            "msg_id": "demo/1",
+            "message_url": "https://t.me/demo/1",
+            "preview": "колесо",
+            "post_text": "колесо",
+            "first_seen": self.now,
+        }
+        info.update(overrides)
+        parser.PENDING_EXPIRED_RETRY[self.url] = info
+
+    def test_empty_registry_is_a_cheap_noop(self):
+        with patch.object(parser, "precheck_wheel") as precheck:
+            entries = parser.retry_expired_links(self.now, {})
+        precheck.assert_not_called()
+        self.assertEqual(entries, [])
+
+    def test_wheel_recovered_from_expired_is_notified(self):
+        self._seed()
+        with patch.object(
+            parser, "precheck_wheel", return_value=("active", False, "")
+        ), patch.object(
+            parser, "send_telegram_notification", return_value=True
+        ) as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], self.url)
+        self.assertEqual(entries[0]["status"], "active")
+        self.assertTrue(entries[0]["notified"])
+        send.assert_called_once()
+        self.assertNotIn(self.url, parser.PENDING_EXPIRED_RETRY)
+        # Кулдаун должен встать — иначе обычный цикл тут же продублирует.
+        self.assertTrue(alerts.cooldown_active(self.url, self.now))
+
+    def test_still_expired_wheel_stays_registered_without_notifying(self):
+        self._seed()
+        with patch.object(
+            parser, "precheck_wheel", return_value=("expired", False, "")
+        ), patch.object(parser, "send_telegram_notification") as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(entries, [])
+        send.assert_not_called()
+        self.assertIn(self.url, parser.PENDING_EXPIRED_RETRY)
+
+    def test_stale_entry_beyond_retry_window_is_dropped_without_notifying(self):
+        stale_first_seen = self.now - timedelta(
+            minutes=config.NOTIFY_RETRY_WINDOW_MINUTES + 1
+        )
+        self._seed(first_seen=stale_first_seen)
+        with patch.object(parser, "precheck_wheel") as precheck, patch.object(
+            parser, "send_telegram_notification"
+        ) as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        precheck.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(entries, [])
+        self.assertNotIn(self.url, parser.PENDING_EXPIRED_RETRY)
+
+    def test_entry_already_covered_by_cooldown_is_dropped_without_duplicate(self):
+        # Уведомление об этом URL уже ушло из другого источника (Twitch,
+        # обычный ретрай доставки), пока ссылка ждала перепроверки.
+        self._seed()
+        with patch.object(
+            parser, "_is_on_cooldown", return_value=True
+        ), patch.object(parser, "precheck_wheel") as precheck, patch.object(
+            parser, "send_telegram_notification"
+        ) as send, self.assertLogs(parser.log, level="INFO") as logs:
+            entries = parser.retry_expired_links(self.now, {})
+
+        precheck.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(entries, [])
+        self.assertNotIn(self.url, parser.PENDING_EXPIRED_RETRY)
+        # Подавление не должно быть молчаливым — иначе «почему не пришло»
+        # диагностировать неоткуда.
+        self.assertTrue(any(self.url in line for line in logs.output))
+
+
 class RetryFailedNotificationsTests(unittest.TestCase):
     """Пост обрабатывается по хэшу один раз — сбой отправки без ретрая
     терял бы находку навсегда, поэтому retry_failed_notifications должен
@@ -292,6 +421,7 @@ class RetryFailedNotificationsTests(unittest.TestCase):
     def setUp(self):
         use_temp_db(self)
         self._start(patch.object(parser, "notifications_enabled", return_value=True))
+        self._start(patch.dict(parser.RETRY_ATTEMPT_COUNTS, clear=True))
         self.now = parser.now_msk()
 
     def store(self, url="https://betboom.ru/freestream/a", notified=False,
@@ -399,6 +529,45 @@ class RetryFailedNotificationsTests(unittest.TestCase):
 
         self.assertEqual(retried, config.NOTIFY_RETRY_MAX_PER_CYCLE)
         self.assertEqual(send.call_count, config.NOTIFY_RETRY_MAX_PER_CYCLE)
+
+    def test_stuck_entry_does_not_permanently_starve_newer_entries(self):
+        # Раньше ORDER BY found_at без учёта числа попыток означал: самая
+        # старая запись всегда первая, и если она не доставляется раз за
+        # разом, она монополизирует весь NOTIFY_RETRY_MAX_PER_CYCLE — более
+        # свежая запись не получает ни одной попытки, пока «застрявшие» не
+        # выйдут из окна ретрая естественным путём (до NOTIFY_RETRY_WINDOW_MINUTES).
+        for index in range(config.NOTIFY_RETRY_MAX_PER_CYCLE):
+            self.store(url=f"https://betboom.ru/freestream/stuck{index}", age_minutes=10)
+        fresh_url = "https://betboom.ru/freestream/fresh"
+        self.store(url=fresh_url, age_minutes=1)
+
+        def flaky(entry, *_args, **_kwargs):
+            return "stuck" not in entry["url"]
+
+        self._start(patch.object(parser, "send_telegram_notification", side_effect=flaky))
+
+        # Цикл 1: пул полностью укомплектован «застрявшими» — все записи
+        # ещё с одинаковым числом попыток (0), порядок по found_at решает,
+        # а «застрявшие» старше. Свежая ещё не пробуется.
+        parser.retry_failed_notifications(self.now)
+        self.assertIn(fresh_url, self.pending_urls())
+
+        # Цикл 2: «застрявшие» набрали по попытке, у свежей попыток всё
+        # ещё ноль — она идёт первой в сортировке и получает шанс.
+        parser.retry_failed_notifications(self.now)
+        self.assertNotIn(fresh_url, self.pending_urls())
+
+    def test_attempt_count_increments_on_failure_and_clears_on_success(self):
+        entry = self.store()
+        entry_id = entry["id"]
+
+        with patch.object(parser, "send_telegram_notification", return_value=False):
+            parser.retry_failed_notifications(self.now)
+        self.assertEqual(parser.RETRY_ATTEMPT_COUNTS.get(entry_id), 1)
+
+        with patch.object(parser, "send_telegram_notification", return_value=True):
+            parser.retry_failed_notifications(self.now)
+        self.assertNotIn(entry_id, parser.RETRY_ATTEMPT_COUNTS)
 
     def test_retries_keyword_notification_without_url(self):
         # У находок по ключевым словам url нет — ретрай узнаёт их по

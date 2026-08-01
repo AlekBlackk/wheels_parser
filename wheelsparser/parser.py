@@ -430,6 +430,18 @@ def index_last_found(results: list[dict[str, Any]]) -> dict[str, datetime]:
     return last_found
 
 
+# Множитель к NOTIFY_RETRY_MAX_PER_CYCLE для выборки кандидатов из базы:
+# без запаса при сортировке по числу попыток (см. retry_failed_notifications)
+# сортировать было бы нечего — SQL и так вернул бы не больше лимита.
+_RETRY_CANDIDATE_POOL_MULTIPLIER = 5
+
+# id -> число подряд неудачных попыток ретрая. Только в памяти (не
+# переживает рестарт) — это не гарантия доставки, а лишь приоритет
+# очерёдности внутри одного запущенного процесса, потеря счётчика при
+# рестарте не страшна. Доступ только из parser-потока — блокировка не нужна.
+RETRY_ATTEMPT_COUNTS: dict[int, int] = {}
+
+
 def retry_failed_notifications(now: datetime) -> int:
     """Повторно отправляет уведомления, недоставленные в своём цикле.
 
@@ -445,6 +457,16 @@ def retry_failed_notifications(now: datetime) -> int:
     Лимит и окно ограничивают стоимость длительного сбоя: не тратим
     весь цикл на HTTP-ретраи по всему бэклогу разом.
 
+    Кандидаты выбираются с запасом (см. _RETRY_CANDIDATE_POOL_MULTIPLIER) и
+    сортируются по числу уже сделанных попыток, а не только по found_at:
+    иначе запись, которая не доставляется раз за разом (битая разметка,
+    бот выкинут из чата и т.п.), как самая старая всегда шла бы первой и
+    монополизировала весь NOTIFY_RETRY_MAX_PER_CYCLE — более свежие находки
+    не получили бы ни одной попытки до истечения NOTIFY_RETRY_WINDOW_MINUTES.
+    Сортировка по числу попыток (сначала нетронутые) даёт свежим записям
+    приоритет, а «застрявшие» всё равно доретраиваются, когда прочих не
+    остаётся.
+
     Записи с delivery_unknown в выборку не попадают: sendMessage не
     идемпотентен, и при таймауте чтения без ответа сообщение могло уже
     уйти в чат — повтор такой отправки рассылал бы дубликаты. 5xx от
@@ -457,8 +479,14 @@ def retry_failed_notifications(now: datetime) -> int:
     if not notifications_enabled():
         return 0
     cutoff = now - timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES)
+    candidates = db.pending_retry(
+        cutoff, NOTIFY_RETRY_MAX_PER_CYCLE * _RETRY_CANDIDATE_POOL_MULTIPLIER
+    )
+    # list.sort устойчива: записи с равным числом попыток остаются в
+    # порядке found_at, который вернул SQL (см. db.pending_retry).
+    candidates.sort(key=lambda entry: RETRY_ATTEMPT_COUNTS.get(entry["id"], 0))
     retried = 0
-    for entry in db.pending_retry(cutoff, NOTIFY_RETRY_MAX_PER_CYCLE):
+    for entry in candidates[:NOTIFY_RETRY_MAX_PER_CYCLE]:
         if entry.get("url"):
             entry["notified"] = send_telegram_notification(entry)
             target = str(entry.get("url"))
@@ -472,12 +500,98 @@ def retry_failed_notifications(now: datetime) -> int:
         # — нет, и тогда повторять её нельзя (см. telegram_api._mark_delivery).
         db.update_delivery(entry)
         if entry["notified"]:
+            RETRY_ATTEMPT_COUNTS.pop(entry["id"], None)
             log.info(
                 "%s Уведомление доставлено повторной попыткой: %s",
                 icon("ok"),
                 target,
             )
+        else:
+            RETRY_ATTEMPT_COUNTS[entry["id"]] = (
+                RETRY_ATTEMPT_COUNTS.get(entry["id"], 0) + 1
+            )
     return retried
+
+
+# Ссылки, пропущенные precheck'ом как «expired»: url -> метаданные поста для
+# повторной проверки. is_ended у API BetBoom не всегда надёжен (см.
+# betboom.api_info_to_status: расчёт по start_dttm/duration_min может
+# ошибиться), а сообщение с такой ссылкой уже помечено «увиденным» в
+# channel_seen (см. process_message) — обычный путь (правка поста) больше
+# никогда её не перепроверит. Без отдельного ретрая одна ошибочная проверка
+# теряла бы находку навсегда. Доступ только из parser-потока — блокировка
+# не нужна (как у CHANNEL_FAIL_STREAK).
+PENDING_EXPIRED_RETRY: dict[str, dict[str, Any]] = {}
+
+
+def retry_expired_links(
+    now: datetime, last_found: dict[str, datetime]
+) -> list[dict[str, Any]]:
+    """Перепроверяет ссылки, ранее пропущенные как expired (см. PENDING_EXPIRED_RETRY).
+
+    Окно ограничено так же, как у retry_failed_notifications
+    (NOTIFY_RETRY_WINDOW_MINUTES): дольше ждать бессмысленно — колесо либо
+    давно завершилось по-настоящему, либо перезапустится новым постом и
+    будет найдено обычным путём через collect_pending_entries. Кулдаун
+    проверяется на случай, если уведомление об этом же URL уже ушло из
+    другого источника (Twitch, обычный ретрай доставки), пока ссылка ждала
+    перепроверки — тогда своя копия не нужна.
+    """
+    if not PENDING_EXPIRED_RETRY:
+        return []
+    cutoff = timedelta(minutes=NOTIFY_RETRY_WINDOW_MINUTES)
+    new_entries: list[dict[str, Any]] = []
+    for url in list(PENDING_EXPIRED_RETRY):
+        info = PENDING_EXPIRED_RETRY[url]
+        if now - info["first_seen"] > cutoff:
+            PENDING_EXPIRED_RETRY.pop(url, None)
+            log.info(
+                "%s Перестаю перепроверять %s [@%s]: %s мин без изменения статуса",
+                icon("bell"),
+                url,
+                info["channel"],
+                NOTIFY_RETRY_WINDOW_MINUTES,
+            )
+            continue
+        if _is_on_cooldown(url, now, last_found):
+            log.info(
+                "%s Прекращаю ретрай %s [@%s]: уведомление уже ушло из другого "
+                "источника, пока ссылка ждала перепроверки",
+                icon("bell"),
+                url,
+                info["channel"],
+            )
+            PENDING_EXPIRED_RETRY.pop(url, None)
+            continue
+        status, referral, ends_at = precheck_wheel(url, post_text=info["post_text"])
+        if status == "expired":
+            continue  # всё ещё завершено — ждём следующего цикла
+        PENDING_EXPIRED_RETRY.pop(url, None)
+        entry = {
+            "url": url,
+            "found_at": now_msk().isoformat(timespec="seconds"),
+            "channel": info["channel"],
+            "msg_id": info["msg_id"],
+            "message_url": info["message_url"],
+            "preview": info["preview"],
+            "edited": False,
+            "status": status,
+            "referral": referral,
+            "ends_at": ends_at,
+            "notified": False,
+        }
+        entry["notified"] = send_telegram_notification(entry)
+        _mark_handled(url, now, last_found)
+        log.info(
+            "%s Ссылка ожила после expired [@%s]: %s -> %s",
+            icon("link"),
+            info["channel"],
+            url,
+            status,
+            extra={"highlight": True},
+        )
+        new_entries.append(entry)
+    return new_entries
 
 
 def _is_on_cooldown(url: str, now: datetime, last_found: dict[str, datetime]) -> bool:
@@ -512,6 +626,17 @@ def collect_pending_entries(
     post_text = message["text"] if len(message["urls"]) == 1 else ""
     for url in message["urls"]:
         if _is_on_cooldown(url, now, last_found):
+            # Раньше это был continue без единой строки лога: если колесо
+            # перезапустили на том же адресе внутри REALERT_COOLDOWN_MINUTES,
+            # выяснить «почему не пришло уведомление» было неоткуда — цикл
+            # отрабатывал молча, как будто ссылки в посте не было вовсе.
+            log.info(
+                "%s Пропускаю %s [@%s]: недавно уже оповещали (кулдаун %s мин)",
+                icon("bell"),
+                url,
+                channel,
+                REALERT_COOLDOWN_MINUTES,
+            )
             continue  # недавно уже оповещали об этом колесе
         # Проверяем колесо через API BetBoom до отправки: «хвосты» —
         # старые href на прошлые (уже завершившиеся) колёса — молча
@@ -533,6 +658,19 @@ def collect_pending_entries(
             # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
             # обязано уйти. Повторные precheck по тому же «хвосту» и так
             # дёшевы — их гасит expired-кэш в betboom.py с тем же TTL.
+            # Сообщение уже будет помечено «увиденным» (см. process_message),
+            # и обычная правка поста больше не перепроверит эту ссылку —
+            # регистрируем её на ретрай (см. retry_expired_links): ошибочный
+            # is_ended или неверно посчитанный duration_min иначе терял бы
+            # находку навсегда.
+            PENDING_EXPIRED_RETRY.setdefault(url, {
+                "channel": channel,
+                "msg_id": message["id"],
+                "message_url": message["message_url"],
+                "preview": message["text"][:200],
+                "post_text": post_text,
+                "first_seen": now,
+            })
             continue
         pending.append({
             "url": url,
@@ -701,6 +839,17 @@ def process_cycle(
     retry_failed_notifications(now)
     last_found = index_last_found(load_cooldown_window(now))
     new_entries: list[dict[str, Any]] = []
+    expired_retry_entries = retry_expired_links(now, last_found)
+    if expired_retry_entries:
+        try:
+            db.insert_entries(expired_retry_entries)
+        except Exception:
+            log.exception(
+                "%s Не удалось записать находку из ретрая expired-ссылок в базу",
+                icon("warn"),
+            )
+        else:
+            new_entries.extend(expired_retry_entries)
     failed_channels: list[str] = []
     empty_channels: list[str] = []
     checked_channels: list[str] = []

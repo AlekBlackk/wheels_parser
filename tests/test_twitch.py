@@ -157,12 +157,44 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(len(self.queued()), 1)
         self.notify.assert_called_once()
 
+    def test_cooldown_skip_is_logged_for_diagnostics(self):
+        # Раньше подавление кулдауном было немым continue — диагностировать
+        # «почему не пришло» было неоткуда.
+        twitch.handle_twitch_message("demo", "nightbot", {}, f"розыгрыш {WHEEL}")
+        self.notify.reset_mock()
+        self.queued()
+
+        with self.assertLogs(twitch.log, level="INFO") as logs:
+            twitch.handle_twitch_message("demo", "nightbot", {}, f"розыгрыш {WHEEL}")
+
+        self.notify.assert_not_called()
+        self.assertEqual(self.queued(), [])
+        self.assertTrue(any(WHEEL in line and "кулдаун" in line for line in logs.output))
+
     def test_message_without_wheel_link_is_skipped(self):
         twitch.handle_twitch_message(
             "demo", "streamer", {"badges": "broadcaster/1"}, "просто колесо"
         )
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
+
+    def test_unexpected_send_error_still_queues_entry_for_history_and_retry(self):
+        # mark_url_alert (кулдаун) уже сработал до отправки — без записи
+        # в очереди находка терялась бы полностью: ни в базе, ни на
+        # ретрае, только «съеденный» кулдаун на REALERT_COOLDOWN_MINUTES.
+        # send_telegram_notification сама ловит requests.RequestException,
+        # поэтому здесь нужен именно неожиданный тип исключения.
+        self.notify.side_effect = TypeError("boom")
+
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, f"колесо {WHEEL}"
+        )
+
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], WHEEL)
+        self.assertFalse(entries[0]["notified"])
+        self.assertIsNotNone(alerts.last_alert(WHEEL))
 
 
 class EnqueueTests(unittest.TestCase):
