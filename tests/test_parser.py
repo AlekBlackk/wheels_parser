@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -67,6 +68,27 @@ class FetchChannelTests(unittest.TestCase):
             side_effect=requests.Timeout("connection timed out"),
         ):
             self.assertIsNone(parser.fetch_channel("offline"))
+
+    def test_returns_none_instead_of_raising_on_parse_crash(self):
+        # Ошибка разбора одного канала (не requests.RequestException) не
+        # должна вылетать наружу: у fetch_channel есть свой try/except,
+        # а в ThreadPoolExecutor (_fetch_all_channels) необработанное
+        # исключение здесь оборвало бы весь цикл по всем каналам разом.
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/1">
+            <div class="tgme_widget_message_text">колесо</div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response), \
+             patch.object(
+                 parser, "message_preview_html", side_effect=RecursionError("boom")
+             ):
+            self.assertIsNone(parser.fetch_channel("broken-markup"))
 
 
 class ProcessMessageTests(unittest.TestCase):
@@ -185,6 +207,24 @@ class ProcessMessageTests(unittest.TestCase):
             self.assertEqual(self.process(message, {}), [])
         self.single.assert_not_called()
 
+    def test_expired_wheel_does_not_block_later_restart_notification(self):
+        # Пропуск expired-«хвоста» — не уведомление: кулдаун ставить нельзя,
+        # иначе перезапуск того же колеса на том же адресе в пределах
+        # REALERT_COOLDOWN_MINUTES останется без уведомления.
+        url = "https://betboom.ru/freestream/a"
+        tail_message = make_message("demo/1", "колесо", [url])
+        with patch.object(parser, "precheck_wheel", return_value=("expired", False, "")):
+            self.assertEqual(self.process(tail_message, {}), [])
+        self.single.assert_not_called()
+
+        # Колесо перезапущено на том же адресе (precheck_wheel из setUp
+        # снова "active") — уведомление обязано уйти.
+        restarted_message = make_message("demo/2", "колесо", [url])
+        entries = self.process(restarted_message, {})
+
+        self.assertEqual(len(entries), 1)
+        self.single.assert_called_once()
+
     def test_keywords_are_checked_only_for_messages_without_links(self):
         with patch.object(registry, "KEYWORDS", ["колесо"]), \
              patch.object(parser, "send_keyword_notification") as notify:
@@ -197,6 +237,26 @@ class ProcessMessageTests(unittest.TestCase):
                 {},
             )
             notify.assert_not_called()
+
+    def test_keywords_are_checked_when_all_links_are_skipped(self):
+        # Пост со ссылкой, которая отсеяна прекчеком (истёкший «хвост»),
+        # не должен остаться совсем без уведомления — иначе пост пропал
+        # бы молча, хотя в тексте есть ключевое слово.
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "precheck_wheel", return_value=("expired", False, "")), \
+             patch.object(parser, "send_keyword_notification") as notify:
+            entries = self.process(
+                make_message(
+                    "demo/1", "будет колесо", ["https://betboom.ru/freestream/a"]
+                ),
+                {},
+            )
+
+        notify.assert_called_once()
+        self.single.assert_not_called()
+        self.assertEqual(len(entries), 1)
+        self.assertNotIn("url", entries[0])
+        self.assertEqual(entries[0]["keywords"], ["колесо"])
 
     def test_failed_keyword_notification_is_recorded_for_retry(self):
         # Пост обрабатывается по хэшу один раз: без записи в истории
@@ -528,6 +588,109 @@ class ProcessCycleTests(unittest.TestCase):
         self.assertEqual(entry["url"], "https://betboom.ru/freestream/new")
         self.assertEqual(entry["channel"], "demo")
         self.assertTrue(entry["notified"])
+
+    def test_one_channel_crash_does_not_abort_the_whole_cycle(self):
+        # _fetch_all_channels опрашивает каналы через ThreadPoolExecutor:
+        # необработанное исключение при разборе одного канала не должно
+        # унести с собой проверку остальных каналов этого же цикла.
+        message = make_message(
+            "demo/1", "колесо", ["https://betboom.ru/freestream/ok"]
+        )
+
+        def flaky_fetch(channel, session=None):
+            if channel == "broken":
+                raise RuntimeError("boom")
+            return [message]
+
+        with patch.dict(parser.CHANNEL_FAIL_STREAK, clear=True), \
+             patch.object(parser, "CHANNEL_FAIL_ALERTED", set()), \
+             patch.dict(alerts.LAST_URL_ALERT, clear=True), \
+             patch.object(registry, "CHANNELS", ["broken", "demo"]), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "fetch_channel", side_effect=flaky_fetch), \
+             patch.object(parser, "send_telegram_notification", return_value=True), \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle(
+                {"broken": {"broken/0": "hash"}, "demo": {"demo/0": "hash"}},
+                baseline=False,
+            )
+
+        (entry,) = self.stored()
+        self.assertEqual(entry["channel"], "demo")
+        self.assertEqual(entry["url"], "https://betboom.ru/freestream/ok")
+
+    def test_db_write_failure_for_one_message_does_not_abort_the_cycle(self):
+        # Сбой самой записи в базу (например, sqlite залочена дольше
+        # busy_timeout) не должен прерывать обработку остальных каналов
+        # этого цикла — иначе одна редкая ошибка теряет куда больше
+        # находок, чем одну.
+        broken_message = make_message(
+            "broken/1", "колесо", ["https://betboom.ru/freestream/lost"]
+        )
+        ok_message = make_message(
+            "demo/1", "колесо", ["https://betboom.ru/freestream/ok"]
+        )
+        real_insert = db.insert_entries
+
+        def flaky_insert(entries):
+            if any(entry.get("channel") == "broken" for entry in entries):
+                raise sqlite3.OperationalError("database is locked")
+            real_insert(entries)
+
+        def fetch_by_channel(channel, session=None):
+            return [broken_message] if channel == "broken" else [ok_message]
+
+        seen = {"broken": {"broken/0": "hash"}, "demo": {"demo/0": "hash"}}
+        with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
+             patch.object(registry, "CHANNELS", ["broken", "demo"]), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "fetch_channel", side_effect=fetch_by_channel), \
+             patch.object(parser, "send_telegram_notification", return_value=True), \
+             patch.object(db, "insert_entries", side_effect=flaky_insert), \
+             patch.object(parser, "save_seen") as save_seen_mock:
+            parser.process_cycle(seen, baseline=False)
+
+        # Демо-канал, обработанный ПОСЛЕ сбойного, всё равно записан.
+        (entry,) = self.stored()
+        self.assertEqual(entry["channel"], "demo")
+        self.assertEqual(entry["url"], "https://betboom.ru/freestream/ok")
+        # Цикл доехал до конца, а не оборвался на сбойной записи.
+        save_seen_mock.assert_called_once()
+        # Пост уже помечен «увиденным» (уведомление, если было, уже
+        # отправлено в Telegram) — откатывать эту пометку нельзя, иначе
+        # повтор на следующем цикле продублировал бы отправку.
+        self.assertIn("broken/1", seen["broken"])
+
+    def test_twitch_db_write_failure_does_not_block_channel_checks(self):
+        ok_message = make_message(
+            "demo/1", "колесо", ["https://betboom.ru/freestream/ok"]
+        )
+        parser.TWITCH_NEW_ENTRIES.put({
+            "url": "https://betboom.ru/freestream/twitch-lost",
+            "found_at": self.now.isoformat(timespec="seconds"),
+            "channel": "streamer",
+            "source": "twitch",
+            "notified": True,
+        })
+        real_insert = db.insert_entries
+
+        def flaky_insert(entries):
+            if any(entry.get("source") == "twitch" for entry in entries):
+                raise sqlite3.OperationalError("database is locked")
+            real_insert(entries)
+
+        with patch.dict(alerts.LAST_URL_ALERT, clear=True), \
+             patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "fetch_channel", return_value=[ok_message]), \
+             patch.object(parser, "send_telegram_notification", return_value=True), \
+             patch.object(db, "insert_entries", side_effect=flaky_insert), \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle({"demo": {"demo/0": "hash"}}, baseline=False)
+
+        (entry,) = self.stored()
+        self.assertEqual(entry["channel"], "demo")
+        self.assertEqual(entry["url"], "https://betboom.ru/freestream/ok")
 
     def test_same_url_from_two_new_messages_is_saved_once(self):
         first = make_message("demo/2", "колесо", ["https://betboom.ru/freestream/same"])

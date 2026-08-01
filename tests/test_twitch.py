@@ -115,7 +115,11 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
 
-    def test_expired_wheel_is_not_notified_but_starts_cooldown(self):
+    def test_expired_wheel_is_not_notified_and_does_not_start_cooldown(self):
+        # Пропуск expired-«хвоста» — не уведомление: кулдаун ставить нельзя,
+        # иначе перезапуск того же колеса на том же адресе в пределах
+        # REALERT_COOLDOWN_MINUTES останется без уведомления (см.
+        # test_expired_wheel_does_not_block_later_restart_notification).
         with patch.object(twitch, "precheck_wheel", return_value=("expired", False, "")):
             twitch.handle_twitch_message(
                 "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
@@ -123,7 +127,26 @@ class HandleMessageTests(unittest.TestCase):
 
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
-        self.assertIsNotNone(alerts.last_alert(WHEEL))
+        self.assertIsNone(alerts.last_alert(WHEEL))
+
+    def test_expired_wheel_does_not_block_later_restart_notification(self):
+        with patch.object(twitch, "precheck_wheel", return_value=("expired", False, "")):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+            )
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+
+        # Колесо перезапущено на том же адресе (setUp мокает precheck_wheel
+        # обратно на "active") — уведомление обязано уйти, а не молчать
+        # до конца REALERT_COOLDOWN_MINUTES.
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+        )
+
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.notify.assert_called_once()
 
     def test_repeated_link_within_cooldown_is_sent_once(self):
         for _ in range(2):

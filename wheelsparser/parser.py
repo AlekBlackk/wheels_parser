@@ -117,10 +117,11 @@ def fetch_channel(
 ) -> list[dict[str, Any]] | None:
     """Последние сообщения канала через веб-превью t.me/s/<channel>.
 
-    None означает, что канал прочитать не удалось (404 или сетевая ошибка).
-    Пустой список — страница получена, но ни одного поста распознать не
-    удалось: это не то же самое, что «нет новых сообщений», и вызывающий
-    обязан различать эти случаи (см. update_channel_empty_streaks).
+    None означает, что канал прочитать не удалось (404, сетевая ошибка или
+    сбой разбора HTML — см. ниже). Пустой список — страница получена, но
+    ни одного поста распознать не удалось: это не то же самое, что «нет
+    новых сообщений», и вызывающий обязан различать эти случаи (см.
+    update_channel_empty_streaks).
     По умолчанию используется PARSER_SESSION — параллельный опрос каналов
     (см. _fetch_all_channels) передаёт сессию своего воркера, так как
     requests.Session не потокобезопасна.
@@ -136,36 +137,46 @@ def fetch_channel(
         log.warning("[%s] ошибка запроса: %s", channel, error)
         return None
 
-    # response.content вместо response.text: если сервер не указал charset,
-    # requests подставляет latin-1 и кириллица превращается в кракозябры.
-    # BeautifulSoup сам определяет UTF-8 по <meta charset> страницы.
-    soup = BeautifulSoup(response.content, "html.parser")
-    messages = soup.select(".tgme_widget_message_wrap")[-MESSAGES_PER_CHANNEL:]
-    results: list[dict[str, Any]] = []
-    for message in messages:
-        bubble = message.select_one(".tgme_widget_message")
-        if not bubble:
-            continue
-        message_id = str(bubble.get("data-post", "")).strip()
-        if not message_id:
-            continue
-        text_element = message.select_one(".tgme_widget_message_text")
-        text = text_element.get_text(" ", strip=True) if text_element else ""
-        urls = find_urls(message, text)
-        results.append({
-            "id": message_id,
-            "text": text,
-            "preview_html": message_preview_html(text_element),
-            "urls": urls,
-            "hash": message_content_hash(text, urls),
-            # Хэш в формате старых версий (URL с query-параметрами): сравнение
-            # с ним не даёт принять смену формата хэша за правку поста.
-            "legacy_hash": message_content_hash(
-                text, extract_urls(message, text, legacy_normalize_url)
-            ),
-            "message_url": f"https://t.me/{message_id}",
-        })
-    return results
+    try:
+        # response.content вместо response.text: если сервер не указал
+        # charset, requests подставляет latin-1 и кириллица превращается
+        # в кракозябры. BeautifulSoup сам определяет UTF-8 по <meta charset>
+        # страницы.
+        soup = BeautifulSoup(response.content, "html.parser")
+        messages = soup.select(".tgme_widget_message_wrap")[-MESSAGES_PER_CHANNEL:]
+        results: list[dict[str, Any]] = []
+        for message in messages:
+            bubble = message.select_one(".tgme_widget_message")
+            if not bubble:
+                continue
+            message_id = str(bubble.get("data-post", "")).strip()
+            if not message_id:
+                continue
+            text_element = message.select_one(".tgme_widget_message_text")
+            text = text_element.get_text(" ", strip=True) if text_element else ""
+            urls = find_urls(message, text)
+            results.append({
+                "id": message_id,
+                "text": text,
+                "preview_html": message_preview_html(text_element),
+                "urls": urls,
+                "hash": message_content_hash(text, urls),
+                # Хэш в формате старых версий (URL с query-параметрами):
+                # сравнение с ним не даёт принять смену формата хэша за
+                # правку поста.
+                "legacy_hash": message_content_hash(
+                    text, extract_urls(message, text, legacy_normalize_url)
+                ),
+                "message_url": f"https://t.me/{message_id}",
+            })
+        return results
+    except Exception:
+        # Разбор одного канала не должен ронять весь цикл: у пула
+        # воркеров (см. _fetch_all_channels) нет своего try/except, и
+        # необработанное исключение здесь вылетело бы из pool.map и
+        # оставило бы непроверенными все остальные каналы этого цикла.
+        log.exception("[%s] не удалось разобрать страницу канала", channel)
+        return None
 
 
 def _fetch_all_channels(
@@ -193,7 +204,16 @@ def _fetch_all_channels(
         return session
 
     def fetch(channel: str) -> tuple[str, list[dict[str, Any]] | None]:
-        return channel, fetch_channel(channel, worker_session())
+        try:
+            return channel, fetch_channel(channel, worker_session())
+        except Exception:
+            # fetch_channel ловит свои ошибки разбора сам — это защита на
+            # случай прочих сбоев (например, в worker_session()). Один
+            # канал не должен ронять весь пул: необработанное исключение
+            # здесь вылетело бы из pool.map и оставило бы непроверенными
+            # все остальные каналы этого цикла.
+            log.exception("[%s] сбой при опросе канала", channel)
+            return channel, None
 
     with ThreadPoolExecutor(max_workers=CHANNEL_FETCH_CONCURRENCY) as pool:
         return list(pool.map(fetch, channels))
@@ -426,10 +446,13 @@ def retry_failed_notifications(now: datetime) -> int:
     весь цикл на HTTP-ретраи по всему бэклогу разом.
 
     Записи с delivery_unknown в выборку не попадают: sendMessage не
-    идемпотентен, и при таймауте чтения или 5xx сообщение могло уже уйти
-    в чат — повтор такой отправки рассылал бы дубликаты (см.
-    telegram_api.delivery_unknown). Результат каждой попытки сразу
-    пишется в базу: иначе следующий цикл отправил бы то же самое ещё раз.
+    идемпотентен, и при таймауте чтения без ответа сообщение могло уже
+    уйти в чат — повтор такой отправки рассылал бы дубликаты. 5xx от
+    шлюза Telegram под delivery_unknown не подпадает: такой ответ значит,
+    что запрос обработан и не отправлен, поэтому ретраится как обычный
+    отказ (см. telegram_api.delivery_unknown). Результат каждой попытки
+    сразу пишется в базу: иначе следующий цикл отправил бы то же самое
+    ещё раз.
     """
     if not notifications_enabled():
         return 0
@@ -505,7 +528,11 @@ def collect_pending_entries(
                 url,
                 channel,
             )
-            _mark_handled(url, now, last_found)
+            # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
+            # мы ничего не оповестили, и если колесо перезапустят на том
+            # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
+            # обязано уйти. Повторные precheck по тому же «хвосту» и так
+            # дёшевы — их гасит expired-кэш в betboom.py с тем же TTL.
             continue
         pending.append({
             "url": url,
@@ -632,11 +659,14 @@ def process_message(
     )
     notify_pending_entries(pending, channel, now, last_found, is_edited_message)
 
-    # Поиск по ключевым словам — только для новых сообщений без ссылок:
-    # ссылки не дублируют уведомление о найденном колесе, а правки
-    # постов проверяем лишь на ссылки — иначе каждая мелкая правка
-    # текста с ключевым словом слала бы повторное уведомление.
-    if is_new_message and not message["urls"]:
+    # Поиск по ключевым словам — только для новых сообщений, из которых не
+    # ушло ни одной ссылки: если хотя бы одна ссылка попала в pending,
+    # дублировать уведомление ключевым словом не нужно. Но если ссылки в
+    # посте есть, а все они отсеяны (кулдаун, expired-хвост), пост не
+    # должен остаться совсем без уведомления — оно уходит по ключевому
+    # слову. Правки постов проверяем лишь на ссылки — иначе каждая мелкая
+    # правка текста с ключевым словом слала бы повторное уведомление.
+    if is_new_message and not pending:
         pending.extend(notify_keywords(message, channel))
     return pending
 
@@ -654,7 +684,18 @@ def process_cycle(
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), len(channels))
     now = now_msk()
     twitch_entries = drain_twitch_entries()
-    db.insert_entries(twitch_entries)
+    try:
+        db.insert_entries(twitch_entries)
+    except Exception:
+        # Уведомления Twitch уже отправлены в чат его потоком — сбой
+        # записи теряет только историю (без ретрая), а не сам факт
+        # оповещения. Каналы Telegram этого цикла всё равно должны
+        # быть проверены дальше.
+        log.exception(
+            "%s Не удалось записать находки Twitch в базу — они "
+            "потеряны для истории, продолжаю цикл",
+            icon("warn"),
+        )
     # Результат ретрая пишется в базу внутри самой функции, поэтому
     # возвращённое число здесь больше ни на что не влияет.
     retry_failed_notifications(now)
@@ -690,9 +731,26 @@ def process_cycle(
             )
             # Пишем сразу, а не в конце цикла: находки следующих каналов
             # ещё впереди, а падение процесса не должно терять уже
-            # разосланные уведомления.
-            db.insert_entries(entries)
-            new_entries.extend(entries)
+            # разосланные уведомления. Уведомление (если было) process_message
+            # уже отправил и уже пометил пост «увиденным» в channel_seen —
+            # откатывать это при сбое записи нельзя: повтор на следующем
+            # цикле продублировал бы уже отправленное в Telegram сообщение
+            # (sendMessage не идемпотентен). Поэтому сбой самой записи ловим
+            # здесь же и продолжаем цикл: находка потеряется для истории и
+            # ретрая (крайне редкий случай — busy_timeout=10с уже переживает
+            # обычную конкуренцию с twitch-worker), но остальные каналы
+            # цикла и save_seen() в конце обязаны отработать.
+            try:
+                db.insert_entries(entries)
+            except Exception:
+                log.exception(
+                    "%s Не удалось записать находку в базу [@%s, %s]",
+                    icon("warn"),
+                    channel,
+                    message.get("id"),
+                )
+            else:
+                new_entries.extend(entries)
 
     update_channel_fail_streaks(checked_channels, failed_channels)
     update_channel_empty_streaks(checked_channels, failed_channels, empty_channels)

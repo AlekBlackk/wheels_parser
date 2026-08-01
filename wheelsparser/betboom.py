@@ -19,20 +19,24 @@ from .config import (
     ACTIVE_CHECK_CONCURRENCY,
     HEADERS,
     MSK_TZ,
+    REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     STREAMER_WHEEL_INFO_API,
 )
 from .logging_setup import log
 from .net import PARSER_SESSION, build_session
-from .timeutils import today_msk
+from .timeutils import now_msk
 from .urls import normalize_url
 
-# Кэш завершившихся колёс на текущие сутки МСК: url -> "YYYY-MM-DD".
-# Завершившееся колесо не «оживает», поэтому повторные /active за день не
-# перепроверяют его через API — к вечеру это главный источник ускорения.
+# Кэш завершившихся колёс: url -> момент, когда колесо признано expired.
+# TTL — тот же REALERT_COOLDOWN_MINUTES, что и у повторных уведомлений
+# (см. alerts.py): колёса BetBoom живут на постоянных адресах, и то же
+# самое «истёкшее» колесо может быть перезапущено раньше конца календарных
+# суток МСК. Кэш на весь день (как было раньше) в этом случае молча скрывал
+# бы уже активное колесо и из precheck, и из /active вплоть до полуночи.
 # Кэш общий для parser-потока (precheck перед уведомлением) и фонового
 # active-api-потока, поэтому доступ — только под _expired_cache_lock.
-_expired_cache: dict[str, str] = {}
+_expired_cache: dict[str, datetime] = {}
 _expired_cache_lock = threading.Lock()
 
 
@@ -186,22 +190,25 @@ def check_wheel_status(url: str, session: requests.Session) -> str:
     return api_info_to_status(info)
 
 
-def _prune_expired_cache(today: str) -> None:
+def _prune_expired_cache() -> None:
+    """Убирает записи старше REALERT_COOLDOWN_MINUTES — иначе кэш растёт бессрочно."""
+    cutoff = timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    now = now_msk()
     with _expired_cache_lock:
         for stale_url in [
-            url for url, day in list(_expired_cache.items()) if day != today
+            url for url, when in _expired_cache.items() if now - when > cutoff
         ]:
             _expired_cache.pop(stale_url, None)
 
 
-def _is_cached_expired(url: str, today: str) -> bool:
+def _is_cached_expired(url: str) -> bool:
     with _expired_cache_lock:
-        return _expired_cache.get(url) == today
+        return url in _expired_cache
 
 
-def _cache_expired(url: str, today: str) -> None:
+def _cache_expired(url: str) -> None:
     with _expired_cache_lock:
-        _expired_cache[url] = today
+        _expired_cache[url] = now_msk()
 
 
 def precheck_wheel(
@@ -222,10 +229,13 @@ def precheck_wheel(
     canonical = normalize_url(url)
     if not canonical:
         return "unknown", False, ""
-    today = today_msk()
-    _prune_expired_cache(today)
-    if _is_cached_expired(canonical, today):
-        log.info("precheck [cache]: %s → expired (кэш за сегодня)", canonical)
+    _prune_expired_cache()
+    if _is_cached_expired(canonical):
+        log.info(
+            "precheck [cache]: %s → expired (кэш %s мин)",
+            canonical,
+            REALERT_COOLDOWN_MINUTES,
+        )
         return "expired", is_referral_wheel(canonical, None, post_text), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
     status = "unknown" if info is None else api_info_to_status(info)
@@ -237,7 +247,7 @@ def precheck_wheel(
         " (для рефералов)" if referral else "",
     )
     if status == "expired":
-        _cache_expired(canonical, today)
+        _cache_expired(canonical)
     return status, referral, wheel_ends_at(info)
 
 
@@ -247,14 +257,13 @@ def classify_wheels(
     """Проверяет список колёс через BetBoom API параллельно.
 
     Использует ThreadPoolExecutor с ACTIVE_CHECK_CONCURRENCY потоками.
-    Кэширует expired-статусы в пределах текущих суток МСК.
+    Кэширует expired-статусы на REALERT_COOLDOWN_MINUTES.
     Возвращает кортеж (active_items, soon_items, unknown_count):
       - active_items  — колёса со статусом active (в исходном порядке);
       - soon_items    — колёса, розыгрыш которых ещё не начался (soon);
       - unknown_count — количество колёс с неопределённым статусом.
     """
-    today = today_msk()
-    _prune_expired_cache(today)
+    _prune_expired_cache()
 
     # requests.Session не потокобезопасна, поэтому общая сессия на все
     # рабочие потоки ThreadPoolExecutor недопустима: у каждого потока —
@@ -277,8 +286,12 @@ def classify_wheels(
             with lock:
                 results.append((index, "unknown"))
             return
-        if _is_cached_expired(url, today):
-            log.info("active-check [cache]: %s → expired (кэш за сегодня)", url)
+        if _is_cached_expired(url):
+            log.info(
+                "active-check [cache]: %s → expired (кэш %s мин)",
+                url,
+                REALERT_COOLDOWN_MINUTES,
+            )
             with lock:
                 results.append((index, "expired"))
             return
@@ -293,7 +306,7 @@ def classify_wheels(
             item["ends_at"] = ends_at
         log.info("active-check [api]: %s → %s", url, status)
         if status == "expired":
-            _cache_expired(url, today)
+            _cache_expired(url)
         with lock:
             results.append((index, status))
 

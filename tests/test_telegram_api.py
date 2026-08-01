@@ -229,9 +229,11 @@ class KeywordNotificationTests(unittest.TestCase):
 class DeliveryUnknownTests(unittest.TestCase):
     """Ошибка отправки не всегда значит «сообщение не доставлено».
 
-    Telegram мог принять sendMessage и не донести ответ (таймаут чтения,
-    502 от шлюза). Повтор такой отправки шлёт дубликат, поэтому такие
-    случаи помечаются delivery_unknown и ретраю не подлежат.
+    Telegram мог принять sendMessage и не донести ответ (таймаут чтения) —
+    повтор такой отправки шлёт дубликат, поэтому такие случаи помечаются
+    delivery_unknown и ретраю не подлежат. 5xx от шлюза Telegram под это
+    не подпадает: такой ответ означает, что запрос обработан и точно не
+    отправлен, поэтому ретраится как обычный отказ.
     """
 
     def setUp(self):
@@ -264,7 +266,10 @@ class DeliveryUnknownTests(unittest.TestCase):
         self.assertFalse(telegram_api.send_telegram_notification(entry, session))
         self.assertTrue(entry["delivery_unknown"])
 
-    def test_server_error_marks_delivery_unknown(self):
+    def test_server_error_keeps_entry_retriable(self):
+        # 502 от шлюза Telegram означает, что запрос обработан и
+        # НЕ отправлен (в отличие от таймаута чтения, где ответа нет
+        # вовсе) — такой отказ должен ретраиться, а не теряться навсегда.
         entry = self.entry()
         response = Mock(status_code=502)
         error = requests.HTTPError("502 Server Error", response=response)
@@ -273,7 +278,7 @@ class DeliveryUnknownTests(unittest.TestCase):
         session.post.return_value = response
 
         self.assertFalse(telegram_api.send_telegram_notification(entry, session))
-        self.assertTrue(entry["delivery_unknown"])
+        self.assertFalse(entry.get("delivery_unknown"))
 
     def test_connection_error_keeps_entry_retriable(self):
         entry = self.entry()
