@@ -128,6 +128,29 @@ class ActiveReportFormatTests(unittest.TestCase):
         }
         self.assertNotIn("осталось", active_report.format_active_item(item, 1))
 
+    def test_format_active_result_returns_text_and_keyboard(self):
+        items = [{
+            "url": "https://betboom.ru/freestream/one",
+            "found_at": "2026-07-30T20:40:31+03:00",
+            "channel": "demo",
+        }]
+        text, keyboard = active_report.format_active_result(items, total=1)
+        self.assertIn("Активные колёса", text)
+        self.assertEqual(
+            keyboard,
+            {"inline_keyboard": [[{"text": "❌ 1", "callback_data": "rmw:1"}]]},
+        )
+
+    def test_format_active_result_keyboard_is_none_when_nothing_to_remove(self):
+        text, keyboard = active_report.format_active_result([], total=2, unknown_count=0)
+        self.assertIn("активных не найдено", text)
+        self.assertIsNone(keyboard)
+
+    def test_format_active_result_keyboard_is_none_on_check_failure(self):
+        text, keyboard = active_report.format_active_result(None, total=0)
+        self.assertIn("Не удалось проверить", text)
+        self.assertIsNone(keyboard)
+
 
 class RemoveWheelCommandTests(unittest.TestCase):
     def test_removes_wheel_by_number_from_last_active_answer(self):

@@ -69,15 +69,28 @@ def format_active_item(item: dict[str, Any], number: int) -> str:
     )
 
 
+def _removal_keyboard(numbered: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+    """Клавиатура ❌ под /active: не через menu.py — тот импортирует этот
+    модуль (lookup_active_number), обратный импорт создал бы цикл.
+    """
+    return {
+        "inline_keyboard": [
+            [{"text": f"❌ {number}", "callback_data": f"rmw:{number}"}]
+            for number, _item in numbered
+        ]
+    }
+
+
 def format_active_result(
     active_items: list[dict[str, Any]] | None,
     total: int,
     unknown_count: int = 0,
-) -> str:
+) -> tuple[str, dict[str, Any] | None]:
     """Форматирует ответ команды /active для отправки в Telegram.
 
     Показываются только действительно активные колёса: ещё не начавшиеся
-    (soon) и завершившиеся в ответ не попадают.
+    (soon) и завершившиеся в ответ не попадают. Возвращает (текст,
+    inline-клавиатура с кнопками ❌) — клавиатура None, если убирать нечего.
     unknown_count > 0 означает, что часть колёс не удалось проверить
     (таймаут или ошибка API) — результат может быть неполным.
     """
@@ -85,14 +98,16 @@ def format_active_result(
         return (
             f"{icon('warn')} Не удалось проверить колёса через API BetBoom. "
             "Это ошибка проверки, а не «активных нет» — "
-            "подробности в parser.log."
+            "подробности в parser.log.",
+            None,
         )
     # Все колёса вернули unknown — скорее всего сетевая ошибка.
     if not active_items and unknown_count > 0 and unknown_count == total:
         return (
             f"{icon('warn')} Не удалось определить статус {total} колёс "
             "(API не ответил).\n"
-            "Попробуйте /active ещё раз через несколько секунд."
+            "Попробуйте /active ещё раз через несколько секунд.",
+            None,
         )
     suffix = (
         f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
@@ -105,7 +120,8 @@ def format_active_result(
         return (
             f"{icon('warn')} Среди {total} колёс за сегодня "
             "активных не найдено.\n"
-            f"Все розыгрыши уже завершились или ещё не начались.{suffix}"
+            f"Все розыгрыши уже завершились или ещё не начались.{suffix}",
+            None,
         )
     lines = [
         f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
@@ -113,13 +129,13 @@ def format_active_result(
     ]
     numbered = list(enumerate(active_items, start=1))
     # Запоминаем нумерацию для /removewheel <номер>: номера действительны
-    # до следующего ответа /active.
+    # до следующего ответа /active или /wheels.
     remember_active_numbers(numbered)
     lines.extend(format_active_item(item, number) for number, item in numbered)
-    lines.append("\nУбрать колесо из списка: /removewheel номер")
+    lines.append("\nУбрать колесо: /removewheel номер или кнопкой ❌ ниже.")
     if suffix:
         lines.append(suffix)
-    return "\n".join(lines)
+    return ("\n".join(lines), _removal_keyboard(numbered))
 
 
 def fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
@@ -146,8 +162,7 @@ def fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
         finally:
             _active_check_lock.release()
 
-        background_bot_send(
-            chat_id, format_active_result(active_items, total, unknown_count)
-        )
+        text, keyboard = format_active_result(active_items, total, unknown_count)
+        background_bot_send(chat_id, text, reply_markup=keyboard)
 
     threading.Thread(target=_run_and_send, daemon=True, name="active-api").start()
