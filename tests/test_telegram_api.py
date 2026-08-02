@@ -328,5 +328,52 @@ class ReplyMarkupTests(unittest.TestCase):
         self.assertEqual(session.post.call_args.kwargs["json"]["reply_markup"], keyboard)
 
 
+class EditMessageTextTests(unittest.TestCase):
+    def test_sends_chat_message_id_text_and_keyboard(self):
+        session = fake_session()
+        keyboard = {"inline_keyboard": [[{"text": "← Назад", "callback_data": "m:root"}]]}
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.edit_message_text("1", 55, "<b>Раздел</b>", keyboard)
+        payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["chat_id"], "1")
+        self.assertEqual(payload["message_id"], 55)
+        self.assertEqual(payload["text"], "<b>Раздел</b>")
+        self.assertEqual(payload["parse_mode"], "HTML")
+        self.assertEqual(payload["reply_markup"], keyboard)
+        session.post.assert_called_once_with(
+            f"{telegram_api.BOT_API}/editMessageText",
+            json=payload,
+            timeout=telegram_api.REQUEST_TIMEOUT,
+        )
+
+    def test_omits_reply_markup_when_not_given(self):
+        session = fake_session()
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.edit_message_text("1", 55, "text")
+        self.assertNotIn("reply_markup", session.post.call_args.kwargs["json"])
+
+    def test_not_modified_error_is_not_logged_as_failure(self):
+        response = Mock(
+            status_code=400,
+            text='{"description":"Bad Request: message is not modified"}',
+        )
+        error = requests.HTTPError("400", response=response)
+        response.raise_for_status.side_effect = error
+        session = Mock()
+        session.post.return_value = response
+        with patch.object(telegram_api, "BOT_SESSION", session), \
+             patch.object(telegram_api.log, "warning") as warn:
+            telegram_api.edit_message_text("1", 55, "text")
+        warn.assert_not_called()
+
+    def test_other_errors_are_logged(self):
+        session = Mock()
+        session.post.side_effect = requests.ConnectionError("boom")
+        with patch.object(telegram_api, "BOT_SESSION", session), \
+             patch.object(telegram_api.log, "warning") as warn:
+            telegram_api.edit_message_text("1", 55, "text")
+        warn.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

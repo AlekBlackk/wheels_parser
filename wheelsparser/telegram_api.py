@@ -264,6 +264,44 @@ def bot_send(
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
+def edit_message_text(
+    chat_id: str,
+    message_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
+    """Редактирует сообщение меню — только из потока бота (BOT_SESSION).
+
+    «Message is not modified» (400) — не сбой: пользователь повторно
+    открыл тот же раздел меню, текст и клавиатура не изменились.
+    """
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        BOT_SESSION.post(
+            f"{BOT_API}/editMessageText", json=payload, timeout=REQUEST_TIMEOUT
+        ).raise_for_status()
+    except requests.RequestException as error:
+        response = getattr(error, "response", None)
+        if (
+            response is not None
+            and response.status_code == 400
+            and "message is not modified" in response.text.lower()
+        ):
+            return
+        log.warning(
+            "Бот: не удалось отредактировать сообщение %s в чате %s: %s",
+            message_id, chat_id, error,
+        )
+
+
 def background_bot_send(
     chat_id: str, text: str, reply_markup: dict[str, Any] | None = None
 ) -> None:
