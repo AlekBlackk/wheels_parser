@@ -251,5 +251,59 @@ class RemoveTwitchCallbackTests(unittest.TestCase):
             self.assertTrue(registry.TWITCH_RELOAD.is_set())
 
 
+class RemoveWordCallbackTests(unittest.TestCase):
+    def setUp(self):
+        menu.forget_deletions()
+        self.addCleanup(menu.forget_deletions)
+
+    def test_removes_word_by_index_and_offers_undo(self):
+        with patch.object(registry, "KEYWORDS", ["колесо", "фрибет"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "wd:rm:0")
+
+            self.assertTrue(handled)
+            self.assertEqual(registry.KEYWORDS, ["фрибет"])
+            save.assert_called_once_with()
+            self.assertIn("колесо", answer.call_args.args[1])
+            self.assertEqual(menu.pop_deletion("word"), "колесо")
+
+    def test_out_of_range_index_does_not_crash_and_refreshes_list(self):
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            menu.handle_callback("1", 55, "cb1", "wd:rm:5")
+
+            save.assert_not_called()
+            self.assertEqual(registry.KEYWORDS, ["колесо"])
+            self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+            edit.assert_called_once_with("1", 55, menu.words_section_text(), menu.words_list_keyboard())
+
+    def test_undo_word_restores_and_saves(self):
+        menu.remember_deletion("word", "колесо")
+        with patch.object(registry, "KEYWORDS", ["фрибет"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query") as answer:
+            menu.handle_callback("1", 55, "cb1", "undo:word")
+
+            self.assertIn("колесо", registry.KEYWORDS)
+            save.assert_called_once_with()
+            self.assertIn("колесо", answer.call_args.args[1])
+
+    def test_undo_word_does_not_duplicate_if_already_present(self):
+        menu.remember_deletion("word", "колесо")
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "undo:word")
+
+            self.assertEqual(registry.KEYWORDS, ["колесо"])
+            save.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

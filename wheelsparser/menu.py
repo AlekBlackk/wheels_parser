@@ -304,3 +304,50 @@ _STATIC_HANDLERS["undo:channel"] = _cb_undo_channel
 _STATIC_HANDLERS["undo:twitch"] = _cb_undo_twitch
 _PREFIX_HANDLERS["ch:rm:"] = _cb_remove_channel
 _PREFIX_HANDLERS["tw:rm:"] = _cb_remove_twitch
+
+
+# ----------------------------------------------------------------------------
+# Удаление / восстановление ключевых слов (по индексу — слово может быть
+# длиннее, чем позволяет 64-байтный лимит callback_data)
+# ----------------------------------------------------------------------------
+
+def _cb_remove_word(chat_id: str, message_id: int, callback_id: str, raw_index: str) -> None:
+    try:
+        index = int(raw_index)
+    except ValueError:
+        return
+    with registry.KEYWORDS_LOCK:
+        if index < 0 or index >= len(registry.KEYWORDS):
+            answer_callback_query(callback_id, "Список изменился — обновляю", show_alert=True)
+            edit_message_text(chat_id, message_id, words_section_text(), words_list_keyboard())
+            return
+        word = registry.KEYWORDS.pop(index)
+        registry.save_keywords_file()
+    remember_deletion("word", word)
+    answer_callback_query(callback_id, f"«{word}» удалено")
+    edit_message_text(
+        chat_id, message_id, words_section_text(),
+        _with_undo(words_list_keyboard(), "undo:word"),
+    )
+
+
+def _cb_undo_word(chat_id: str, message_id: int, callback_id: str) -> None:
+    word = pop_deletion("word")
+    if word is None:
+        answer_callback_query(
+            callback_id, "Время отмены истекло. Добавьте: /addword слово", show_alert=True
+        )
+        return
+    with registry.KEYWORDS_LOCK:
+        already_present = any(
+            existing.casefold() == word.casefold() for existing in registry.KEYWORDS
+        )
+        if not already_present:
+            registry.KEYWORDS.append(word)
+            registry.save_keywords_file()
+    answer_callback_query(callback_id, f"«{word}» восстановлено")
+    edit_message_text(chat_id, message_id, words_section_text(), words_list_keyboard())
+
+
+_STATIC_HANDLERS["undo:word"] = _cb_undo_word
+_PREFIX_HANDLERS["wd:rm:"] = _cb_remove_word
