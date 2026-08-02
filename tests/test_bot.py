@@ -317,5 +317,25 @@ class DispatchTests(unittest.TestCase):
         send.assert_called_once()
 
 
+class MenuCommandTests(unittest.TestCase):
+    def test_menu_command_sends_root_keyboard(self):
+        from wheelsparser import menu
+        with patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/menu")
+        send.assert_called_once_with("1", menu.root_text(), reply_markup=menu.root_menu_keyboard())
+
+    def test_start_includes_menu_button(self):
+        from wheelsparser import menu
+        with patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/start")
+        self.assertEqual(send.call_args.kwargs["reply_markup"], menu.root_open_keyboard())
+
+    def test_help_includes_menu_button(self):
+        from wheelsparser import menu
+        with patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/help")
+        self.assertEqual(send.call_args.kwargs["reply_markup"], menu.root_open_keyboard())
+
+
 if __name__ == "__main__":
     unittest.main()

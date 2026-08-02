@@ -15,7 +15,7 @@ from typing import Any
 
 import requests
 
-from . import db, registry
+from . import db, menu, registry
 from .active_report import fire_active_check, lookup_active_number
 from .config import (
     ACTIVE_MAX_AGE_HOURS,
@@ -46,6 +46,7 @@ from .urls import normalize_url
 
 BOT_COMMANDS = [
     {"command": "start", "description": "О боте"},
+    {"command": "menu", "description": "Меню управления кнопками"},
     {"command": "wheels", "description": f"Колёса за последние {WHEELS_WINDOW_MINUTES} мин"},
     {"command": "active", "description": "Живые колёса за сегодня (сброс в 00:00 МСК)"},
     {"command": "removewheel", "description": "Убрать колесо по номеру из /active: /removewheel 2"},
@@ -99,6 +100,7 @@ def check_channel_preview(channel: str) -> str:
 def help_text() -> str:
     return (
         "<b>Команды:</b>\n"
+        "/menu — то же самое, но кнопками\n"
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
         "/active — живые колёса за сегодня (сброс в 00:00 МСК)\n"
         "/removewheel номер — убрать колесо из /active до конца суток\n"
@@ -227,11 +229,16 @@ def cmd_start(chat_id: str, _argument: str) -> None:
         "/active — живые колёса за сегодня\n"
         "/status — статистика находок\n\n"
         "Полный список команд — /help",
+        reply_markup=menu.root_open_keyboard(),
     )
 
 
 def cmd_help(chat_id: str, _argument: str) -> None:
-    bot_send(chat_id, help_text())
+    bot_send(chat_id, help_text(), reply_markup=menu.root_open_keyboard())
+
+
+def cmd_menu(chat_id: str, _argument: str) -> None:
+    bot_send(chat_id, menu.root_text(), reply_markup=menu.root_menu_keyboard())
 
 
 def cmd_status(chat_id: str, _argument: str) -> None:
@@ -562,6 +569,7 @@ def cmd_remove(chat_id: str, argument: str) -> None:
 
 COMMAND_HANDLERS: dict[str, Callable[[str, str], None]] = {
     "/start": cmd_start,
+    "/menu": cmd_menu,
     "/help": cmd_help,
     "/status": cmd_status,
     "/top": cmd_top,
