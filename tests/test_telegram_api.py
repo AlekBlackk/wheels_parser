@@ -375,5 +375,41 @@ class EditMessageTextTests(unittest.TestCase):
         warn.assert_called_once()
 
 
+class AnswerCallbackQueryTests(unittest.TestCase):
+    def test_sends_callback_id_and_text(self):
+        session = fake_session()
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.answer_callback_query("cb1", "Готово")
+        payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["callback_query_id"], "cb1")
+        self.assertEqual(payload["text"], "Готово")
+        self.assertNotIn("show_alert", payload)
+        session.post.assert_called_once_with(
+            f"{telegram_api.BOT_API}/answerCallbackQuery",
+            json=payload,
+            timeout=telegram_api.REQUEST_TIMEOUT,
+        )
+
+    def test_omits_text_when_empty(self):
+        session = fake_session()
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.answer_callback_query("cb1")
+        self.assertNotIn("text", session.post.call_args.kwargs["json"])
+
+    def test_show_alert_flag_is_included_when_true(self):
+        session = fake_session()
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.answer_callback_query("cb1", "Ошибка", show_alert=True)
+        self.assertTrue(session.post.call_args.kwargs["json"]["show_alert"])
+
+    def test_failure_is_logged_not_raised(self):
+        session = Mock()
+        session.post.side_effect = requests.ConnectionError("boom")
+        with patch.object(telegram_api, "BOT_SESSION", session), \
+             patch.object(telegram_api.log, "warning") as warn:
+            telegram_api.answer_callback_query("cb1")
+        warn.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

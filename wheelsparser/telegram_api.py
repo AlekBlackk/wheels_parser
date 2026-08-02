@@ -302,6 +302,27 @@ def edit_message_text(
         )
 
 
+def answer_callback_query(
+    callback_id: str, text: str = "", show_alert: bool = False
+) -> None:
+    """Закрывает «крутилку» на нажатой inline-кнопке.
+
+    Вызывать на каждом обработанном callback'е — иначе кнопка у
+    пользователя «крутится» до тайм-аута Telegram.
+    """
+    payload: dict[str, Any] = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
+    try:
+        BOT_SESSION.post(
+            f"{BOT_API}/answerCallbackQuery", json=payload, timeout=REQUEST_TIMEOUT
+        ).raise_for_status()
+    except requests.RequestException as error:
+        log.warning("Бот: не удалось ответить на callback %s: %s", callback_id, error)
+
+
 def background_bot_send(
     chat_id: str, text: str, reply_markup: dict[str, Any] | None = None
 ) -> None:
