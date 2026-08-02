@@ -44,6 +44,19 @@ class NormalizeUrlTests(unittest.TestCase):
             urls.normalize_url("https://betboom.ru/freestream/demo"),
         )
 
+    def test_http_scheme_normalizes_to_https(self):
+        # Telegram кладёт в href схему http, а видимый текст той же ссылки —
+        # без схемы (достраивается выше до https). Без унификации одна и та
+        # же ссылка поста давала бы два разных канонических URL: список
+        # ссылок поста «плыл», хэш содержимого менялся, и правка поста
+        # определялась ложно (регресс: 4 старых поста в @whylollybet разом
+        # посчитались отредактированными и ушли повторно). API BetBoom к
+        # тому же не отвечает на http-вариант — он молча уходил в unknown.
+        self.assertEqual(
+            urls.normalize_url("http://betboom.ru/freestream/demo"),
+            "https://betboom.ru/freestream/demo",
+        )
+
     def test_legacy_normalization_keeps_query(self):
         self.assertEqual(
             urls.legacy_normalize_url(
@@ -96,6 +109,24 @@ class FindUrlsTests(unittest.TestCase):
         self.assertEqual(
             urls.find_urls(html, "Го колесо betboom.ru/freestream/demo налетай"),
             ["https://betboom.ru/freestream/demo"],
+        )
+
+    def test_dedups_when_href_scheme_differs_from_bare_text_mention(self):
+        # Реальный кейс @whylollybet: <a href="http://...">betboom.ru/...</a>
+        # — href со схемой http, видимый текст ссылки без схемы вовсе.
+        # Раньше это давало ДВЕ ссылки (http из href, https из текста) —
+        # список urls поста менялся при каждом деплое, ложно засчитываясь
+        # правкой поста (см. urls.normalize_url).
+        html = BeautifulSoup(
+            '<div><a href="http://betboom.ru/freestream/LOLLY08">'
+            "betboom.ru/freestream/LOLLY08</a><br/>за полчасика до матча</div>",
+            "html.parser",
+        )
+        text = html.get_text(" ", strip=True)
+
+        self.assertEqual(
+            urls.find_urls(html, text),
+            ["https://betboom.ru/freestream/LOLLY08"],
         )
 
     def test_ignores_lookalike_host_without_scheme(self):

@@ -33,12 +33,21 @@ def normalize_url(url: str) -> str:
     принял бы весь адрес за path, а не netloc, и один и тот же URL из
     разных источников (Telegram/Twitch) перестал бы быть одной канонической
     строкой — сломались бы дедупликация, кулдаун и expired-кэш.
+    Схема всегда приводится к https, даже если во входном URL указан http:
+    Telegram нередко кладёт в href схему http (а в видимом тексте ссылки
+    схемы вовсе нет — она достраивается выше), и без унификации один и тот
+    же пост давал бы ДВЕ разные «канонические» ссылки (http из href и https
+    из текста) — список ссылок поста менялся, хэш содержимого «плыл», и
+    правка поста определялась ложно (см. регресс после введения
+    schemeless-матчинга: 4 старых поста в @whylollybet разом посчитались
+    отредактированными). API BetBoom к тому же отвечает только на https —
+    http-вариант молча уходил в 'unknown' и рассылался fail-open.
     """
     cleaned = html.unescape(str(url)).strip().rstrip(TRAILING_PUNCTUATION)
     if cleaned and not _SCHEME_RE.match(cleaned):
         cleaned = f"https://{cleaned}"
     parts = urlsplit(cleaned)
-    scheme = parts.scheme.lower()
+    scheme = "https" if parts.scheme.lower() in ("http", "https") else parts.scheme.lower()
     netloc = parts.netloc.lower()
     if netloc == "www.betboom.ru":
         netloc = "betboom.ru"
