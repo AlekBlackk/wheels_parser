@@ -306,5 +306,27 @@ class DeliveryUnknownTests(unittest.TestCase):
         self.assertTrue(all(entry["delivery_unknown"] for entry in entries))
 
 
+class ReplyMarkupTests(unittest.TestCase):
+    def test_bot_send_includes_reply_markup_when_given(self):
+        session = fake_session()
+        keyboard = {"inline_keyboard": [[{"text": "Меню", "callback_data": "m:root"}]]}
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.bot_send("1", "text", reply_markup=keyboard)
+        self.assertEqual(session.post.call_args.kwargs["json"]["reply_markup"], keyboard)
+
+    def test_bot_send_omits_reply_markup_when_not_given(self):
+        session = fake_session()
+        with patch.object(telegram_api, "BOT_SESSION", session):
+            telegram_api.bot_send("1", "text")
+        self.assertNotIn("reply_markup", session.post.call_args.kwargs["json"])
+
+    def test_background_bot_send_includes_reply_markup(self):
+        session = fake_session()
+        keyboard = {"inline_keyboard": [[{"text": "x", "callback_data": "y"}]]}
+        with patch.object(telegram_api, "ACTIVE_CHECK_SESSION", session):
+            telegram_api.background_bot_send("1", "text", reply_markup=keyboard)
+        self.assertEqual(session.post.call_args.kwargs["json"]["reply_markup"], keyboard)
+
+
 if __name__ == "__main__":
     unittest.main()

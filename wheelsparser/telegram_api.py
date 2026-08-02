@@ -84,6 +84,7 @@ def _post_message(
     chat_id: str,
     text: str,
     parse_mode: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
 ) -> requests.Response:
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -92,6 +93,8 @@ def _post_message(
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     return session.post(
         f"{BOT_API}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT
     )
@@ -249,22 +252,32 @@ def send_service_notification(
         return False
 
 
-def bot_send(chat_id: str, text: str) -> None:
+def bot_send(
+    chat_id: str, text: str, reply_markup: dict[str, Any] | None = None
+) -> None:
     """Ответ на команду — только из потока бота (BOT_SESSION)."""
     try:
-        _post_message(BOT_SESSION, chat_id, text, parse_mode="HTML").raise_for_status()
+        _post_message(
+            BOT_SESSION, chat_id, text, parse_mode="HTML", reply_markup=reply_markup
+        ).raise_for_status()
     except requests.RequestException as error:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
 
 
-def background_bot_send(chat_id: str, text: str) -> None:
+def background_bot_send(
+    chat_id: str, text: str, reply_markup: dict[str, Any] | None = None
+) -> None:
     """Ответ из фонового потока active-api (ACTIVE_CHECK_SESSION).
 
     Отдельная сессия нужна, чтобы не делить BOT_SESSION между потоками.
     """
     try:
         _post_message(
-            ACTIVE_CHECK_SESSION, chat_id, text, parse_mode="HTML"
+            ACTIVE_CHECK_SESSION,
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
         ).raise_for_status()
     except requests.RequestException as error:
         log.warning("Бот: не удалось ответить в чат %s: %s", chat_id, error)
