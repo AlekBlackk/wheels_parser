@@ -256,6 +256,20 @@ class RemoveWordCallbackTests(unittest.TestCase):
         menu.forget_deletions()
         self.addCleanup(menu.forget_deletions)
 
+    def test_non_integer_index_answers_callback_instead_of_hanging(self):
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "wd:rm:abc")
+
+            self.assertTrue(handled)
+            answer.assert_called_once()
+            self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+            edit.assert_not_called()
+            save.assert_not_called()
+            self.assertEqual(registry.KEYWORDS, ["колесо"])
+
     def test_removes_word_by_index_and_offers_undo(self):
         with patch.object(registry, "KEYWORDS", ["колесо", "фрибет"]), \
              patch.object(registry, "save_keywords_file") as save, \

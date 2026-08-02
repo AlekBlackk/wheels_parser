@@ -315,6 +315,7 @@ def _cb_remove_word(chat_id: str, message_id: int, callback_id: str, raw_index: 
     try:
         index = int(raw_index)
     except ValueError:
+        answer_callback_query(callback_id, "Некорректный номер", show_alert=True)
         return
     with registry.KEYWORDS_LOCK:
         if index < 0 or index >= len(registry.KEYWORDS):
