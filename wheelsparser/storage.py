@@ -206,6 +206,24 @@ def mark_wheel_removed(url: str) -> bool:
     return True
 
 
+def unmark_wheel_removed(url: str) -> bool:
+    """Снимает пометку ручного удаления колеса (отмена /removewheel).
+
+    Возвращает True, если колесо было отмечено удалённым сегодня и
+    пометка снята, и False, если снимать было нечего.
+    """
+    today = today_msk()
+    with REMOVED_WHEELS_LOCK:
+        _prune_removed_wheels_locked(today)
+        removed = _removed_wheels_locked()
+        if url not in removed:
+            return False
+        del removed[url]
+        snapshot = dict(removed)
+    atomic_write_json(REMOVED_WHEELS_FILE, snapshot)
+    return True
+
+
 # ----------------------------------------------------------------------------
 # Offset Telegram-бота (bot_state.json)
 # ----------------------------------------------------------------------------

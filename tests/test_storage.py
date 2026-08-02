@@ -169,6 +169,14 @@ class RemovedWheelsTests(TempDirTestCase):
         with patch.object(storage, "today_msk", return_value="2026-07-30"):
             self.assertEqual(storage.removed_wheels_today(), {"https://x/new"})
 
+    def test_unmark_wheel_removed_restores_and_reports(self):
+        with patch.object(storage, "today_msk", return_value="2026-07-30"):
+            storage.mark_wheel_removed("https://x/one")
+            self.assertTrue(storage.unmark_wheel_removed("https://x/one"))
+            self.assertEqual(storage.removed_wheels_today(), set())
+            self.assertFalse(storage.unmark_wheel_removed("https://x/one"))
+        self.assertEqual(json.loads(self.file.read_text(encoding="utf-8")), {})
+
 
 class PendingExpiredStateTests(TempDirTestCase):
     """pending_expired.json — единственный способ пережить рестарт для
