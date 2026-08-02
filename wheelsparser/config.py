@@ -193,9 +193,19 @@ STREAMER_WHEEL_INFO_API = "https://betboom.ru/api/streamer-wheel/action/get-info
 # независимо от источника). (?<![\w.-]) — граница перед доменом: без неё
 # опциональная схема заставила бы findall() матчить и «хвост» чужого имени
 # («evilbetboom.ru/freestream/x» → ложно распознавался бы как betboom.ru).
+# Символьный класс пути включает ':' и '/' (нужны для query/fragment), из-за
+# чего без стоп-условия regex проглатывал склеенные без пробела повторы
+# ссылки («...kekw1https://betboom.ru/freestream/kekw1...» — зрители так
+# постят, чтобы обойти анти-дубль фильтр Twitch) в один гигантский match.
+# Он каждый раз рос новой длины и не совпадал с предыдущим по строке, поэтому
+# кулдаун в alerts.cooldown_active (ключ — точная строка url) не срабатывал,
+# и одно и то же колесо уходило в Telegram по несколько раз подряд.
+# Негативный lookahead останавливает жадный класс перед началом следующей
+# ссылки на betboom.ru/freestream/.
 FREESTREAM_RE = re.compile(
     r"(?<![\w.-])(?:https?://)?(?:www\.)?betboom\.ru/freestream/"
-    r"[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-]+",
+    r"(?:(?!(?:https?://)?(?:www\.)?betboom\.ru/freestream/)"
+    r"[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-])+",
     re.IGNORECASE,
 )
 TRAILING_PUNCTUATION = ".,;:!?)]}>'\""

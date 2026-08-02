@@ -187,6 +187,22 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(len(self.queued()), 1)
         self.notify.assert_called_once()
 
+    def test_pasted_repeat_without_separator_is_notified_once(self):
+        # Зрители/стример иногда вставляют ссылку слитно несколько раз подряд
+        # без пробела, чтобы обойти анти-дубль фильтр Twitch. Раньше жадный
+        # FREESTREAM_RE склеивал такие повторы в один гигантский match,
+        # который каждый раз был новой строкой и не совпадал по кулдауну —
+        # уведомление уходило заново на каждое сообщение (4 раза подряд в
+        # реальном инциденте).
+        twitch.handle_twitch_message("demo", "nightbot", {}, WHEEL)
+        twitch.handle_twitch_message("demo", "nightbot", {}, WHEEL * 2)
+        twitch.handle_twitch_message("demo", "nightbot", {}, WHEEL * 4)
+
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], WHEEL)
+        self.notify.assert_called_once()
+
     def test_cooldown_skip_is_logged_for_diagnostics(self):
         # Раньше подавление кулдауном было немым continue — диагностировать
         # «почему не пришло» было неоткуда.
