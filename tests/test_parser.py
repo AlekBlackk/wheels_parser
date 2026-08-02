@@ -226,6 +226,25 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertEqual(info["channel"], "demo")
         self.assertEqual(info["msg_id"], "demo/1")
 
+    def test_soon_wheel_is_not_notified(self):
+        # Розыгрыш ещё не начался — уведомлять рано (пользователь получил
+        # бы ссылку, по которой нечего делать).
+        message = make_message("demo/1", "колесо", ["https://betboom.ru/freestream/a"])
+        with patch.object(parser, "precheck_wheel", return_value=("soon", False, "")):
+            self.assertEqual(self.process(message, {}), [])
+        self.single.assert_not_called()
+
+    def test_soon_wheel_is_registered_for_retry(self):
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        with patch.object(parser, "precheck_wheel", return_value=("soon", False, "")):
+            self.process(message, {})
+
+        self.assertIn(url, parser.PENDING_EXPIRED_RETRY)
+        info = parser.PENDING_EXPIRED_RETRY[url]
+        self.assertEqual(info["channel"], "demo")
+        self.assertEqual(info["msg_id"], "demo/1")
+
     def test_cooldown_skip_is_logged_for_diagnostics(self):
         # Раньше подавление кулдауном было немым continue: перезапуск
         # колеса на том же URL внутри REALERT_COOLDOWN_MINUTES проходил
@@ -404,6 +423,32 @@ class RetryExpiredLinksTests(unittest.TestCase):
         self._seed()
         with patch.object(
             parser, "precheck_wheel", return_value=("expired", False, "")
+        ), patch.object(parser, "send_telegram_notification") as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(entries, [])
+        send.assert_not_called()
+        self.assertIn(self.url, parser.PENDING_EXPIRED_RETRY)
+
+    def test_wheel_recovered_from_soon_is_notified(self):
+        self._seed()
+        with patch.object(
+            parser, "precheck_wheel", return_value=("active", False, "")
+        ), patch.object(
+            parser, "send_telegram_notification", return_value=True
+        ) as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], "active")
+        self.assertTrue(entries[0]["notified"])
+        send.assert_called_once()
+        self.assertNotIn(self.url, parser.PENDING_EXPIRED_RETRY)
+
+    def test_still_soon_wheel_stays_registered_without_notifying(self):
+        self._seed()
+        with patch.object(
+            parser, "precheck_wheel", return_value=("soon", False, "")
         ), patch.object(parser, "send_telegram_notification") as send:
             entries = parser.retry_expired_links(self.now, {})
 

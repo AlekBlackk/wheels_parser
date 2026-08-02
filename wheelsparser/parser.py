@@ -564,7 +564,7 @@ def _drop_pending_expired(url: str) -> None:
 def retry_expired_links(
     now: datetime, last_found: dict[str, datetime]
 ) -> list[dict[str, Any]]:
-    """Перепроверяет ссылки, ранее пропущенные как expired (см. PENDING_EXPIRED_RETRY).
+    """Перепроверяет ссылки, ранее пропущенные как expired/soon (см. PENDING_EXPIRED_RETRY).
 
     Окно ограничено так же, как у retry_failed_notifications
     (NOTIFY_RETRY_WINDOW_MINUTES): дольше ждать бессмысленно — колесо либо
@@ -607,8 +607,8 @@ def retry_expired_links(
         status, referral, ends_at = precheck_wheel(
             url, post_text=info["post_text"], use_cache=False
         )
-        if status == "expired":
-            continue  # всё ещё завершено — ждём следующего цикла
+        if status in ("expired", "soon"):
+            continue  # всё ещё завершено или ещё не началось — ждём следующего цикла
         _drop_pending_expired(url)
         entry = {
             "url": url,
@@ -683,30 +683,34 @@ def collect_pending_entries(
             continue  # недавно уже оповещали об этом колесе
         # Проверяем колесо через API BetBoom до отправки: «хвосты» —
         # старые href на прошлые (уже завершившиеся) колёса — молча
-        # пропускаем. Статусы 'active'/'soon'/'unknown' рассылаются,
-        # unknown — fail-open, чтобы не терять живые колёса при сбое API.
+        # пропускаем. Рассылаются только 'active' и 'unknown' (fail-open,
+        # чтобы не терять живые колёса при сбое API). 'soon' — розыгрыш ещё
+        # не начался, уведомлять о нём рано: пользователь получал бы ссылку,
+        # по которой нечего делать, и путал бы её с активным колесом.
         if PRECHECK_WHEELS:
             status, referral, ends_at = precheck_wheel(url, post_text=post_text)
         else:
             status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
-        if status == "expired":
+        if status in ("expired", "soon"):
             log.info(
-                "%s Пропускаю %s [@%s]: колесо уже завершилось (API BetBoom)",
+                "%s Пропускаю %s [@%s]: %s (API BetBoom)",
                 icon("warn"),
                 url,
                 channel,
+                "колесо уже завершилось" if status == "expired" else "розыгрыш ещё не начался",
             )
             # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
             # мы ничего не оповестили, и если колесо перезапустят на том
             # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
             # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
             # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
-            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES).
+            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES,
+            # и относится только к expired — soon в нём не кэшируется).
             # Сообщение уже будет помечено «увиденным» (см. process_message),
             # и обычная правка поста больше не перепроверит эту ссылку —
             # регистрируем её на ретрай (см. retry_expired_links): ошибочный
-            # is_ended или неверно посчитанный duration_min иначе терял бы
-            # находку навсегда.
+            # is_ended/duration_min или ранний репост до старта розыгрыша
+            # иначе терял бы находку навсегда.
             _register_pending_expired(url, channel, message, post_text, now)
             continue
         pending.append({

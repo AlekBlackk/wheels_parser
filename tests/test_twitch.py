@@ -148,6 +148,36 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.notify.assert_called_once()
 
+    def test_soon_wheel_is_not_notified_and_does_not_start_cooldown(self):
+        # Розыгрыш ещё не начался — уведомлять рано, иначе бот шлёт ссылку,
+        # по которой нечего делать. Кулдаун не ставим по той же причине, что
+        # и для expired: это отказ слать, а не отправка.
+        with patch.object(twitch, "precheck_wheel", return_value=("soon", False, "")):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+            )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+        self.assertIsNone(alerts.last_alert(WHEEL))
+
+    def test_wheel_starting_later_is_notified_once_active(self):
+        with patch.object(twitch, "precheck_wheel", return_value=("soon", False, "")):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+            )
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+
+        # setUp мокает precheck_wheel обратно на "active": розыгрыш начался.
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+        )
+
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.notify.assert_called_once()
+
     def test_repeated_link_within_cooldown_is_sent_once(self):
         for _ in range(2):
             twitch.handle_twitch_message(

@@ -145,19 +145,25 @@ def handle_twitch_message(
             )
         else:
             status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
-        if status == "expired":
+        if status in ("expired", "soon"):
             log.info(
-                "%s Пропускаю %s [twitch #%s]: колесо уже завершилось (API BetBoom)",
+                "%s Пропускаю %s [twitch #%s]: %s (API BetBoom)",
                 icon("warn"),
                 url,
                 channel,
+                "колесо уже завершилось" if status == "expired" else "розыгрыш ещё не начался",
             )
             # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
             # мы ничего не оповестили, и если колесо перезапустят на том
             # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
             # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
             # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
-            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES).
+            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES,
+            # и относится только к expired). Персистентного ретрая тут нет
+            # (см. parser.PENDING_EXPIRED_RETRY для Telegram) — сообщение из
+            # чата Twitch не «правится» повторно, поэтому колесо, ставшее
+            # active позже, попадёт в уведомления только по новому сообщению
+            # в чате (тот же зазор, что уже был для expired).
             continue
         entry = {
             "url": url,
