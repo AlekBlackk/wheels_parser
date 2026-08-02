@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from . import registry
 from .config import icon
+from .telegram_api import answer_callback_query, edit_message_text
 
 BACK_BUTTON = {"text": "← Назад", "callback_data": "m:root"}
 
@@ -167,3 +169,64 @@ def _with_undo(keyboard: dict[str, Any], undo_callback: str) -> dict[str, Any]:
     else:
         rows.append(undo_row)
     return _kb(rows)
+
+
+# ----------------------------------------------------------------------------
+# Навигация
+# ----------------------------------------------------------------------------
+
+def _cb_root(chat_id: str, message_id: int, callback_id: str) -> None:
+    answer_callback_query(callback_id)
+    edit_message_text(chat_id, message_id, root_text(), root_menu_keyboard())
+
+
+def _cb_wheels_section(chat_id: str, message_id: int, callback_id: str) -> None:
+    answer_callback_query(callback_id)
+    edit_message_text(chat_id, message_id, wheels_section_text(), wheels_section_keyboard())
+
+
+def _cb_channels_section(chat_id: str, message_id: int, callback_id: str) -> None:
+    answer_callback_query(callback_id)
+    edit_message_text(chat_id, message_id, channels_section_text(), channels_list_keyboard())
+
+
+def _cb_twitch_section(chat_id: str, message_id: int, callback_id: str) -> None:
+    answer_callback_query(callback_id)
+    edit_message_text(chat_id, message_id, twitch_section_text(), twitch_list_keyboard())
+
+
+def _cb_words_section(chat_id: str, message_id: int, callback_id: str) -> None:
+    answer_callback_query(callback_id)
+    edit_message_text(chat_id, message_id, words_section_text(), words_list_keyboard())
+
+
+# ----------------------------------------------------------------------------
+# Роутинг
+# ----------------------------------------------------------------------------
+
+_STATIC_HANDLERS: dict[str, Callable[[str, int, str], None]] = {
+    "m:root": _cb_root,
+    "m:wheels": _cb_wheels_section,
+    "m:channels": _cb_channels_section,
+    "m:twitch": _cb_twitch_section,
+    "m:words": _cb_words_section,
+}
+
+_PREFIX_HANDLERS: dict[str, Callable[[str, int, str, str], None]] = {}
+
+
+def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) -> bool:
+    """Обрабатывает callback меню. Возвращает True, если данные распознаны.
+
+    False означает «не мой callback» — bot.py пробует свои обработчики
+    (m:do_wheels и т.п.) перед тем, как молча проигнорировать.
+    """
+    handler = _STATIC_HANDLERS.get(data)
+    if handler is not None:
+        handler(chat_id, message_id, callback_id)
+        return True
+    for prefix, prefix_handler in _PREFIX_HANDLERS.items():
+        if data.startswith(prefix):
+            prefix_handler(chat_id, message_id, callback_id, data[len(prefix):])
+            return True
+    return False

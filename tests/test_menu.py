@@ -136,5 +136,32 @@ class WithUndoTests(unittest.TestCase):
         self.assertEqual(rows[2][0], menu.BACK_BUTTON)
 
 
+class NavigationCallbackTests(unittest.TestCase):
+    def test_m_root_edits_message_and_answers(self):
+        with patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "m:root")
+        self.assertTrue(handled)
+        answer.assert_called_once_with("cb1")
+        edit.assert_called_once_with("1", 55, menu.root_text(), menu.root_menu_keyboard())
+
+    def test_m_channels_shows_channel_list(self):
+        with patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "m:channels")
+            edit.assert_called_once_with(
+                "1", 55, menu.channels_section_text(), menu.channels_list_keyboard()
+            )
+
+    def test_unknown_callback_is_not_handled_and_stays_silent(self):
+        with patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "m:do_wheels")
+        self.assertFalse(handled)
+        edit.assert_not_called()
+        answer.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
