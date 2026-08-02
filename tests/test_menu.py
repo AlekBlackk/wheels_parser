@@ -163,5 +163,93 @@ class NavigationCallbackTests(unittest.TestCase):
         answer.assert_not_called()
 
 
+class RemoveChannelCallbackTests(unittest.TestCase):
+    def setUp(self):
+        menu.forget_deletions()
+        self.addCleanup(menu.forget_deletions)
+
+    def test_removes_channel_saves_and_offers_undo(self):
+        with patch.object(registry, "CHANNELS", ["demo", "other"]), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "ch:rm:demo")
+
+            self.assertTrue(handled)
+            self.assertEqual(registry.CHANNELS, ["other"])
+            save.assert_called_once_with()
+            answer.assert_called_once()
+            self.assertIn("demo", answer.call_args.args[1])
+            edited_keyboard = edit.call_args.args[3]
+            callbacks = [b["callback_data"] for row in edited_keyboard["inline_keyboard"] for b in row]
+            self.assertIn("undo:channel", callbacks)
+            self.assertEqual(menu.pop_deletion("channel"), "demo")
+
+    def test_removing_already_gone_channel_does_not_touch_undo_slot(self):
+        with patch.object(registry, "CHANNELS", ["other"]), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "ch:rm:demo")
+        save.assert_not_called()
+        self.assertIsNone(menu.pop_deletion("channel"))
+
+    def test_undo_channel_restores_and_saves(self):
+        menu.remember_deletion("channel", "demo")
+        with patch.object(registry, "CHANNELS", ["other"]), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "undo:channel")
+
+            self.assertTrue(handled)
+            self.assertIn("demo", registry.CHANNELS)
+            save.assert_called_once_with()
+            self.assertIn("demo", answer.call_args.args[1])
+
+    def test_undo_channel_after_window_shows_alert_and_does_not_restore(self):
+        with patch.object(registry, "CHANNELS", []), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query") as answer:
+            menu.handle_callback("1", 55, "cb1", "undo:channel")
+
+            save.assert_not_called()
+            self.assertEqual(registry.CHANNELS, [])
+            self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+
+
+class RemoveTwitchCallbackTests(unittest.TestCase):
+    def setUp(self):
+        menu.forget_deletions()
+        self.addCleanup(menu.forget_deletions)
+        registry.TWITCH_RELOAD.clear()
+        self.addCleanup(registry.TWITCH_RELOAD.clear)
+
+    def test_removes_twitch_channel_signals_reload_and_offers_undo(self):
+        with patch.object(registry, "TWITCH_CHANNELS", ["streamer"]), \
+             patch.object(registry, "save_twitch_channels_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "tw:rm:streamer")
+
+            self.assertEqual(registry.TWITCH_CHANNELS, [])
+            save.assert_called_once_with()
+            self.assertTrue(registry.TWITCH_RELOAD.is_set())
+            self.assertEqual(menu.pop_deletion("twitch"), "streamer")
+
+    def test_undo_twitch_restores_and_signals_reload(self):
+        menu.remember_deletion("twitch", "streamer")
+        with patch.object(registry, "TWITCH_CHANNELS", []), \
+             patch.object(registry, "save_twitch_channels_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "undo:twitch")
+
+            self.assertEqual(registry.TWITCH_CHANNELS, ["streamer"])
+            save.assert_called_once_with()
+            self.assertTrue(registry.TWITCH_RELOAD.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -230,3 +230,77 @@ def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) 
             prefix_handler(chat_id, message_id, callback_id, data[len(prefix):])
             return True
     return False
+
+
+# ----------------------------------------------------------------------------
+# Удаление / восстановление Telegram- и Twitch-каналов
+# ----------------------------------------------------------------------------
+
+def _cb_remove_channel(chat_id: str, message_id: int, callback_id: str, channel: str) -> None:
+    with registry.CHANNELS_LOCK:
+        if channel not in registry.CHANNELS:
+            answer_callback_query(callback_id, "Уже удалён")
+            edit_message_text(chat_id, message_id, channels_section_text(), channels_list_keyboard())
+            return
+        registry.CHANNELS.remove(channel)
+        registry.save_channels_file()
+    remember_deletion("channel", channel)
+    answer_callback_query(callback_id, f"@{channel} удалён")
+    edit_message_text(
+        chat_id, message_id, channels_section_text(),
+        _with_undo(channels_list_keyboard(), "undo:channel"),
+    )
+
+
+def _cb_undo_channel(chat_id: str, message_id: int, callback_id: str) -> None:
+    channel = pop_deletion("channel")
+    if channel is None:
+        answer_callback_query(
+            callback_id, "Время отмены истекло. Добавьте: /add @channel", show_alert=True
+        )
+        return
+    with registry.CHANNELS_LOCK:
+        if channel not in registry.CHANNELS:
+            registry.CHANNELS.append(channel)
+            registry.save_channels_file()
+    answer_callback_query(callback_id, f"@{channel} восстановлен")
+    edit_message_text(chat_id, message_id, channels_section_text(), channels_list_keyboard())
+
+
+def _cb_remove_twitch(chat_id: str, message_id: int, callback_id: str, channel: str) -> None:
+    with registry.TWITCH_CHANNELS_LOCK:
+        if channel not in registry.TWITCH_CHANNELS:
+            answer_callback_query(callback_id, "Уже удалён")
+            edit_message_text(chat_id, message_id, twitch_section_text(), twitch_list_keyboard())
+            return
+        registry.TWITCH_CHANNELS.remove(channel)
+        registry.save_twitch_channels_file()
+    registry.TWITCH_RELOAD.set()
+    remember_deletion("twitch", channel)
+    answer_callback_query(callback_id, f"twitch.tv/{channel} удалён")
+    edit_message_text(
+        chat_id, message_id, twitch_section_text(),
+        _with_undo(twitch_list_keyboard(), "undo:twitch"),
+    )
+
+
+def _cb_undo_twitch(chat_id: str, message_id: int, callback_id: str) -> None:
+    channel = pop_deletion("twitch")
+    if channel is None:
+        answer_callback_query(
+            callback_id, "Время отмены истекло. Добавьте: /addtwitch channel", show_alert=True
+        )
+        return
+    with registry.TWITCH_CHANNELS_LOCK:
+        if channel not in registry.TWITCH_CHANNELS:
+            registry.TWITCH_CHANNELS.append(channel)
+            registry.save_twitch_channels_file()
+    registry.TWITCH_RELOAD.set()
+    answer_callback_query(callback_id, f"twitch.tv/{channel} восстановлен")
+    edit_message_text(chat_id, message_id, twitch_section_text(), twitch_list_keyboard())
+
+
+_STATIC_HANDLERS["undo:channel"] = _cb_undo_channel
+_STATIC_HANDLERS["undo:twitch"] = _cb_undo_twitch
+_PREFIX_HANDLERS["ch:rm:"] = _cb_remove_channel
+_PREFIX_HANDLERS["tw:rm:"] = _cb_remove_twitch
