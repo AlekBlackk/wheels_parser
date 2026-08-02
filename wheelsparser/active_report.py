@@ -70,16 +70,24 @@ def format_active_item(item: dict[str, Any], number: int) -> str:
     )
 
 
+_MENU_BUTTON_ROW = [{"text": "☰ Меню", "callback_data": "m:root"}]
+
+
+def _menu_only_keyboard() -> dict[str, Any]:
+    return {"inline_keyboard": [_MENU_BUTTON_ROW]}
+
+
 def _removal_keyboard(numbered: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
     """Клавиатура ❌ под /active: не через menu.py — тот импортирует этот
     модуль (lookup_active_number), обратный импорт создал бы цикл.
+    Последней строкой всегда идёт кнопка «☰ Меню».
     """
-    return {
-        "inline_keyboard": [
-            [{"text": f"❌ {number}", "callback_data": f"rmw:{number}"}]
-            for number, _item in numbered
-        ]
-    }
+    rows = [
+        [{"text": f"❌ {number}", "callback_data": f"rmw:{number}"}]
+        for number, _item in numbered
+    ]
+    rows.append(_MENU_BUTTON_ROW)
+    return {"inline_keyboard": rows}
 
 
 def format_active_result(
@@ -100,7 +108,7 @@ def format_active_result(
             f"{icon('warn')} Не удалось проверить колёса через API BetBoom. "
             "Это ошибка проверки, а не «активных нет» — "
             "подробности в parser.log.",
-            None,
+            _menu_only_keyboard(),
         )
     # Все колёса вернули unknown — скорее всего сетевая ошибка.
     if not active_items and unknown_count > 0 and unknown_count == total:
@@ -108,7 +116,7 @@ def format_active_result(
             f"{icon('warn')} Не удалось определить статус {total} колёс "
             "(API не ответил).\n"
             "Попробуйте /active ещё раз через несколько секунд.",
-            None,
+            _menu_only_keyboard(),
         )
     suffix = (
         f"\n⚠️ {unknown_count} колёс не удалось проверить (таймаут) — "
@@ -122,7 +130,7 @@ def format_active_result(
             f"{icon('warn')} Среди {total} колёс за сегодня "
             "активных не найдено.\n"
             f"Все розыгрыши уже завершились или ещё не начались.{suffix}",
-            None,
+            _menu_only_keyboard(),
         )
     lines = [
         f"{icon('link')} <b>Активные колёса ({len(active_items)} из "
@@ -147,7 +155,11 @@ def fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
     if not _active_check_lock.acquire(blocking=False):
-        bot_send(chat_id, f"{icon('warn')} Проверка уже выполняется, подождите…")
+        bot_send(
+            chat_id,
+            f"{icon('warn')} Проверка уже выполняется, подождите…",
+            reply_markup=_menu_only_keyboard(),
+        )
         return
 
     total = len(unique_items)

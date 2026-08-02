@@ -247,7 +247,7 @@ def cmd_menu(chat_id: str, _argument: str) -> None:
 
 
 def cmd_status(chat_id: str, _argument: str) -> None:
-    bot_send(chat_id, status_text())
+    bot_send(chat_id, status_text(), reply_markup=menu.root_open_keyboard())
 
 
 def cmd_top(chat_id: str, argument: str) -> None:
@@ -257,12 +257,13 @@ def cmd_top(chat_id: str, argument: str) -> None:
             chat_id,
             "Укажите период в днях: <code>/top 7</code> "
             f"(без аргумента — за {TOP_PERIOD_DAYS} дн.)",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     # Верхняя граница — чтобы «/top 100000» не выглядел осмысленным
     # периодом: истории всё равно не больше MAX_RESULTS записей.
     days = min(max(int(raw), 1), 365) if raw else TOP_PERIOD_DAYS
-    bot_send(chat_id, top_text(days))
+    bot_send(chat_id, top_text(days), reply_markup=menu.root_open_keyboard())
 
 
 def cmd_wheels(chat_id: str, _argument: str) -> None:
@@ -272,6 +273,7 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
             chat_id,
             f"За последние {WHEELS_WINDOW_MINUTES} минут новых колёс не найдено. "
             "Как только появится ссылка — пришлю её сразу.",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     lines = [f"{icon('link')} <b>Колёса за последние {WHEELS_WINDOW_MINUTES} минут:</b>"]
@@ -301,6 +303,7 @@ def cmd_active(chat_id: str, _argument: str) -> None:
             chat_id,
             f"За последние {ACTIVE_MAX_AGE_HOURS} часов колёс не найдено. "
             "Как только появится ссылка — пришлю её сразу.",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     # Fire-and-forget: поток бота не блокируется.
@@ -309,6 +312,7 @@ def cmd_active(chat_id: str, _argument: str) -> None:
         chat_id,
         f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
         " Результат пришлю отдельным сообщением.",
+        reply_markup=menu.root_open_keyboard(),
     )
     fire_active_check(chat_id, unique_items)
 
@@ -332,6 +336,7 @@ def _resolve_wheel_to_remove(chat_id: str, raw: str) -> str | None:
             bot_send(
                 chat_id,
                 f"{icon('warn')} Не нашёл колесо с номером {number}. {hint}",
+                reply_markup=menu.root_open_keyboard(),
             )
             return None
         return url
@@ -343,6 +348,7 @@ def _resolve_wheel_to_remove(chat_id: str, raw: str) -> str | None:
             f"{icon('warn')} Укажите номер колеса из /active "
             "(например <code>/removewheel 2</code>) или ссылку вида "
             "<code>https://betboom.ru/freestream/...</code>",
+            reply_markup=menu.root_open_keyboard(),
         )
         return None
     return url
@@ -358,6 +364,7 @@ def cmd_removewheel(chat_id: str, argument: str) -> None:
             "Работает и ссылка: "
             "<code>/removewheel https://betboom.ru/freestream/...</code>\n"
             "Колесо будет скрыто из /active до конца суток (00:00 МСК).",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     url = _resolve_wheel_to_remove(chat_id, raw)
@@ -369,12 +376,14 @@ def cmd_removewheel(chat_id: str, argument: str) -> None:
             chat_id,
             f"{icon('ok')} Колесо удалено и не будет показываться "
             f"в /active до конца суток (00:00 МСК):\n{html.escape(url)}",
+            reply_markup=menu.root_open_keyboard(),
         )
     else:
         bot_send(
             chat_id,
             "Это колесо уже удалено из /active. "
             "Список обнулится в 00:00 МСК.",
+            reply_markup=menu.root_open_keyboard(),
         )
 
 
@@ -391,7 +400,11 @@ def cmd_channels(chat_id: str, _argument: str) -> None:
 def cmd_words(chat_id: str, _argument: str) -> None:
     keywords = registry.keywords_snapshot()
     if not keywords:
-        bot_send(chat_id, "Ключевых слов пока нет. Добавьте: /addword колесо")
+        bot_send(
+            chat_id,
+            "Ключевых слов пока нет. Добавьте: /addword колесо",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return
     listing = "\n".join(f"• {html.escape(keyword)}" for keyword in keywords)
     bot_send(
@@ -404,7 +417,11 @@ def cmd_words(chat_id: str, _argument: str) -> None:
 def _validate_keyword(chat_id: str, command: str, argument: str) -> str | None:
     keyword = argument.strip()
     if not keyword or len(keyword) > 64:
-        bot_send(chat_id, f"Укажите слово: <code>{command} колесо</code>")
+        bot_send(
+            chat_id,
+            f"Укажите слово: <code>{command} колесо</code>",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return None
     if "*" in keyword and not (
         keyword.startswith("*") and keyword.endswith("*") and len(keyword) > 2
@@ -413,6 +430,7 @@ def _validate_keyword(chat_id: str, command: str, argument: str) -> str | None:
             chat_id,
             "Звёздочки — только с обеих сторон: <code>*колесо*</code> "
             "(поиск по подстроке). Без звёздочек — поиск по границам слова.",
+            reply_markup=menu.root_open_keyboard(),
         )
         return None
     return keyword
@@ -427,12 +445,20 @@ def cmd_addword(chat_id: str, argument: str) -> None:
             (k for k in registry.KEYWORDS if k.casefold() == keyword.casefold()), None
         )
         if existing is not None:
-            bot_send(chat_id, f"«{html.escape(existing)}» уже в списке.")
+            bot_send(
+                chat_id,
+                f"«{html.escape(existing)}» уже в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.KEYWORDS.append(keyword)
         registry.save_keywords_file()
         total = len(registry.KEYWORDS)
-    bot_send(chat_id, f"{icon('ok')} «{html.escape(keyword)}» добавлено. Слов: {total}")
+    bot_send(
+        chat_id,
+        f"{icon('ok')} «{html.escape(keyword)}» добавлено. Слов: {total}",
+        reply_markup=menu.root_open_keyboard(),
+    )
     log.info("Бот: слово %r добавлено, всего %s", keyword, total)
 
 
@@ -445,19 +471,31 @@ def cmd_removeword(chat_id: str, argument: str) -> None:
             (k for k in registry.KEYWORDS if k.casefold() == keyword.casefold()), None
         )
         if existing is None:
-            bot_send(chat_id, f"«{html.escape(keyword)}» нет в списке.")
+            bot_send(
+                chat_id,
+                f"«{html.escape(keyword)}» нет в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.KEYWORDS.remove(existing)
         registry.save_keywords_file()
         total = len(registry.KEYWORDS)
-    bot_send(chat_id, f"{icon('stop')} «{html.escape(existing)}» удалено. Слов: {total}")
+    bot_send(
+        chat_id,
+        f"{icon('stop')} «{html.escape(existing)}» удалено. Слов: {total}",
+        reply_markup=menu.root_open_keyboard(),
+    )
     log.info("Бот: слово %r удалено, всего %s", keyword, total)
 
 
 def cmd_twitch(chat_id: str, _argument: str) -> None:
     channels = registry.twitch_channels_snapshot()
     if not channels:
-        bot_send(chat_id, "Twitch-каналов пока нет. Добавьте: /addtwitch channel")
+        bot_send(
+            chat_id,
+            "Twitch-каналов пока нет. Добавьте: /addtwitch channel",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return
     listing = "\n".join(
         f"• twitch.tv/{html.escape(channel)}" for channel in channels
@@ -475,7 +513,11 @@ def _parse_twitch_channel(chat_id: str, command: str, argument: str) -> str | No
         candidate = candidate.rstrip("/").rsplit("/", 1)[-1]
     match = TWITCH_USERNAME_RE.match(candidate)
     if not match:
-        bot_send(chat_id, f"Укажите канал: <code>{command} channel</code>")
+        bot_send(
+            chat_id,
+            f"Укажите канал: <code>{command} channel</code>",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return None
     return match.group(1).lower()
 
@@ -486,7 +528,11 @@ def cmd_addtwitch(chat_id: str, argument: str) -> None:
         return
     with registry.TWITCH_CHANNELS_LOCK:
         if channel in registry.TWITCH_CHANNELS:
-            bot_send(chat_id, f"twitch.tv/{html.escape(channel)} уже в списке.")
+            bot_send(
+                chat_id,
+                f"twitch.tv/{html.escape(channel)} уже в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.TWITCH_CHANNELS.append(channel)
         registry.save_twitch_channels_file()
@@ -496,6 +542,7 @@ def cmd_addtwitch(chat_id: str, argument: str) -> None:
         chat_id,
         f"{icon('ok')} twitch.tv/{html.escape(channel)} добавлен. "
         f"Twitch-каналов: {total}",
+        reply_markup=menu.root_open_keyboard(),
     )
     log.info("Бот: twitch-канал %s добавлен, всего %s", channel, total)
 
@@ -506,7 +553,11 @@ def cmd_removetwitch(chat_id: str, argument: str) -> None:
         return
     with registry.TWITCH_CHANNELS_LOCK:
         if channel not in registry.TWITCH_CHANNELS:
-            bot_send(chat_id, f"twitch.tv/{html.escape(channel)} нет в списке.")
+            bot_send(
+                chat_id,
+                f"twitch.tv/{html.escape(channel)} нет в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.TWITCH_CHANNELS.remove(channel)
         registry.save_twitch_channels_file()
@@ -516,6 +567,7 @@ def cmd_removetwitch(chat_id: str, argument: str) -> None:
         chat_id,
         f"{icon('stop')} twitch.tv/{html.escape(channel)} удалён. "
         f"Twitch-каналов: {total}",
+        reply_markup=menu.root_open_keyboard(),
     )
     log.info("Бот: twitch-канал %s удалён, всего %s", channel, total)
 
@@ -523,7 +575,11 @@ def cmd_removetwitch(chat_id: str, argument: str) -> None:
 def _parse_telegram_channel(chat_id: str, command: str, argument: str) -> str | None:
     match = USERNAME_RE.match(argument)
     if not match:
-        bot_send(chat_id, f"Укажите канал: <code>{command} @channel</code>")
+        bot_send(
+            chat_id,
+            f"Укажите канал: <code>{command} @channel</code>",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return None
     return match.group(1)
 
@@ -533,7 +589,11 @@ def cmd_add(chat_id: str, argument: str) -> None:
     if channel is None:
         return
     if channel in registry.channels_snapshot():
-        bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
+        bot_send(
+            chat_id,
+            f"@{html.escape(channel)} уже в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
         return
     # Валидация до добавления. Сетевой запрос выполняем БЕЗ
     # CHANNELS_LOCK, чтобы не блокировать основной цикл парсинга.
@@ -543,6 +603,7 @@ def cmd_add(chat_id: str, argument: str) -> None:
             chat_id,
             f"{icon('warn')} @{html.escape(channel)} не найден: "
             "канал не существует или приватный. Не добавлен.",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     if status == "no_preview":
@@ -551,6 +612,7 @@ def cmd_add(chat_id: str, argument: str) -> None:
             f"{icon('warn')} У @{html.escape(channel)} недоступна лента "
             "t.me/s (веб-превью отключено или канал пуст) — парсер не "
             "сможет читать его сообщения. Не добавлен.",
+            reply_markup=menu.root_open_keyboard(),
         )
         return
     note = (
@@ -563,7 +625,11 @@ def cmd_add(chat_id: str, argument: str) -> None:
     )
     with registry.CHANNELS_LOCK:
         if channel in registry.CHANNELS:
-            bot_send(chat_id, f"@{html.escape(channel)} уже в списке.")
+            bot_send(
+                chat_id,
+                f"@{html.escape(channel)} уже в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.CHANNELS.append(channel)
         registry.save_channels_file()
@@ -571,6 +637,7 @@ def cmd_add(chat_id: str, argument: str) -> None:
     bot_send(
         chat_id,
         f"{icon('ok')} @{html.escape(channel)} добавлен. Каналов: {total}{note}",
+        reply_markup=menu.root_open_keyboard(),
     )
     log.info("Бот: канал @%s добавлен, всего %s", channel, total)
 
@@ -581,13 +648,19 @@ def cmd_remove(chat_id: str, argument: str) -> None:
         return
     with registry.CHANNELS_LOCK:
         if channel not in registry.CHANNELS:
-            bot_send(chat_id, f"@{html.escape(channel)} нет в списке.")
+            bot_send(
+                chat_id,
+                f"@{html.escape(channel)} нет в списке.",
+                reply_markup=menu.root_open_keyboard(),
+            )
             return
         registry.CHANNELS.remove(channel)
         registry.save_channels_file()
         total = len(registry.CHANNELS)
     bot_send(
-        chat_id, f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}"
+        chat_id,
+        f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}",
+        reply_markup=menu.root_open_keyboard(),
     )
     log.info("Бот: канал @%s удалён, всего %s", channel, total)
 

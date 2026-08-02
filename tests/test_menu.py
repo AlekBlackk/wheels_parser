@@ -94,6 +94,7 @@ class WheelRemovalKeyboardTests(unittest.TestCase):
                 "inline_keyboard": [
                     [{"text": "❌ 10:00 @demo", "callback_data": "rmw:1"}],
                     [{"text": "❌ 10:05 @demo", "callback_data": "rmw:2"}],
+                    [{"text": "☰ Меню", "callback_data": "m:root"}],
                 ]
             },
         )

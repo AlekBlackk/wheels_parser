@@ -114,11 +114,14 @@ def wheel_removal_keyboard(rows: list[tuple[int, str]]) -> dict[str, Any]:
     """Клавиатура ❌ под списком колёс (/active, /wheels).
 
     rows — пары (номер из общей нумерации /removewheel, подпись кнопки).
+    Последней строкой всегда идёт кнопка «☰ Меню».
     """
-    return _kb([
+    kb_rows = [
         [{"text": label, "callback_data": f"rmw:{number}"}]
         for number, label in rows
-    ])
+    ]
+    kb_rows.append([{"text": "☰ Меню", "callback_data": "m:root"}])
+    return _kb(kb_rows)
 
 
 # ----------------------------------------------------------------------------

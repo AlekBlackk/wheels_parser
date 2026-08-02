@@ -138,18 +138,27 @@ class ActiveReportFormatTests(unittest.TestCase):
         self.assertIn("Активные колёса", text)
         self.assertEqual(
             keyboard,
-            {"inline_keyboard": [[{"text": "❌ 1", "callback_data": "rmw:1"}]]},
+            {
+                "inline_keyboard": [
+                    [{"text": "❌ 1", "callback_data": "rmw:1"}],
+                    [{"text": "☰ Меню", "callback_data": "m:root"}],
+                ]
+            },
         )
 
-    def test_format_active_result_keyboard_is_none_when_nothing_to_remove(self):
+    def test_format_active_result_keyboard_is_menu_only_when_nothing_to_remove(self):
         text, keyboard = active_report.format_active_result([], total=2, unknown_count=0)
         self.assertIn("активных не найдено", text)
-        self.assertIsNone(keyboard)
+        self.assertEqual(
+            keyboard, {"inline_keyboard": [[{"text": "☰ Меню", "callback_data": "m:root"}]]}
+        )
 
-    def test_format_active_result_keyboard_is_none_on_check_failure(self):
+    def test_format_active_result_keyboard_is_menu_only_on_check_failure(self):
         text, keyboard = active_report.format_active_result(None, total=0)
         self.assertIn("Не удалось проверить", text)
-        self.assertIsNone(keyboard)
+        self.assertEqual(
+            keyboard, {"inline_keyboard": [[{"text": "☰ Меню", "callback_data": "m:root"}]]}
+        )
 
 
 class RemoveWheelCommandTests(unittest.TestCase):
@@ -313,8 +322,9 @@ class HistoryReportTests(unittest.TestCase):
             bot.cmd_wheels("1", "")
 
         keyboard = send.call_args.kwargs["reply_markup"]
-        self.assertEqual(len(keyboard["inline_keyboard"]), 1)
+        self.assertEqual(len(keyboard["inline_keyboard"]), 2)
         self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "rmw:1")
+        self.assertEqual(keyboard["inline_keyboard"][-1][0]["callback_data"], "m:root")
         url, known = active_report.lookup_active_number(1)
         self.assertEqual(url, "https://betboom.ru/freestream/only")
         self.assertEqual(known, 1)
