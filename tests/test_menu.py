@@ -99,5 +99,42 @@ class WheelRemovalKeyboardTests(unittest.TestCase):
         )
 
 
+class UndoStoreTests(unittest.TestCase):
+    def setUp(self):
+        menu.forget_deletions()
+        self.addCleanup(menu.forget_deletions)
+
+    def test_pop_within_window_returns_value_once(self):
+        menu.remember_deletion("channel", "demo")
+        self.assertEqual(menu.pop_deletion("channel"), "demo")
+        self.assertIsNone(menu.pop_deletion("channel"))
+
+    def test_pop_after_window_returns_none(self):
+        with patch.object(menu.time, "time", return_value=1000.0):
+            menu.remember_deletion("channel", "demo")
+        with patch.object(menu.time, "time", return_value=1000.0 + menu.UNDO_WINDOW_SECONDS + 1):
+            self.assertIsNone(menu.pop_deletion("channel"))
+
+    def test_new_deletion_overwrites_previous_slot_in_same_category(self):
+        menu.remember_deletion("channel", "first")
+        menu.remember_deletion("channel", "second")
+        self.assertEqual(menu.pop_deletion("channel"), "second")
+
+    def test_categories_are_independent(self):
+        menu.remember_deletion("channel", "demo")
+        self.assertIsNone(menu.pop_deletion("twitch"))
+        self.assertEqual(menu.pop_deletion("channel"), "demo")
+
+
+class WithUndoTests(unittest.TestCase):
+    def test_inserts_undo_row_before_last_row(self):
+        base = menu._kb([[{"text": "x", "callback_data": "y"}], [menu.BACK_BUTTON]])
+        combined = menu._with_undo(base, "undo:channel")
+        rows = combined["inline_keyboard"]
+        self.assertEqual(rows[0][0]["callback_data"], "y")
+        self.assertEqual(rows[1][0]["callback_data"], "undo:channel")
+        self.assertEqual(rows[2][0], menu.BACK_BUTTON)
+
+
 if __name__ == "__main__":
     unittest.main()

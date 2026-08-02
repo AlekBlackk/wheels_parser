@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from . import registry
@@ -114,3 +116,54 @@ def wheel_removal_keyboard(rows: list[tuple[int, str]]) -> dict[str, Any]:
         [{"text": label, "callback_data": f"rmw:{number}"}]
         for number, label in rows
     ])
+
+
+# ----------------------------------------------------------------------------
+# Отмена последнего удаления (один слот на категорию, TTL)
+# ----------------------------------------------------------------------------
+# Как в Gmail — «Отменить» относится к последнему действию в категории,
+# не к полной истории: новое удаление в той же категории перезаписывает
+# предыдущий слот отмены.
+
+UNDO_WINDOW_SECONDS = 10
+
+_undo_lock = threading.Lock()
+_last_deletion: dict[str, tuple[str, float]] = {}
+
+
+def remember_deletion(category: str, value: str) -> None:
+    with _undo_lock:
+        _last_deletion[category] = (value, time.time())
+
+
+def pop_deletion(category: str) -> str | None:
+    """Значение для отмены, если оно ещё в пределах окна.
+
+    Слот освобождается в любом случае (и при успехе, и при просрочке) —
+    повторный тап «Отменить» не должен восстановить то же самое дважды.
+    """
+    with _undo_lock:
+        entry = _last_deletion.pop(category, None)
+    if entry is None:
+        return None
+    value, deleted_at = entry
+    if time.time() - deleted_at > UNDO_WINDOW_SECONDS:
+        return None
+    return value
+
+
+def forget_deletions() -> None:
+    """Только для тестов — сбрасывает все ожидающие отмены."""
+    with _undo_lock:
+        _last_deletion.clear()
+
+
+def _with_undo(keyboard: dict[str, Any], undo_callback: str) -> dict[str, Any]:
+    """Вставляет кнопку «↩️ Отменить» перед последней строкой (обычно «← Назад»)."""
+    rows = [list(row) for row in keyboard["inline_keyboard"]]
+    undo_row = [{"text": "↩️ Отменить", "callback_data": undo_callback}]
+    if rows:
+        rows.insert(len(rows) - 1, undo_row)
+    else:
+        rows.append(undo_row)
+    return _kb(rows)
