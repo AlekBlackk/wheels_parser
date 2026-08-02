@@ -16,7 +16,11 @@ from typing import Any
 import requests
 
 from . import db, menu, registry
-from .active_report import fire_active_check, lookup_active_number
+from .active_report import (
+    fire_active_check,
+    lookup_active_number,
+    remember_active_numbers,
+)
 from .config import (
     ACTIVE_MAX_AGE_HOURS,
     BOT_API,
@@ -104,7 +108,8 @@ def help_text() -> str:
         f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
         "/active — живые колёса за сегодня (сброс в 00:00 МСК)\n"
         "/removewheel номер — убрать колесо из /active до конца суток\n"
-        "    (номер — из последнего ответа /active; можно и ссылкой)\n"
+        "    (номер — из последнего ответа /active или /wheels; можно "
+        "ссылкой или кнопкой ❌)\n"
         "/status — статистика найденных ссылок\n"
         f"/top — какие каналы дают колёса чаще (за {TOP_PERIOD_DAYS} дн.)\n"
         "    (период задаётся числом дней: <code>/top 7</code>)\n"
@@ -270,7 +275,9 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
         )
         return
     lines = [f"{icon('link')} <b>Колёса за последние {WHEELS_WINDOW_MINUTES} минут:</b>"]
-    for item in wheels:
+    numbered = list(enumerate(wheels, start=1))
+    keyboard_rows: list[tuple[int, str]] = []
+    for number, item in numbered:
         found_at = str(item.get("found_at", ""))
         found_time = found_at[11:16] if len(found_at) >= 16 else found_at
         channel = html.escape(str(item.get("channel", "")))
@@ -278,7 +285,13 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
         url = html.escape(normalize_url(str(item.get("url", ""))))
         referral_mark = " ⚠️ для рефералов" if item.get("referral") else ""
         lines.append(f"• {found_time} — @{channel}{referral_mark}\n{url}")
-    bot_send(chat_id, "\n".join(lines))
+        keyboard_rows.append((number, f"❌ {found_time} @{channel}"))
+    # Общая нумерация с /active: /removewheel и кнопки ❌ работают по
+    # номерам из ПОСЛЕДНЕГО показанного списка, каким бы он ни был.
+    remember_active_numbers(numbered)
+    bot_send(
+        chat_id, "\n".join(lines), reply_markup=menu.wheel_removal_keyboard(keyboard_rows)
+    )
 
 
 def cmd_active(chat_id: str, _argument: str) -> None:
@@ -310,11 +323,11 @@ def _resolve_wheel_to_remove(chat_id: str, raw: str) -> str | None:
         url, known = lookup_active_number(number)
         if not url:
             if known:
-                hint = f"В последнем ответе /active номера 1–{known}."
+                hint = f"В последнем ответе /active или /wheels номера 1–{known}."
             else:
                 hint = (
-                    "Сначала вызовите /active — номера колёс берутся "
-                    "из его последнего ответа."
+                    "Сначала вызовите /active или /wheels — номера колёс "
+                    "берутся из последнего ответа."
                 )
             bot_send(
                 chat_id,

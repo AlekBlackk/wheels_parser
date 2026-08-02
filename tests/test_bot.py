@@ -304,6 +304,21 @@ class HistoryReportTests(unittest.TestCase):
         self.assertIn("пока нет", recent)
         self.assertIn("@demo", older)
 
+    def test_wheels_command_attaches_removal_keyboard_and_shares_numbering(self):
+        from wheelsparser import active_report, menu
+        self.store(url="https://betboom.ru/freestream/only")
+        self.addCleanup(active_report.forget_active_numbers)
+
+        with patch.object(bot, "bot_send") as send:
+            bot.cmd_wheels("1", "")
+
+        keyboard = send.call_args.kwargs["reply_markup"]
+        self.assertEqual(len(keyboard["inline_keyboard"]), 1)
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "rmw:1")
+        url, known = active_report.lookup_active_number(1)
+        self.assertEqual(url, "https://betboom.ru/freestream/only")
+        self.assertEqual(known, 1)
+
 
 class DispatchTests(unittest.TestCase):
     def test_unknown_command_is_ignored(self):
