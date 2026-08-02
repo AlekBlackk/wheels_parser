@@ -15,6 +15,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .config import FREESTREAM_RE, TRAILING_PUNCTUATION
 
+_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
 
 def normalize_url(url: str) -> str:
     """Единая каноническая форма URL колеса.
@@ -26,8 +28,15 @@ def normalize_url(url: str) -> str:
     и двойные уведомления. HTML-сущности (&amp; и т.п.) раскодируются:
     ссылка могла быть извлечена из «сырого» HTML или сохранена
     старой версией в экранированном виде.
+    Ссылка без схемы (Twitch-чат: боты часто режут https://, см.
+    config.FREESTREAM_RE) достраивается до https://: без этого urlsplit
+    принял бы весь адрес за path, а не netloc, и один и тот же URL из
+    разных источников (Telegram/Twitch) перестал бы быть одной канонической
+    строкой — сломались бы дедупликация, кулдаун и expired-кэш.
     """
     cleaned = html.unescape(str(url)).strip().rstrip(TRAILING_PUNCTUATION)
+    if cleaned and not _SCHEME_RE.match(cleaned):
+        cleaned = f"https://{cleaned}"
     parts = urlsplit(cleaned)
     scheme = parts.scheme.lower()
     netloc = parts.netloc.lower()

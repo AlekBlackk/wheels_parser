@@ -234,9 +234,10 @@ class PrecheckWheelTests(unittest.TestCase):
 
 
 class ExpiredCacheTests(unittest.TestCase):
-    """Кэш expired не должен переживать REALERT_COOLDOWN_MINUTES: колёса
-    BetBoom живут на постоянных адресах, и то же самое «истёкшее» колесо
-    может быть перезапущено раньше конца календарных суток МСК."""
+    """Кэш expired не должен переживать EXPIRED_CACHE_TTL_SECONDS (короткий,
+    НЕ REALERT_COOLDOWN_MINUTES): колёса BetBoom живут на постоянных адресах,
+    и то же самое «истёкшее» колесо может быть перезапущено новым постом
+    считаные минуты спустя — долгий TTL молча скрывал бы такой перезапуск."""
 
     def setUp(self):
         betboom._expired_cache.clear()
@@ -269,9 +270,8 @@ class ExpiredCacheTests(unittest.TestCase):
         # истёк — запрос к API вообще не должен уйти.
         session.post.reset_mock()
         session.post.return_value = self._active_response()
-        with patch(
-            "wheelsparser.betboom.now_msk", return_value=base + timedelta(minutes=10)
-        ):
+        within_ttl = timedelta(seconds=config.EXPIRED_CACHE_TTL_SECONDS - 10)
+        with patch("wheelsparser.betboom.now_msk", return_value=base + within_ttl):
             status, *_ = betboom.precheck_wheel(
                 "https://betboom.ru/freestream/staya", session
             )
@@ -286,15 +286,38 @@ class ExpiredCacheTests(unittest.TestCase):
         with patch("wheelsparser.betboom.now_msk", return_value=base):
             betboom.precheck_wheel("https://betboom.ru/freestream/staya", session)
 
-        # Колесо перезапущено на том же адресе после конца кулдауна: кэш
+        # Колесо перезапущено на том же адресе после конца TTL кэша: кэш
         # обязан протухнуть и уйти за свежим статусом в API, а не молчать
-        # до конца календарных суток МСК.
+        # ещё REALERT_COOLDOWN_MINUTES (кэш от него не зависит).
         session.post.reset_mock()
         session.post.return_value = self._active_response()
-        after_cooldown = base + timedelta(minutes=config.REALERT_COOLDOWN_MINUTES + 1)
-        with patch("wheelsparser.betboom.now_msk", return_value=after_cooldown):
+        after_ttl = base + timedelta(seconds=config.EXPIRED_CACHE_TTL_SECONDS + 1)
+        with patch("wheelsparser.betboom.now_msk", return_value=after_ttl):
             status, *_ = betboom.precheck_wheel(
                 "https://betboom.ru/freestream/staya", session
+            )
+        self.assertEqual(status, "active")
+        session.post.assert_called_once()
+
+    def test_precheck_use_cache_false_bypasses_cache(self):
+        # retry_expired_links передаёт use_cache=False: его смысл в честной
+        # перепроверке, а не в ожидании TTL (см. config.EXPIRED_CACHE_TTL_SECONDS).
+        session = Mock()
+        session.post.return_value = self._expired_response()
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
+
+        with patch("wheelsparser.betboom.now_msk", return_value=base):
+            status, *_ = betboom.precheck_wheel(
+                "https://betboom.ru/freestream/staya", session
+            )
+        self.assertEqual(status, "expired")
+
+        # Кэш ещё свежий, но use_cache=False обязан всё равно уйти в API.
+        session.post.reset_mock()
+        session.post.return_value = self._active_response()
+        with patch("wheelsparser.betboom.now_msk", return_value=base):
+            status, *_ = betboom.precheck_wheel(
+                "https://betboom.ru/freestream/staya", session, use_cache=False
             )
         self.assertEqual(status, "active")
         session.post.assert_called_once()
@@ -323,10 +346,10 @@ class ExpiredCacheTests(unittest.TestCase):
             session.post.return_value = self._active_response()
             return session
 
-        after_cooldown = base + timedelta(minutes=config.REALERT_COOLDOWN_MINUTES + 1)
+        after_ttl = base + timedelta(seconds=config.EXPIRED_CACHE_TTL_SECONDS + 1)
         with (
             patch("wheelsparser.betboom.build_session", fake_build_session_active),
-            patch("wheelsparser.betboom.now_msk", return_value=after_cooldown),
+            patch("wheelsparser.betboom.now_msk", return_value=after_ttl),
         ):
             active_items, _soon, _unknown = betboom.classify_wheels([item])
         self.assertEqual(active_items, [item])

@@ -36,7 +36,7 @@ from .keywords import find_keywords
 from .logging_setup import log
 from .net import PARSER_SESSION, build_session
 from .runtime import STOP_EVENT
-from .storage import save_seen
+from .storage import load_pending_expired, save_pending_expired, save_seen
 from .telegram_api import (
     notifications_enabled,
     send_keyword_notification,
@@ -521,7 +521,44 @@ def retry_failed_notifications(now: datetime) -> int:
 # никогда её не перепроверит. Без отдельного ретрая одна ошибочная проверка
 # теряла бы находку навсегда. Доступ только из parser-потока — блокировка
 # не нужна (как у CHANNEL_FAIL_STREAK).
+# Переживает рестарт: зеркалится в pending_expired.json (см. storage.py) при
+# каждом изменении. Без этого рестарт процесса терял бы такие находки
+# навсегда — пост уже «увиден», и повторно попасть в этот список ему больше
+# неоткуда (см. load_pending_expired_retry, вызывается из app.main()).
 PENDING_EXPIRED_RETRY: dict[str, dict[str, Any]] = {}
+
+
+def load_pending_expired_retry() -> None:
+    """Восстанавливает PENDING_EXPIRED_RETRY из pending_expired.json.
+
+    Вызывается один раз из app.main() после ensure_data_dir(), до старта
+    потоков — как registry.init() и storage.load_seen().
+    """
+    PENDING_EXPIRED_RETRY.clear()
+    PENDING_EXPIRED_RETRY.update(load_pending_expired())
+
+
+def _register_pending_expired(
+    url: str, channel: str, message: dict[str, Any], post_text: str, now: datetime
+) -> None:
+    """Добавляет ссылку на ретрай, если её там ещё нет, и сохраняет на диск."""
+    if url in PENDING_EXPIRED_RETRY:
+        return
+    PENDING_EXPIRED_RETRY[url] = {
+        "channel": channel,
+        "msg_id": message["id"],
+        "message_url": message["message_url"],
+        "preview": message["text"][:200],
+        "post_text": post_text,
+        "first_seen": now,
+    }
+    save_pending_expired(PENDING_EXPIRED_RETRY)
+
+
+def _drop_pending_expired(url: str) -> None:
+    """Убирает ссылку из ретрая (если была) и сохраняет изменение на диск."""
+    if PENDING_EXPIRED_RETRY.pop(url, None) is not None:
+        save_pending_expired(PENDING_EXPIRED_RETRY)
 
 
 def retry_expired_links(
@@ -544,7 +581,7 @@ def retry_expired_links(
     for url in list(PENDING_EXPIRED_RETRY):
         info = PENDING_EXPIRED_RETRY[url]
         if now - info["first_seen"] > cutoff:
-            PENDING_EXPIRED_RETRY.pop(url, None)
+            _drop_pending_expired(url)
             log.info(
                 "%s Перестаю перепроверять %s [@%s]: %s мин без изменения статуса",
                 icon("bell"),
@@ -561,12 +598,18 @@ def retry_expired_links(
                 url,
                 info["channel"],
             )
-            PENDING_EXPIRED_RETRY.pop(url, None)
+            _drop_pending_expired(url)
             continue
-        status, referral, ends_at = precheck_wheel(url, post_text=info["post_text"])
+        # use_cache=False: это и есть честная перепроверка, а не очередной
+        # «хвост» — expired-кэш (EXPIRED_CACHE_TTL_SECONDS) здесь обходится,
+        # иначе ретрай раз за разом получал бы старый expired из кэша, ни
+        # разу не дойдя до API (см. config.EXPIRED_CACHE_TTL_SECONDS).
+        status, referral, ends_at = precheck_wheel(
+            url, post_text=info["post_text"], use_cache=False
+        )
         if status == "expired":
             continue  # всё ещё завершено — ждём следующего цикла
-        PENDING_EXPIRED_RETRY.pop(url, None)
+        _drop_pending_expired(url)
         entry = {
             "url": url,
             "found_at": now_msk().isoformat(timespec="seconds"),
@@ -656,21 +699,15 @@ def collect_pending_entries(
             # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
             # мы ничего не оповестили, и если колесо перезапустят на том
             # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
-            # обязано уйти. Повторные precheck по тому же «хвосту» и так
-            # дёшевы — их гасит expired-кэш в betboom.py с тем же TTL.
+            # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
+            # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
+            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES).
             # Сообщение уже будет помечено «увиденным» (см. process_message),
             # и обычная правка поста больше не перепроверит эту ссылку —
             # регистрируем её на ретрай (см. retry_expired_links): ошибочный
             # is_ended или неверно посчитанный duration_min иначе терял бы
             # находку навсегда.
-            PENDING_EXPIRED_RETRY.setdefault(url, {
-                "channel": channel,
-                "msg_id": message["id"],
-                "message_url": message["message_url"],
-                "preview": message["text"][:200],
-                "post_text": post_text,
-                "first_seen": now,
-            })
+            _register_pending_expired(url, channel, message, post_text, now)
             continue
         pending.append({
             "url": url,

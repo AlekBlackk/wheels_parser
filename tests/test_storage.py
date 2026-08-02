@@ -170,6 +170,64 @@ class RemovedWheelsTests(TempDirTestCase):
             self.assertEqual(storage.removed_wheels_today(), {"https://x/new"})
 
 
+class PendingExpiredStateTests(TempDirTestCase):
+    """pending_expired.json — единственный способ пережить рестарт для
+    PENDING_EXPIRED_RETRY (см. parser.py): пост, чья ссылка ошибочно
+    признана expired, уже помечен «увиденным» в seen_ids.json, и без этого
+    файла рестарт терял бы такую находку навсегда."""
+
+    def setUp(self):
+        super().setUp()
+        self.file = self.tmp / "pending_expired.json"
+        patcher = patch.object(storage, "PENDING_EXPIRED_FILE", self.file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_load_without_file_returns_empty(self):
+        self.assertEqual(storage.load_pending_expired(), {})
+
+    def test_save_and_load_round_trip(self):
+        first_seen = storage.parse_msk("2026-07-30T12:00:00+03:00")
+        pending = {
+            "https://betboom.ru/freestream/a": {
+                "channel": "demo",
+                "msg_id": "demo/1",
+                "message_url": "https://t.me/demo/1",
+                "preview": "колесо",
+                "post_text": "колесо",
+                "first_seen": first_seen,
+            }
+        }
+        storage.save_pending_expired(pending)
+        self.assertEqual(storage.load_pending_expired(), pending)
+
+    def test_load_drops_entries_with_unparsable_first_seen(self):
+        self.file.write_text(
+            json.dumps({
+                "https://x/bad": {"channel": "demo", "first_seen": "not-a-date"},
+                "https://x/good": {
+                    "channel": "demo",
+                    "msg_id": "1",
+                    "message_url": "u",
+                    "preview": "p",
+                    "post_text": "t",
+                    "first_seen": "2026-07-30T12:00:00+03:00",
+                },
+            }),
+            encoding="utf-8",
+        )
+        loaded = storage.load_pending_expired()
+        self.assertNotIn("https://x/bad", loaded)
+        self.assertIn("https://x/good", loaded)
+
+    def test_save_does_not_raise_on_disk_failure(self):
+        # Сбой записи не должен ронять цикл парсинга — только лог.
+        with patch.object(
+            storage, "atomic_write_json", side_effect=OSError("disk full")
+        ):
+            storage.save_pending_expired({})
+
+
 class BotOffsetTests(TempDirTestCase):
     def test_offset_round_trip(self):
         path = self.tmp / "bot_state.json"

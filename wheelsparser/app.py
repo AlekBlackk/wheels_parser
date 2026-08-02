@@ -38,7 +38,7 @@ from .config import (
 from .db import close_connection, init_db
 from .logging_setup import force_utf8_console, log, redact_token, setup_logging
 from .net import SUPERVISOR_SESSION
-from .parser import process_cycle
+from .parser import load_pending_expired_retry, process_cycle
 from .runtime import (
     STOP_EVENT,
     acquire_single_instance_lock,
@@ -223,6 +223,10 @@ def main() -> int:
     # старый freebets.json из корня уже лежит в data/ и его можно перенести.
     init_db()
     seen, has_state = load_seen()
+    # Ссылки, ошибочно признанные expired до рестарта: их посты уже
+    # «увидены», и без восстановления этого списка перепроверка была бы
+    # больше неоткуда взять (см. parser.PENDING_EXPIRED_RETRY).
+    load_pending_expired_retry()
 
     notifications = (
         "включены" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "выключены"

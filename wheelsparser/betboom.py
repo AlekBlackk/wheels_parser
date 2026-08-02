@@ -17,9 +17,9 @@ import requests
 
 from .config import (
     ACTIVE_CHECK_CONCURRENCY,
+    EXPIRED_CACHE_TTL_SECONDS,
     HEADERS,
     MSK_TZ,
-    REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     STREAMER_WHEEL_INFO_API,
 )
@@ -29,11 +29,11 @@ from .timeutils import now_msk
 from .urls import normalize_url
 
 # Кэш завершившихся колёс: url -> момент, когда колесо признано expired.
-# TTL — тот же REALERT_COOLDOWN_MINUTES, что и у повторных уведомлений
-# (см. alerts.py): колёса BetBoom живут на постоянных адресах, и то же
-# самое «истёкшее» колесо может быть перезапущено раньше конца календарных
-# суток МСК. Кэш на весь день (как было раньше) в этом случае молча скрывал
-# бы уже активное колесо и из precheck, и из /active вплоть до полуночи.
+# TTL — EXPIRED_CACHE_TTL_SECONDS (короткий, минуты, НЕ REALERT_COOLDOWN_MINUTES
+# — см. config.py): единственная задача кэша — не бить по API повторно за
+# один и тот же «хвост», всплывший в нескольких постах подряд. Долгий TTL
+# (раньше — REALERT_COOLDOWN_MINUTES, 30 мин) означал, что реальный перезапуск
+# колеса на том же адресе новым постом молча пропускался почти полчаса.
 # Кэш общий для parser-потока (precheck перед уведомлением) и фонового
 # active-api-потока, поэтому доступ — только под _expired_cache_lock.
 _expired_cache: dict[str, datetime] = {}
@@ -191,8 +191,8 @@ def check_wheel_status(url: str, session: requests.Session) -> str:
 
 
 def _prune_expired_cache() -> None:
-    """Убирает записи старше REALERT_COOLDOWN_MINUTES — иначе кэш растёт бессрочно."""
-    cutoff = timedelta(minutes=REALERT_COOLDOWN_MINUTES)
+    """Убирает записи старше EXPIRED_CACHE_TTL_SECONDS — иначе кэш растёт бессрочно."""
+    cutoff = timedelta(seconds=EXPIRED_CACHE_TTL_SECONDS)
     now = now_msk()
     with _expired_cache_lock:
         for stale_url in [
@@ -212,7 +212,10 @@ def _cache_expired(url: str) -> None:
 
 
 def precheck_wheel(
-    url: str, session: requests.Session | None = None, post_text: str = ""
+    url: str,
+    session: requests.Session | None = None,
+    post_text: str = "",
+    use_cache: bool = True,
 ) -> tuple[str, bool, str]:
     """Статус колеса, реф-флаг и дедлайн перед отправкой уведомления.
 
@@ -225,16 +228,21 @@ def precheck_wheel(
     (post_text, см. is_referral_wheel).
     По умолчанию используется PARSER_SESSION — вызывающему из другого
     потока нужно передать свою сессию.
+    use_cache=False пропускает чтение expired-кэша и всегда идёт в API —
+    этим пользуется parser.retry_expired_links: его смысл в честной
+    перепроверке ссылки, а не в ожидании EXPIRED_CACHE_TTL_SECONDS. Успешный
+    результат всё равно пишется в кэш (если снова expired) — другие «хвосты»
+    того же URL по-прежнему выигрывают от дедупликации.
     """
     canonical = normalize_url(url)
     if not canonical:
         return "unknown", False, ""
     _prune_expired_cache()
-    if _is_cached_expired(canonical):
+    if use_cache and _is_cached_expired(canonical):
         log.info(
-            "precheck [cache]: %s → expired (кэш %s мин)",
+            "precheck [cache]: %s → expired (кэш %sс)",
             canonical,
-            REALERT_COOLDOWN_MINUTES,
+            EXPIRED_CACHE_TTL_SECONDS,
         )
         return "expired", is_referral_wheel(canonical, None, post_text), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
@@ -288,9 +296,9 @@ def classify_wheels(
             return
         if _is_cached_expired(url):
             log.info(
-                "active-check [cache]: %s → expired (кэш %s мин)",
+                "active-check [cache]: %s → expired (кэш %sс)",
                 url,
-                REALERT_COOLDOWN_MINUTES,
+                EXPIRED_CACHE_TTL_SECONDS,
             )
             with lock:
                 results.append((index, "expired"))

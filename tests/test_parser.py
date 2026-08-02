@@ -1,12 +1,15 @@
 import sqlite3
+import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime as dt
+from datetime import timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
 
 from tests.dbfixture import entries_since, use_temp_db
-from wheelsparser import alerts, config, db, parser, registry, urls
+from wheelsparser import alerts, betboom, config, db, parser, registry, storage, urls
 
 
 def make_message(message_id, text, links):
@@ -348,11 +351,15 @@ class RetryExpiredLinksTests(unittest.TestCase):
         self._seed()
         with patch.object(
             parser, "precheck_wheel", return_value=("active", False, "")
-        ), patch.object(
+        ) as precheck, patch.object(
             parser, "send_telegram_notification", return_value=True
         ) as send:
             entries = parser.retry_expired_links(self.now, {})
 
+        # Ретрай обязан обходить expired-кэш betboom.py — иначе он раз за
+        # разом получал бы старый статус из кэша, ни разу не дойдя до API
+        # (см. config.EXPIRED_CACHE_TTL_SECONDS).
+        self.assertEqual(precheck.call_args.kwargs.get("use_cache"), False)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["url"], self.url)
         self.assertEqual(entries[0]["status"], "active")
@@ -361,6 +368,37 @@ class RetryExpiredLinksTests(unittest.TestCase):
         self.assertNotIn(self.url, parser.PENDING_EXPIRED_RETRY)
         # Кулдаун должен встать — иначе обычный цикл тут же продублирует.
         self.assertTrue(alerts.cooldown_active(self.url, self.now))
+
+    def test_retry_recovers_wheel_through_real_expired_cache(self):
+        """Регрессия: precheck_wheel раньше отдавал expired из кэша betboom.py
+        (TTL был = REALERT_COOLDOWN_MINUTES, 30 мин), и ретрай ни разу не
+        доходил до настоящего API, пока кэш не протухал. Здесь precheck_wheel
+        НЕ мокается — используется реальная функция с реальным кэшем, чтобы
+        проверить интеграцию, а не только то, что retry_expired_links передаёт
+        нужный флаг."""
+        self._seed()
+        self.addCleanup(betboom._expired_cache.clear)
+        with patch.object(betboom, "fetch_wheel_info", return_value={"is_ended": True}):
+            # Кэш выставляется так же, как при первичном обнаружении «хвоста».
+            self.assertEqual(betboom.precheck_wheel(self.url)[0], "expired")
+
+        started = dt.now(timezone.utc) - timedelta(minutes=1)
+        active_info = {
+            "is_ended": False,
+            "is_early": False,
+            "start_dttm": started.isoformat().replace("+00:00", "Z"),
+            "duration_min": 30,
+        }
+        with patch.object(
+            betboom, "fetch_wheel_info", return_value=active_info
+        ), patch.object(
+            parser, "send_telegram_notification", return_value=True
+        ) as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], "active")
+        send.assert_called_once()
 
     def test_still_expired_wheel_stays_registered_without_notifying(self):
         self._seed()
@@ -406,6 +444,67 @@ class RetryExpiredLinksTests(unittest.TestCase):
         # Подавление не должно быть молчаливым — иначе «почему не пришло»
         # диагностировать неоткуда.
         self.assertTrue(any(self.url in line for line in logs.output))
+
+
+class PendingExpiredPersistenceTests(unittest.TestCase):
+    """PENDING_EXPIRED_RETRY обязан переживать рестарт процесса: пост, чья
+    ссылка ошибочно признана expired, уже помечен «увиденным» в
+    seen_ids.json — обычная правка поста больше не даст шанса на
+    перепроверку, единственный путь назад — восстановление этого списка
+    из pending_expired.json при старте (см. app.main)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wheelsparser-pending-parser-"))
+        patcher = patch.object(storage, "PENDING_EXPIRED_FILE", self.tmp / "pending_expired.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(parser.PENDING_EXPIRED_RETRY.clear)
+        parser.PENDING_EXPIRED_RETRY.clear()
+        self.url = "https://betboom.ru/freestream/a"
+        self.message = make_message("demo/1", "колесо", [self.url])
+        self.now = parser.now_msk()
+
+    def test_registered_entry_survives_simulated_restart(self):
+        parser._register_pending_expired(
+            self.url, "demo", self.message, "колесо", self.now
+        )
+
+        # Симулируем рестарт процесса: очищаем память и грузим заново с диска
+        # (то же самое делает app.main() через load_pending_expired_retry()).
+        parser.PENDING_EXPIRED_RETRY.clear()
+        parser.load_pending_expired_retry()
+
+        self.assertIn(self.url, parser.PENDING_EXPIRED_RETRY)
+        restored = parser.PENDING_EXPIRED_RETRY[self.url]
+        self.assertEqual(restored["channel"], "demo")
+        self.assertEqual(restored["msg_id"], "demo/1")
+        self.assertEqual(restored["post_text"], "колесо")
+
+    def test_dropped_entry_does_not_come_back_after_restart(self):
+        parser._register_pending_expired(
+            self.url, "demo", self.message, "колесо", self.now
+        )
+        parser._drop_pending_expired(self.url)
+
+        parser.PENDING_EXPIRED_RETRY.clear()
+        parser.load_pending_expired_retry()
+
+        self.assertEqual(parser.PENDING_EXPIRED_RETRY, {})
+
+    def test_registering_same_url_twice_keeps_first_seen(self):
+        # setdefault-семантика: вторая попытка (например, другой канал
+        # репостнул тот же «хвост») не должна сдвигать окно ретрая.
+        parser._register_pending_expired(
+            self.url, "demo", self.message, "колесо", self.now
+        )
+        later = self.now + timedelta(minutes=5)
+        other_message = make_message("other/1", "колесо", [self.url])
+        parser._register_pending_expired(
+            self.url, "other", other_message, "колесо", later
+        )
+
+        self.assertEqual(parser.PENDING_EXPIRED_RETRY[self.url]["channel"], "demo")
+        self.assertEqual(parser.PENDING_EXPIRED_RETRY[self.url]["first_seen"], self.now)
 
 
 class RetryFailedNotificationsTests(unittest.TestCase):

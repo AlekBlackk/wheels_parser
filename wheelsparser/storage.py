@@ -23,11 +23,12 @@ from .config import (
     LOG_FILE,
     MAX_SEEN_PER_CHANNEL,
     OUTPUT_FILE,
+    PENDING_EXPIRED_FILE,
     REMOVED_WHEELS_FILE,
     SEEN_FILE,
 )
 from .logging_setup import log
-from .timeutils import today_msk
+from .timeutils import parse_msk, today_msk
 
 
 def ensure_data_dir() -> list[str]:
@@ -230,3 +231,71 @@ def save_bot_offset(offset: int) -> None:
         atomic_write_json(BOT_STATE_FILE, {"offset": offset})
     except OSError as error:
         log.warning("Бот: не удалось сохранить %s: %s", BOT_STATE_FILE.name, error)
+
+
+# ----------------------------------------------------------------------------
+# Ссылки, ожидающие перепроверки после expired (pending_expired.json)
+# ----------------------------------------------------------------------------
+# url -> {channel, msg_id, message_url, preview, post_text, first_seen}.
+# Без этого файла PENDING_EXPIRED_RETRY (см. parser.py) жил только в
+# памяти: пост, чья ссылка ошибочно признана expired, уже помечен
+# «увиденным» в seen_ids.json, и обычная правка поста его больше не
+# перепроверит — рестарт процесса терял такую находку навсегда вместо
+# повторной проверки на следующих циклах (см. parser.retry_expired_links).
+# Доступ и запись — только из parser-потока (как у самого
+# PENDING_EXPIRED_RETRY), поэтому лок не нужен.
+
+def load_pending_expired() -> dict[str, dict[str, Any]]:
+    """Читает список ссылок на перепроверку, накопленный до рестарта.
+
+    Записи с нечитаемым first_seen отбрасываются: без валидной метки
+    времени retry_expired_links не сможет сравнить её с окном ретрая
+    (NOTIFY_RETRY_WINDOW_MINUTES), а восстановить её нечем.
+    """
+    raw = read_json(PENDING_EXPIRED_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    pending: dict[str, dict[str, Any]] = {}
+    for url, info in raw.items():
+        if not isinstance(url, str) or not isinstance(info, dict):
+            continue
+        first_seen = parse_msk(info.get("first_seen"))
+        if first_seen is None:
+            continue
+        pending[url] = {
+            "channel": str(info.get("channel", "")),
+            "msg_id": str(info.get("msg_id", "")),
+            "message_url": str(info.get("message_url", "")),
+            "preview": str(info.get("preview", "")),
+            "post_text": str(info.get("post_text", "")),
+            "first_seen": first_seen,
+        }
+    return pending
+
+
+def save_pending_expired(pending: dict[str, dict[str, Any]]) -> None:
+    """Атомарно сохраняет список ссылок на перепроверку.
+
+    Вызывается на каждое изменение (добавление/снятие одной ссылки) —
+    записей единицы (только реальные «хвосты» с ошибочным is_ended), полная
+    перезапись дёшева. Сбой записи не должен ронять цикл парсинга: при
+    ошибке диска парсер продолжает работать по памяти в пределах текущего
+    запуска, просто без гарантии пережить следующий рестарт.
+    """
+    try:
+        serializable = {
+            url: {
+                "channel": info["channel"],
+                "msg_id": info["msg_id"],
+                "message_url": info["message_url"],
+                "preview": info["preview"],
+                "post_text": info["post_text"],
+                "first_seen": info["first_seen"].isoformat(timespec="seconds"),
+            }
+            for url, info in pending.items()
+        }
+        atomic_write_json(PENDING_EXPIRED_FILE, serializable)
+    except OSError as error:
+        log.warning(
+            "Не удалось сохранить %s: %s", PENDING_EXPIRED_FILE.name, error
+        )

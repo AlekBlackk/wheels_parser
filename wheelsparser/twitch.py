@@ -155,8 +155,9 @@ def handle_twitch_message(
             # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
             # мы ничего не оповестили, и если колесо перезапустят на том
             # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
-            # обязано уйти. Повторные precheck по тому же «хвосту» и так
-            # дёшевы — их гасит expired-кэш в betboom.py с тем же TTL.
+            # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
+            # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
+            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES).
             continue
         entry = {
             "url": url,

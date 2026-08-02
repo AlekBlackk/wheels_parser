@@ -36,6 +36,11 @@ OUTPUT_FILE = DATA_DIR / "freebets.json"
 SEEN_FILE = DATA_DIR / "seen_ids.json"
 BOT_STATE_FILE = DATA_DIR / "bot_state.json"
 REMOVED_WHEELS_FILE = DATA_DIR / "removed_wheels.json"
+# Ссылки, ошибочно признанные expired и ждущие перепроверки (см.
+# parser.PENDING_EXPIRED_RETRY) — переживают рестарт: пост уже помечен
+# «увиденным» в seen_ids.json, и без этого файла рестарт терял бы находку
+# навсегда вместо повторной проверки на следующих циклах.
+PENDING_EXPIRED_FILE = DATA_DIR / "pending_expired.json"
 LOG_FILE = DATA_DIR / "parser.log"
 LOCK_FILE = DATA_DIR / "wheelsparser.lock"
 
@@ -96,6 +101,18 @@ ACTIVE_CHECK_CONCURRENCY = env_int("ACTIVE_CHECK_CONCURRENCY", 3, 1)
 # Колёса BetBoom живут на постоянных адресах (/staya, /neret, ...), поэтому
 # «вечная» дедупликация по URL пропускала повторные запуски того же колеса.
 REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
+# TTL кэша expired-статусов в betboom.py (сек), НЕ связан с REALERT_COOLDOWN_MINUTES.
+# Кэш существует только для того, чтобы не бить по API BetBoom повторно за
+# один и тот же «хвост» (старый href), когда он всплывает в нескольких
+# постах подряд (например, один стрим репостят в несколько каналов почти
+# одновременно). TTL должен быть коротким: пока запись в кэше жива, свежий
+# пост с тем же URL (реальный перезапуск колеса) будет ошибочно принят за
+# тот же самый «хвост» и пропущен без проверки API — см.
+# parser.collect_pending_entries, где кулдаун на такой пропуск намеренно
+# НЕ ставится именно ради быстрого повторного обнаружения. retry_expired_links
+# всегда обходит этот кэш (precheck_wheel(..., use_cache=False)) — его смысл
+# как раз в честной перепроверке, а не в ожидании TTL.
+EXPIRED_CACHE_TTL_SECONDS = env_int("EXPIRED_CACHE_TTL_SECONDS", 120, 5)
 # Проверять колесо через API BetBoom перед отправкой уведомления. Посты
 # нередко содержат «хвосты» — старые href на прошлые колёса, невидимые
 # в Telegram, но попадающие в HTML-разметку (стример скопировал прошлый пост
@@ -169,8 +186,16 @@ TWITCH_ROLE_ICONS = {
 
 STREAMER_WHEEL_INFO_API = "https://betboom.ru/api/streamer-wheel/action/get-info"
 
+# Схема и www. — опциональны: Twitch-боты (nightbot, StreamElements и т.п.)
+# нередко режут https:// в сообщениях чата, а обычный regex с обязательным
+# https?:// такие ссылки вообще не находил (см. urls.normalize_url — она
+# достраивает схему обратно, чтобы канонический URL был одним и тем же
+# независимо от источника). (?<![\w.-]) — граница перед доменом: без неё
+# опциональная схема заставила бы findall() матчить и «хвост» чужого имени
+# («evilbetboom.ru/freestream/x» → ложно распознавался бы как betboom.ru).
 FREESTREAM_RE = re.compile(
-    r"https?://(?:www\.)?betboom\.ru/freestream/[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-]+",
+    r"(?<![\w.-])(?:https?://)?(?:www\.)?betboom\.ru/freestream/"
+    r"[A-Za-z0-9_~:/?#\[\]@!$&'()*+,;=%.-]+",
     re.IGNORECASE,
 )
 TRAILING_PUNCTUATION = ".,;:!?)]}>'\""

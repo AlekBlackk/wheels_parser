@@ -171,6 +171,19 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.queued(), [])
         self.assertTrue(any(WHEEL in line and "кулдаун" in line for line in logs.output))
 
+    def test_schemeless_link_from_bot_is_notified(self):
+        # nightbot/StreamElements нередко режут https:// в сообщениях чата —
+        # раньше такая ссылка не находилась вообще (FREESTREAM_RE требовал
+        # схему), теперь normalize_url достраивает её до канонической формы.
+        twitch.handle_twitch_message(
+            "demo", "nightbot", {}, "Колесо фрибетов! betboom.ru/freestream/stream1"
+        )
+
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], WHEEL)
+        self.notify.assert_called_once()
+
     def test_message_without_wheel_link_is_skipped(self):
         twitch.handle_twitch_message(
             "demo", "streamer", {"badges": "broadcaster/1"}, "просто колесо"
