@@ -368,7 +368,11 @@ def cmd_removewheel(chat_id: str, argument: str) -> None:
 def cmd_channels(chat_id: str, _argument: str) -> None:
     channels = registry.channels_snapshot()
     listing = "\n".join(f"• @{html.escape(channel)}" for channel in channels)
-    bot_send(chat_id, f"<b>Каналы ({len(channels)}):</b>\n{listing}")
+    bot_send(
+        chat_id,
+        f"<b>Каналы ({len(channels)}):</b>\n{listing}",
+        reply_markup=menu.channels_list_keyboard(),
+    )
 
 
 def cmd_words(chat_id: str, _argument: str) -> None:
@@ -377,7 +381,11 @@ def cmd_words(chat_id: str, _argument: str) -> None:
         bot_send(chat_id, "Ключевых слов пока нет. Добавьте: /addword колесо")
         return
     listing = "\n".join(f"• {html.escape(keyword)}" for keyword in keywords)
-    bot_send(chat_id, f"<b>Ключевые слова ({len(keywords)}):</b>\n{listing}")
+    bot_send(
+        chat_id,
+        f"<b>Ключевые слова ({len(keywords)}):</b>\n{listing}",
+        reply_markup=menu.words_list_keyboard(),
+    )
 
 
 def _validate_keyword(chat_id: str, command: str, argument: str) -> str | None:
@@ -441,7 +449,11 @@ def cmd_twitch(chat_id: str, _argument: str) -> None:
     listing = "\n".join(
         f"• twitch.tv/{html.escape(channel)}" for channel in channels
     )
-    bot_send(chat_id, f"<b>Twitch-каналы ({len(channels)}):</b>\n{listing}")
+    bot_send(
+        chat_id,
+        f"<b>Twitch-каналы ({len(channels)}):</b>\n{listing}",
+        reply_markup=menu.twitch_list_keyboard(),
+    )
 
 
 def _parse_twitch_channel(chat_id: str, command: str, argument: str) -> str | None:

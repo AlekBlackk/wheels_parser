@@ -429,5 +429,28 @@ class CallbackQueryLoopTests(unittest.TestCase):
         save_offset.assert_called_once_with(11)
 
 
+class ListCommandKeyboardTests(unittest.TestCase):
+    def test_channels_command_attaches_removal_keyboard(self):
+        from wheelsparser import menu
+        with patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/channels")
+            self.assertEqual(send.call_args.kwargs["reply_markup"], menu.channels_list_keyboard())
+
+    def test_twitch_command_attaches_removal_keyboard(self):
+        from wheelsparser import menu
+        with patch.object(registry, "TWITCH_CHANNELS", ["streamer"]), \
+             patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/twitch")
+            self.assertEqual(send.call_args.kwargs["reply_markup"], menu.twitch_list_keyboard())
+
+    def test_words_command_attaches_removal_keyboard(self):
+        from wheelsparser import menu
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/words")
+            self.assertEqual(send.call_args.kwargs["reply_markup"], menu.words_list_keyboard())
+
+
 if __name__ == "__main__":
     unittest.main()
