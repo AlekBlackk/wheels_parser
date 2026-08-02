@@ -18,7 +18,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import registry
+from . import registry, storage
+from .active_report import lookup_active_number
 from .config import icon
 from .telegram_api import answer_callback_query, edit_message_text
 
@@ -352,3 +353,43 @@ def _cb_undo_word(chat_id: str, message_id: int, callback_id: str) -> None:
 
 _STATIC_HANDLERS["undo:word"] = _cb_undo_word
 _PREFIX_HANDLERS["wd:rm:"] = _cb_remove_word
+
+
+# ----------------------------------------------------------------------------
+# Удаление / восстановление колеса из /active (кнопка ❌ под /active, /wheels)
+# ----------------------------------------------------------------------------
+
+def _cb_remove_wheel(chat_id: str, message_id: int, callback_id: str, raw_number: str) -> None:
+    try:
+        number = int(raw_number)
+    except ValueError:
+        answer_callback_query(callback_id, "Некорректный номер", show_alert=True)
+        return
+    url, _known = lookup_active_number(number)
+    if not url:
+        answer_callback_query(
+            callback_id, "Список устарел — вызовите /active заново", show_alert=True
+        )
+        return
+    if storage.mark_wheel_removed(url):
+        remember_deletion("wheel", url)
+        answer_callback_query(callback_id, "Колесо убрано из /active")
+    else:
+        answer_callback_query(callback_id, "Уже убрано")
+
+
+def _cb_undo_wheel(chat_id: str, message_id: int, callback_id: str) -> None:
+    url = pop_deletion("wheel")
+    if url is None:
+        answer_callback_query(
+            callback_id,
+            "Время отмены истекло. Колесо останется скрытым из /active до 00:00 МСК.",
+            show_alert=True,
+        )
+        return
+    storage.unmark_wheel_removed(url)
+    answer_callback_query(callback_id, "Колесо возвращено в /active")
+
+
+_STATIC_HANDLERS["undo:wheel"] = _cb_undo_wheel
+_PREFIX_HANDLERS["rmw:"] = _cb_remove_wheel

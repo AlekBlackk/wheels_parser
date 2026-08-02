@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from wheelsparser import menu, registry
+from wheelsparser import active_report, menu, registry, storage
 
 
 class RootKeyboardTests(unittest.TestCase):
@@ -317,6 +317,75 @@ class RemoveWordCallbackTests(unittest.TestCase):
 
             self.assertEqual(registry.KEYWORDS, ["колесо"])
             save.assert_not_called()
+
+
+class RemoveWheelCallbackTests(unittest.TestCase):
+    def setUp(self):
+        menu.forget_deletions()
+        self.addCleanup(menu.forget_deletions)
+        active_report.forget_active_numbers()
+        self.addCleanup(active_report.forget_active_numbers)
+
+    def test_removes_wheel_by_number_and_offers_undo(self):
+        active_report.remember_active_numbers(
+            [(1, {"url": "https://betboom.ru/freestream/one"})]
+        )
+        with patch.object(storage, "mark_wheel_removed", return_value=True) as mark, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "rmw:1")
+
+        self.assertTrue(handled)
+        mark.assert_called_once_with("https://betboom.ru/freestream/one")
+        answer.assert_called_once()
+        self.assertEqual(
+            menu.pop_deletion("wheel"), "https://betboom.ru/freestream/one"
+        )
+
+    def test_unknown_number_shows_alert_without_marking(self):
+        with patch.object(storage, "mark_wheel_removed") as mark, \
+             patch.object(menu, "answer_callback_query") as answer:
+            menu.handle_callback("1", 55, "cb1", "rmw:99")
+
+        mark.assert_not_called()
+        self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+
+    def test_already_removed_wheel_reports_without_touching_undo_slot(self):
+        active_report.remember_active_numbers(
+            [(1, {"url": "https://betboom.ru/freestream/one"})]
+        )
+        with patch.object(storage, "mark_wheel_removed", return_value=False), \
+             patch.object(menu, "answer_callback_query"):
+            menu.handle_callback("1", 55, "cb1", "rmw:1")
+
+        self.assertIsNone(menu.pop_deletion("wheel"))
+
+    def test_undo_wheel_calls_unmark(self):
+        menu.remember_deletion("wheel", "https://betboom.ru/freestream/one")
+        with patch.object(storage, "unmark_wheel_removed") as unmark, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "undo:wheel")
+
+        self.assertTrue(handled)
+        unmark.assert_called_once_with("https://betboom.ru/freestream/one")
+        answer.assert_called_once()
+
+    def test_undo_wheel_after_window_shows_alert(self):
+        with patch.object(storage, "unmark_wheel_removed") as unmark, \
+             patch.object(menu, "answer_callback_query") as answer:
+            menu.handle_callback("1", 55, "cb1", "undo:wheel")
+
+        unmark.assert_not_called()
+        self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+
+    def test_non_integer_number_answers_callback_instead_of_hanging(self):
+        with patch.object(storage, "mark_wheel_removed") as mark, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "rmw:abc")
+
+        self.assertTrue(handled)
+        mark.assert_not_called()
+        answer.assert_called_once()
+        self.assertTrue(answer.call_args.kwargs.get("show_alert"))
 
 
 if __name__ == "__main__":
