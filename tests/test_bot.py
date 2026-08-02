@@ -1,6 +1,6 @@
 import unittest
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.dbfixture import use_temp_db
 from wheelsparser import active_report, bot, db, registry
@@ -335,6 +335,98 @@ class MenuCommandTests(unittest.TestCase):
         with patch.object(bot, "bot_send") as send:
             bot.handle_command("1", "/help")
         self.assertEqual(send.call_args.kwargs["reply_markup"], menu.root_open_keyboard())
+
+
+class CallbackDispatchTests(unittest.TestCase):
+    def test_do_wheels_runs_cmd_wheels_and_answers(self):
+        with patch.object(bot, "cmd_wheels") as cmd, \
+             patch.object(bot, "answer_callback_query") as answer:
+            bot.handle_callback("1", 55, "cb1", "m:do_wheels")
+        cmd.assert_called_once_with("1", "")
+        answer.assert_called_once_with("cb1")
+
+    def test_do_active_runs_cmd_active(self):
+        with patch.object(bot, "cmd_active") as cmd, \
+             patch.object(bot, "answer_callback_query"):
+            bot.handle_callback("1", 55, "cb1", "m:do_active")
+        cmd.assert_called_once_with("1", "")
+
+    def test_do_status_runs_cmd_status(self):
+        with patch.object(bot, "cmd_status") as cmd, \
+             patch.object(bot, "answer_callback_query"):
+            bot.handle_callback("1", 55, "cb1", "m:do_status")
+        cmd.assert_called_once_with("1", "")
+
+    def test_do_top_runs_cmd_top(self):
+        with patch.object(bot, "cmd_top") as cmd, \
+             patch.object(bot, "answer_callback_query"):
+            bot.handle_callback("1", 55, "cb1", "m:do_top")
+        cmd.assert_called_once_with("1", "")
+
+    def test_unrecognized_data_falls_through_to_menu(self):
+        from wheelsparser import menu
+        with patch.object(menu, "handle_callback", return_value=True) as delegate:
+            bot.handle_callback("1", 55, "cb1", "m:root")
+        delegate.assert_called_once_with("1", 55, "cb1", "m:root")
+
+
+class CallbackQueryLoopTests(unittest.TestCase):
+    """update с callback_query обрабатывается в bot_loop наравне с message."""
+
+    def test_bot_loop_dispatches_trusted_callback_and_advances_offset(self):
+        update = {
+            "update_id": 10,
+            "callback_query": {
+                "id": "cb1",
+                "data": "m:root",
+                "message": {"message_id": 77, "chat": {"id": 42}},
+            },
+        }
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": [update]}
+        session = Mock()
+        session.get.return_value = response
+        session.post.return_value = response
+
+        with patch.object(bot, "BOT_SESSION", session), \
+             patch.object(bot, "TELEGRAM_CHAT_ID", "42"), \
+             patch.object(bot, "load_bot_offset", return_value=0), \
+             patch.object(bot, "save_bot_offset") as save_offset, \
+             patch.object(bot, "handle_callback") as handle, \
+             patch.object(bot.STOP_EVENT, "is_set", side_effect=[False, True]):
+            bot.bot_loop()
+
+        handle.assert_called_once_with("42", 77, "cb1", "m:root")
+        save_offset.assert_called_once_with(11)
+
+    def test_bot_loop_ignores_callback_from_untrusted_chat(self):
+        update = {
+            "update_id": 10,
+            "callback_query": {
+                "id": "cb1",
+                "data": "m:root",
+                "message": {"message_id": 77, "chat": {"id": 999}},
+            },
+        }
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": [update]}
+        session = Mock()
+        session.get.return_value = response
+        session.post.return_value = response
+
+        with patch.object(bot, "BOT_SESSION", session), \
+             patch.object(bot, "TELEGRAM_CHAT_ID", "42"), \
+             patch.object(bot, "load_bot_offset", return_value=0), \
+             patch.object(bot, "save_bot_offset") as save_offset, \
+             patch.object(bot, "handle_callback") as handle, \
+             patch.object(bot.STOP_EVENT, "is_set", side_effect=[False, True]):
+            bot.bot_loop()
+
+        handle.assert_not_called()
+        # offset всё равно продвигается, чтобы бэклог не повторялся:
+        save_offset.assert_called_once_with(11)
 
 
 if __name__ == "__main__":

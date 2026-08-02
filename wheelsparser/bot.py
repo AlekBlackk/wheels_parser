@@ -40,7 +40,7 @@ from .storage import (
     removed_wheels_today,
     save_bot_offset,
 )
-from .telegram_api import bot_send
+from .telegram_api import answer_callback_query, bot_send
 from .timeutils import now_msk
 from .urls import normalize_url
 
@@ -589,6 +589,34 @@ COMMAND_HANDLERS: dict[str, Callable[[str, str], None]] = {
 }
 
 
+_MENU_RUN_COMMANDS: dict[str, str] = {
+    "m:do_wheels": "cmd_wheels",
+    "m:do_active": "cmd_active",
+    "m:do_status": "cmd_status",
+    "m:do_top": "cmd_top",
+}
+
+
+def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) -> None:
+    """Разбирает callback inline-кнопки.
+
+    Действия, запускающие существующую команду (m:do_*), обрабатываются
+    здесь — им нужны cmd_wheels/cmd_active/cmd_status/cmd_top из этого
+    модуля. Диспетчер хранит имена функций, а не сами объекты: вызов через
+    globals() резолвится в момент обращения, поэтому patch.object(bot,
+    "cmd_wheels", ...) в тестах подменяет и то, что вызовется отсюда.
+    Всё остальное (навигация, списки, undo) — в menu.handle_callback,
+    который bot.py не трогает, чтобы не тащить его внутренности сюда.
+    Неопознанный data молча игнорируется — как неизвестные команды.
+    """
+    command_name = _MENU_RUN_COMMANDS.get(data)
+    if command_name is not None:
+        answer_callback_query(callback_id)
+        globals()[command_name](chat_id, "")
+        return
+    menu.handle_callback(chat_id, message_id, callback_id, data)
+
+
 def handle_command(chat_id: str, text: str) -> None:
     """Разбирает «/команда аргумент» и вызывает обработчик.
 
@@ -637,6 +665,22 @@ def bot_loop() -> None:
         stale_count = 0
         for update in updates:
             offset = max(offset, int(update.get("update_id", 0)) + 1)
+            callback = update.get("callback_query")
+            if callback is not None:
+                cb_message = callback.get("message") or {}
+                chat_id = str((cb_message.get("chat") or {}).get("id", ""))
+                if not chat_id or not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
+                    # Тот же принцип, что и для команд: без доверенного
+                    # chat_id callback'и не обрабатываются вовсе.
+                    continue
+                callback_id = str(callback.get("id", ""))
+                message_id = int(cb_message.get("message_id", 0))
+                data = str(callback.get("data", ""))
+                try:
+                    handle_callback(chat_id, message_id, callback_id, data)
+                except Exception:
+                    log.exception("Бот: ошибка обработки callback %r", data)
+                continue
             message = update.get("message") or {}
             text = str(message.get("text") or "")
             chat_id = str((message.get("chat") or {}).get("id", ""))
