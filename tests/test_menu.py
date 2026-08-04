@@ -182,7 +182,11 @@ class RemoveChannelCallbackTests(unittest.TestCase):
             answer.assert_called_once()
             self.assertIn("demo", answer.call_args.args[1])
             edited_keyboard = edit.call_args.args[3]
-            callbacks = [b["callback_data"] for row in edited_keyboard["inline_keyboard"] for b in row]
+            callbacks = [
+                b["callback_data"]
+                for row in edited_keyboard["inline_keyboard"]
+                for b in row
+            ]
             self.assertIn("undo:channel", callbacks)
             self.assertEqual(menu.pop_deletion("channel"), "demo")
 
@@ -294,7 +298,9 @@ class RemoveWordCallbackTests(unittest.TestCase):
             save.assert_not_called()
             self.assertEqual(registry.KEYWORDS, ["колесо"])
             self.assertTrue(answer.call_args.kwargs.get("show_alert"))
-            edit.assert_called_once_with("1", 55, menu.words_section_text(), menu.words_list_keyboard())
+            edit.assert_called_once_with(
+                "1", 55, menu.words_section_text(), menu.words_list_keyboard()
+            )
 
     def test_undo_word_restores_and_saves(self):
         menu.remember_deletion("word", "колесо")

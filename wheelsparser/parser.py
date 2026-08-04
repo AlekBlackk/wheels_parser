@@ -28,6 +28,7 @@ from .config import (
     NOTIFY_RETRY_MAX_PER_CYCLE,
     NOTIFY_RETRY_WINDOW_MINUTES,
     PRECHECK_WHEELS,
+    PREVIEW_CHAR_LIMIT,
     REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     icon,
@@ -58,7 +59,7 @@ from .urls import (
 # Чтение канала
 # ----------------------------------------------------------------------------
 
-def message_preview_html(text_element: Any, limit: int = 200) -> str:
+def message_preview_html(text_element: Any, limit: int = PREVIEW_CHAR_LIMIT) -> str:
     """HTML-превью текста поста для отправки с parse_mode=HTML.
 
     Кликабельные ссылки из поста (например «Твич | ВК») сохраняются как
@@ -548,7 +549,7 @@ def _register_pending_expired(
         "channel": channel,
         "msg_id": message["id"],
         "message_url": message["message_url"],
-        "preview": message["text"][:200],
+        "preview": message["text"][:PREVIEW_CHAR_LIMIT],
         "post_text": post_text,
         "first_seen": now,
     }
@@ -719,7 +720,7 @@ def collect_pending_entries(
             "channel": channel,
             "msg_id": message["id"],
             "message_url": message["message_url"],
-            "preview": message["text"][:200],
+            "preview": message["text"][:PREVIEW_CHAR_LIMIT],
             "edited": is_edited_message,
             "status": status,
             "referral": referral,
@@ -789,7 +790,7 @@ def notify_keywords(message: dict[str, Any], channel: str) -> list[dict[str, Any
         "channel": channel,
         "msg_id": message["id"],
         "message_url": message["message_url"],
-        "preview": message["text"][:200],
+        "preview": message["text"][:PREVIEW_CHAR_LIMIT],
         "preview_html": message.get("preview_html", ""),
         "keywords": matched,
         "notified": False,

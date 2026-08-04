@@ -36,6 +36,7 @@ from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
     FREESTREAM_RE,
     PRECHECK_WHEELS,
+    PREVIEW_CHAR_LIMIT,
     REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     TWITCH_BOTS,
@@ -174,7 +175,7 @@ def handle_twitch_message(
             "author_roles": roles,
             "msg_id": tags.get("id", ""),
             "message_url": f"https://www.twitch.tv/{channel}",
-            "preview": text[:200],
+            "preview": text[:PREVIEW_CHAR_LIMIT],
             "edited": False,
             "status": status,
             "referral": referral,

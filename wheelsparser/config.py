@@ -79,6 +79,10 @@ def env_bool(name: str, default: bool = False) -> bool:
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
+# Длина превью текста поста/сообщения в уведомлениях и истории находок
+# (preview, message_preview_html). Не настраивается через env: это лимит
+# формата уведомления, а не поведения парсера.
+PREVIEW_CHAR_LIMIT = 200
 # Сколько каналов опрашивается одновременно. Раньше каналы читались строго
 # по одному с паузой между ними — при полусотне каналов цикл не укладывался
 # в CHECK_INTERVAL, и реальная задержка обнаружения ссылки росла вместе со
@@ -140,6 +144,10 @@ CHANNEL_EMPTY_THRESHOLD = env_int("CHANNEL_EMPTY_THRESHOLD", 3, 2)
 ALERT_ON_FIRST_RUN = env_bool("ALERT_ON_FIRST_RUN", False)
 USE_COLORS = env_bool("USE_COLORS", True)
 USE_ICONS = env_bool("USE_ICONS", True)
+
+# Верхняя граница длины ключевого слова в /addword — против случайной вставки
+# целого поста вместо слова; не настраивается через env.
+KEYWORD_MAX_LENGTH = 64
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()

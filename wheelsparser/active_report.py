@@ -15,7 +15,7 @@ from .betboom import classify_wheels
 from .config import icon
 from .logging_setup import log
 from .telegram_api import background_bot_send, bot_send
-from .timeutils import format_deadline
+from .timeutils import format_deadline, format_found_time
 from .urls import normalize_url
 
 # Один /active за раз (non-blocking acquire).
@@ -51,8 +51,7 @@ def lookup_active_number(number: int) -> tuple[str | None, int]:
 
 def format_active_item(item: dict[str, Any], number: int) -> str:
     """Строка одного колеса в ответе /active."""
-    found_at = str(item.get("found_at", ""))
-    found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+    found_time = format_found_time(item.get("found_at", ""))
     channel = html.escape(str(item.get("channel", "")))
     if item.get("source") == "twitch":
         channel_label = f"twitch.tv/{channel}"

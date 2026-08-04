@@ -244,7 +244,9 @@ def _cb_remove_channel(chat_id: str, message_id: int, callback_id: str, channel:
     with registry.CHANNELS_LOCK:
         if channel not in registry.CHANNELS:
             answer_callback_query(callback_id, "Уже удалён")
-            edit_message_text(chat_id, message_id, channels_section_text(), channels_list_keyboard())
+            edit_message_text(
+                chat_id, message_id, channels_section_text(), channels_list_keyboard()
+            )
             return
         registry.CHANNELS.remove(channel)
         registry.save_channels_file()

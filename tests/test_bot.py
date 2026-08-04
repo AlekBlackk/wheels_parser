@@ -193,6 +193,17 @@ class RemoveWheelCommandTests(unittest.TestCase):
 
         mark.assert_called_once_with("https://betboom.ru/freestream/two")
 
+    def test_unicode_digit_lookalike_is_rejected_not_crashed(self):
+        # "²" проходит str.isdigit(), но int("²") бросает ValueError —
+        # без isascii()-проверки команда упала бы необработанным исключением
+        # вместо обычной подсказки об ошибке.
+        with patch.object(bot, "mark_wheel_removed") as mark, \
+             patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/removewheel ²")
+
+        mark.assert_not_called()
+        self.assertIn("Укажите номер колеса", send.call_args.args[1])
+
 
 class HistoryReportTests(unittest.TestCase):
     """Отчёты бота читают историю запросами к базе, а не всем файлом."""
@@ -313,8 +324,17 @@ class HistoryReportTests(unittest.TestCase):
         self.assertIn("пока нет", recent)
         self.assertIn("@demo", older)
 
+    def test_top_rejects_unicode_digit_lookalike_without_crashing(self):
+        # "²" проходит str.isdigit(), но int("²") бросает ValueError —
+        # без isascii()-проверки команда упала бы необработанным исключением
+        # вместо обычной подсказки об ошибке.
+        with patch.object(bot, "bot_send") as send:
+            bot.handle_command("1", "/top ²")
+
+        self.assertIn("Укажите период в днях", send.call_args.args[1])
+
     def test_wheels_command_attaches_removal_keyboard_and_shares_numbering(self):
-        from wheelsparser import active_report, menu
+        from wheelsparser import active_report
         self.store(url="https://betboom.ru/freestream/only")
         self.addCleanup(active_report.forget_active_numbers)
 

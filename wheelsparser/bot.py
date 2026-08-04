@@ -26,6 +26,7 @@ from .config import (
     BOT_API,
     CHECK_INTERVAL,
     FREESTREAM_RE,
+    KEYWORD_MAX_LENGTH,
     REQUEST_TIMEOUT,
     STALE_COMMAND_SECONDS,
     TELEGRAM_CHAT_ID,
@@ -45,7 +46,7 @@ from .storage import (
     save_bot_offset,
 )
 from .telegram_api import answer_callback_query, bot_send
-from .timeutils import now_msk
+from .timeutils import format_found_time, now_msk
 from .urls import normalize_url
 
 BOT_COMMANDS = [
@@ -161,8 +162,7 @@ def status_text() -> str:
     if stats.last is None:
         lines.append("🕑 Последняя ссылка: пока нет")
         return "\n".join(lines)
-    found_at = str(stats.last.get("found_at", ""))
-    found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+    found_time = format_found_time(stats.last.get("found_at", ""))
     url = html.escape(normalize_url(str(stats.last.get("url", ""))))
     lines.append(
         f"🕑 Последняя ссылка: {found_time} ({channel_label(stats.last)})"
@@ -252,7 +252,11 @@ def cmd_status(chat_id: str, _argument: str) -> None:
 
 def cmd_top(chat_id: str, argument: str) -> None:
     raw = argument.strip()
-    if raw and not raw.isdigit():
+    # isascii() обязателен: isdigit() true и для юникодных цифр вроде «²»
+    # или «٣», на которых int() падает с ValueError — исключение ушло бы
+    # необработанным из handle_command (перехватывается лишь в bot_loop,
+    # но ответ пользователю уже не будет отправлен).
+    if raw and not (raw.isascii() and raw.isdigit()):
         bot_send(
             chat_id,
             "Укажите период в днях: <code>/top 7</code> "
@@ -280,8 +284,7 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
     numbered = list(enumerate(wheels, start=1))
     keyboard_rows: list[tuple[int, str]] = []
     for number, item in numbered:
-        found_at = str(item.get("found_at", ""))
-        found_time = found_at[11:16] if len(found_at) >= 16 else found_at
+        found_time = format_found_time(item.get("found_at", ""))
         channel = html.escape(str(item.get("channel", "")))
         # normalize_url: старые записи могли сохранить URL с &amp; и utm-хвостом.
         url = html.escape(normalize_url(str(item.get("url", ""))))
@@ -322,7 +325,7 @@ def _resolve_wheel_to_remove(chat_id: str, raw: str) -> str | None:
 
     None означает, что пользователю уже отправлена подсказка об ошибке.
     """
-    if raw.isdigit():
+    if raw.isascii() and raw.isdigit():
         number = int(raw)
         url, known = lookup_active_number(number)
         if not url:
@@ -416,7 +419,7 @@ def cmd_words(chat_id: str, _argument: str) -> None:
 
 def _validate_keyword(chat_id: str, command: str, argument: str) -> str | None:
     keyword = argument.strip()
-    if not keyword or len(keyword) > 64:
+    if not keyword or len(keyword) > KEYWORD_MAX_LENGTH:
         bot_send(
             chat_id,
             f"Укажите слово: <code>{command} колесо</code>",
@@ -436,14 +439,19 @@ def _validate_keyword(chat_id: str, command: str, argument: str) -> str | None:
     return keyword
 
 
+def _find_keyword_casefold(keyword: str) -> str | None:
+    """Ищет слово в registry.KEYWORDS без учёта регистра. Вызывать под KEYWORDS_LOCK."""
+    return next(
+        (k for k in registry.KEYWORDS if k.casefold() == keyword.casefold()), None
+    )
+
+
 def cmd_addword(chat_id: str, argument: str) -> None:
     keyword = _validate_keyword(chat_id, "/addword", argument)
     if keyword is None:
         return
     with registry.KEYWORDS_LOCK:
-        existing = next(
-            (k for k in registry.KEYWORDS if k.casefold() == keyword.casefold()), None
-        )
+        existing = _find_keyword_casefold(keyword)
         if existing is not None:
             bot_send(
                 chat_id,
@@ -467,9 +475,7 @@ def cmd_removeword(chat_id: str, argument: str) -> None:
     if keyword is None:
         return
     with registry.KEYWORDS_LOCK:
-        existing = next(
-            (k for k in registry.KEYWORDS if k.casefold() == keyword.casefold()), None
-        )
+        existing = _find_keyword_casefold(keyword)
         if existing is None:
             bot_send(
                 chat_id,

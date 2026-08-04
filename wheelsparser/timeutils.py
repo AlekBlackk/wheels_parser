@@ -75,6 +75,18 @@ def format_deadline(value: Any, remaining: bool = True) -> str:
     return f"{end.strftime('%H:%M')} ({left_note})"
 
 
+def format_found_time(value: Any) -> str:
+    """«ЧЧ:ММ» из ISO-строки found_at («YYYY-MM-DDTHH:MM:SS+03:00»).
+
+    Строковый срез, а не parse_msk: found_at уже в МСК (см. модульную
+    докстроку), лишний парсинг и обратное форматирование не нужны. Значение
+    короче ожидаемого возвращается как есть — вызывающему всё равно нечего
+    показать точнее.
+    """
+    found_at = str(value)
+    return found_at[11:16] if len(found_at) >= 16 else found_at
+
+
 def format_found_at(value: Any) -> str:
     """Время находки в читаемом виде (МСК): 16.07.2026 | 20:40:31 | +03:00."""
     moment = parse_found_at(value)
