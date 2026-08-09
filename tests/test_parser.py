@@ -12,13 +12,14 @@ from tests.dbfixture import entries_since, use_temp_db
 from wheelsparser import alerts, betboom, config, db, parser, registry, storage, urls
 
 
-def make_message(message_id, text, links):
+def make_message(message_id, text, links, disallowed_domains=()):
     """Сообщение в том виде, в каком его отдаёт fetch_channel."""
     return {
         "id": message_id,
         "text": text,
         "preview_html": text,
         "urls": links,
+        "disallowed_domains": list(disallowed_domains),
         "hash": urls.message_content_hash(text, links),
         "legacy_hash": urls.message_content_hash(text, links),
         "message_url": f"https://t.me/{message_id}",
@@ -333,6 +334,24 @@ class ProcessMessageTests(unittest.TestCase):
             entries = self.process(make_message("demo/1", "будет колесо", []), {})
 
         self.assertTrue(entries[0]["notified"])
+
+    def test_keyword_alert_dropped_for_third_party_link(self):
+        # Скам-казино: пост со словом «колесо», но ссылка ведёт не на
+        # betboom.ru — алерта быть не должно (см. urls.find_disallowed_domains).
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "send_keyword_notification") as notify:
+            entries = self.process(
+                make_message(
+                    "demo/1",
+                    "Колесо на 60000$",
+                    [],
+                    disallowed_domains=["mellehdw.life"],
+                ),
+                {},
+            )
+
+        notify.assert_not_called()
+        self.assertEqual(entries, [])
 
 
 class RetryExpiredLinksTests(unittest.TestCase):

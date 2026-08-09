@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import FREESTREAM_RE, TRAILING_PUNCTUATION
+from .config import ALLOWED_KEYWORD_DOMAINS, FREESTREAM_RE, TRAILING_PUNCTUATION
 
 _SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -91,6 +91,37 @@ def extract_urls(
 def find_urls(node: Any, text: str) -> list[str]:
     """Канонические ссылки на колёса из сообщения."""
     return extract_urls(node, text, normalize_url)
+
+
+def find_disallowed_domains(node: Any, text: str) -> list[str]:
+    """Домены ссылок поста, не входящие в ALLOWED_KEYWORD_DOMAINS.
+
+    Ссылочная (freestream) находка уже домен-специфична сама по себе
+    (см. FREESTREAM_RE) — эта проверка нужна только алерту по ключевым
+    словам без ссылки на betboom.ru (см. parser.notify_keywords). Скам-
+    казино нередко копирует формулировки типа «колесо на 60000$», но ведёт
+    на свой сайт — без проверки такой пост уходил бы алертом наравне с
+    настоящим колесом (пример: канал слал колесо и рекламу казино вперемешку,
+    оба текста содержат слово «колесо»).
+    Смотрим только <a href> — веб-превью t.me/s автоматически превращает
+    голые URL в посте в такие ссылки, отдельный regex по тексту не нужен.
+    Порядок сохраняется, дубликаты домена схлопываются.
+    """
+    domains: list[str] = []
+    for link in node.find_all("a", href=True):
+        href = str(link.get("href", "")).strip()
+        if not href:
+            continue
+        domain = urlsplit(normalize_url(href)).netloc
+        if not domain or domain in domains:
+            continue
+        if any(
+            domain == allowed or domain.endswith(f".{allowed}")
+            for allowed in ALLOWED_KEYWORD_DOMAINS
+        ):
+            continue
+        domains.append(domain)
+    return domains
 
 
 def message_content_hash(text: str, urls: list[str]) -> str:

@@ -217,6 +217,16 @@ FREESTREAM_RE = re.compile(
     re.IGNORECASE,
 )
 TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
+
+# Домены, разрешённые в посте, найденном по ключевому слову (см.
+# urls.find_disallowed_domains). Ссылочная (freestream) ветка уже
+# домен-специфична сама по себе (см. FREESTREAM_RE) — это ограничение
+# только для алертов по ключевым словам без ссылки на betboom.ru:
+# скам-казино нередко пишет «колесо на 60000$» и ведёт на свой сайт —
+# без проверки домена такой пост уходил бы алертом наравне с настоящим
+# колесом. t.me/telegram.me разрешены — это ссылка на другой пост/канал
+# в том же Telegram, а не сторонний сайт.
+ALLOWED_KEYWORD_DOMAINS = frozenset({"betboom.ru", "t.me", "telegram.me"})
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

@@ -140,6 +140,38 @@ class FindUrlsTests(unittest.TestCase):
         )
 
 
+class FindDisallowedDomainsTests(unittest.TestCase):
+    def test_allows_betboom_and_telegram_links(self):
+        html = BeautifulSoup(
+            '<div><a href="https://betboom.ru/freestream/demo">колесо</a> '
+            '<a href="https://t.me/somechannel">канал</a></div>',
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
+        )
+
+    def test_flags_third_party_casino_link(self):
+        # Реальный кейс: скам-казино пишет «колесо на 60000$» и ведёт на
+        # свой сайт вместо betboom.ru/freestream — такой пост не должен
+        # уходить алертом наравне с настоящим колесом.
+        html = BeautifulSoup(
+            '<div>Колесо на 60000$ '
+            '<a href="https://mellehdw.life/?open=register&p=qmf5">тут</a></div>',
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["mellehdw.life"],
+        )
+
+    def test_no_links_means_no_disallowed_domains(self):
+        html = BeautifulSoup("<div>просто текст про колесо</div>", "html.parser")
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
+        )
+
+
 class ContentHashTests(unittest.TestCase):
     def test_hash_ignores_whitespace_changes(self):
         self.assertEqual(

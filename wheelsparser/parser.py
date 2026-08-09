@@ -49,6 +49,7 @@ from .timeutils import now_msk, parse_found_at
 from .twitch import TWITCH_NEW_ENTRIES
 from .urls import (
     extract_urls,
+    find_disallowed_domains,
     find_urls,
     legacy_normalize_url,
     message_content_hash,
@@ -161,6 +162,10 @@ def fetch_channel(
                 "text": text,
                 "preview_html": message_preview_html(text_element),
                 "urls": urls,
+                # Домены поста вне betboom.ru/t.me — сигнал скам-рекламы
+                # («колесо на 60000$», ведущее на сторонний сайт), см.
+                # notify_keywords и urls.find_disallowed_domains.
+                "disallowed_domains": find_disallowed_domains(message, text),
                 "hash": message_content_hash(text, urls),
                 # Хэш в формате старых версий (URL с query-параметрами):
                 # сравнение с ним не даёт принять смену формата хэша за
@@ -784,6 +789,20 @@ def notify_keywords(message: dict[str, Any], channel: str) -> list[dict[str, Any
     """
     matched = find_keywords(message["text"])
     if not matched:
+        return []
+    disallowed_domains = message.get("disallowed_domains") or []
+    if disallowed_domains:
+        # Пост со словом «колесо» и т.п., ведущий на сторонний сайт —
+        # похоже на скам-казино, а не на настоящее колесо betboom, у
+        # которого своя ссылочная ветка (см. find_disallowed_domains).
+        # Молча дропаем: пользователь явно не хочет видеть такие алерты.
+        log.info(
+            "%s Пропускаю ключевые слова (%s) [@%s]: подозрительная ссылка (%s)",
+            icon("warn"),
+            ", ".join(matched),
+            channel,
+            ", ".join(disallowed_domains),
+        )
         return []
     entry = {
         "found_at": now_msk().isoformat(timespec="seconds"),
