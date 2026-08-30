@@ -151,6 +151,21 @@ class FindDisallowedDomainsTests(unittest.TestCase):
             urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
         )
 
+    def test_allows_streamer_platform_links(self):
+        # Обычный пост стримера: колесо плюс ссылки на его площадки
+        # («Твич | ВК»). Такие домены не признак скама, и алерт по
+        # ключевому слову из-за них дропаться не должен.
+        html = BeautifulSoup(
+            '<div>Колесо! '
+            '<a href="https://www.twitch.tv/vlazhniy">твич</a> '
+            '<a href="https://vk.com/vlazhniy">вк</a> '
+            '<a href="https://youtu.be/abc">ютуб</a></div>',
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
+        )
+
     def test_flags_third_party_casino_link(self):
         # Реальный кейс: скам-казино пишет «колесо на 60000$» и ведёт на
         # свой сайт вместо betboom.ru/freestream — такой пост не должен

@@ -416,7 +416,17 @@ class RetryExpiredLinksTests(unittest.TestCase):
         нужный флаг."""
         self._seed()
         self.addCleanup(betboom._expired_cache.clear)
-        with patch.object(betboom, "fetch_wheel_info", return_value={"is_ended": True}):
+        # Полный ответ API, а не только is_ended: один флаг статусом больше
+        # не считается (заглушка API отдаёт его и для живых колёс, см.
+        # betboom.api_info_to_status).
+        ended = dt.now(timezone.utc) - timedelta(hours=2)
+        expired_info = {
+            "is_ended": True,
+            "is_early": False,
+            "start_dttm": ended.isoformat().replace("+00:00", "Z"),
+            "duration_min": 30,
+        }
+        with patch.object(betboom, "fetch_wheel_info", return_value=expired_info):
             # Кэш выставляется так же, как при первичном обнаружении «хвоста».
             self.assertEqual(betboom.precheck_wheel(self.url)[0], "expired")
 

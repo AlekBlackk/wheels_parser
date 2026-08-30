@@ -17,9 +17,67 @@ def running_info(**extra):
     }
 
 
+def ended_info(**extra):
+    """info завершённого колеса: полный ответ API, а не заглушка.
+
+    is_ended в одиночку статусом больше не считается (см. stub_info), поэтому
+    тестам про expired нужен ответ с окном розыгрыша.
+    """
+    started = datetime.now(timezone.utc) - timedelta(hours=2)
+    return {
+        "is_ended": True,
+        "is_early": False,
+        "start_dttm": started.isoformat().replace("+00:00", "Z"),
+        "duration_min": 30,
+        **extra,
+    }
+
+
+def stub_info(**extra):
+    """Ответ-заглушка API BetBoom: is_ended=true и ни одного пригодного поля.
+
+    Ровно такой ответ API отдаёт с августа 2026 на ЛЮБОЙ streamer_link,
+    включая живое колесо (проверено на betboom.ru/freestream/vlazhniy) и
+    заведомо несуществующий slug. start_dttm в нём — время запроса, а не
+    старт розыгрыша; duration_min и is_early из ответа исчезли.
+    """
+    return {
+        "start_dttm": "2026-08-30T14:41:39.968Z",
+        "title": "Колесо Фрибетов",
+        "prizes": [500],
+        "is_ended": True,
+        "rules_link": "https://static.mobile-bb.com/x/various_files/y.pdf",
+        **extra,
+    }
+
+
 class ApiStatusTests(unittest.TestCase):
-    def test_marks_ended_wheel_expired(self):
-        self.assertEqual(betboom.api_info_to_status({"is_ended": True}), "expired")
+    def test_rejects_stub_info_without_classifiable_fields(self):
+        # is_ended=true в одиночку доверия не заслуживает: заглушка API
+        # отдаёт его для живых колёс, и вера в него означала бы fail-closed
+        # (все находки молча пропадают). unknown уходит fail-open.
+        self.assertEqual(betboom.api_info_to_status(stub_info()), "unknown")
+
+    def test_expires_ended_wheel_with_known_window(self):
+        # Настоящий ответ с окном розыгрыша: is_ended=true по-прежнему
+        # означает «завершилось» — fail-open ничего здесь не смягчает.
+        self.assertEqual(
+            betboom.api_info_to_status({
+                "is_ended": True,
+                "is_early": False,
+                "start_dttm": "2026-08-30T10:00:00Z",
+                "duration_min": 30,
+            }),
+            "expired",
+        )
+
+    def test_expires_ended_wheel_with_is_early_flag(self):
+        # Окна нет, но is_early пришёл булевым — значит ответ настоящий,
+        # и is_ended можно верить.
+        self.assertEqual(
+            betboom.api_info_to_status({"is_ended": True, "is_early": False}),
+            "expired",
+        )
 
     def test_marks_early_wheel_soon(self):
         self.assertEqual(
@@ -246,7 +304,7 @@ class ExpiredCacheTests(unittest.TestCase):
     def _expired_response(self):
         return Mock(
             status_code=200,
-            json=Mock(return_value={"info": {"is_ended": True}}),
+            json=Mock(return_value={"info": ended_info()}),
         )
 
     def _active_response(self):

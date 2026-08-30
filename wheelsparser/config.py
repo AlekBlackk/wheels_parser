@@ -225,8 +225,15 @@ TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 # скам-казино нередко пишет «колесо на 60000$» и ведёт на свой сайт —
 # без проверки домена такой пост уходил бы алертом наравне с настоящим
 # колесом. t.me/telegram.me разрешены — это ссылка на другой пост/канал
-# в том же Telegram, а не сторонний сайт.
-ALLOWED_KEYWORD_DOMAINS = frozenset({"betboom.ru", "t.me", "telegram.me"})
+# в том же Telegram, а не сторонний сайт. Площадки стримеров (twitch, vk,
+# youtube) — тоже: пост с колесом почти всегда несёт подпись «Твич | ВК»,
+# и без них проверка глушила бы не скам, а обычные посты тех самых каналов,
+# за которыми и ведётся мониторинг. Проверка идёт и по поддоменам
+# (см. urls.find_disallowed_domains), поэтому www.twitch.tv тоже разрешён.
+ALLOWED_KEYWORD_DOMAINS = frozenset({
+    "betboom.ru", "t.me", "telegram.me",
+    "twitch.tv", "vk.com", "vk.ru", "youtube.com", "youtu.be",
+})
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

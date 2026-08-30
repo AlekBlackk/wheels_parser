@@ -115,13 +115,26 @@ def api_info_to_status(info: dict[str, Any]) -> str:
     is_ended = info.get("is_ended")
     if not isinstance(is_ended, bool):
         return "unknown"
-    if is_ended:
-        return "expired"
     # is_ended у API BetBoom запаздывает: флаг не переключается по таймеру,
     # и колесо может часами числиться «не завершённым» после окончания.
     # Поэтому конец розыгрыша считаем сами: start_dttm + duration_min.
     time_status: str | None = None
     start, end = wheel_window(info)
+    is_early = info.get("is_early")
+    # Ответ, в котором нет ни окна розыгрыша, ни булева is_early, о колесе
+    # не сообщает ничего — верить одному is_ended в нём нельзя. С августа
+    # 2026 API отдаёт именно такую заглушку («Колесо Фрибетов», prizes [500],
+    # is_ended=true, start_dttm = время запроса) на ЛЮБОЙ streamer_link:
+    # и на живое колесо, и на несуществующий slug, и на пустое тело запроса.
+    # Раньше такой ответ давал expired, и уведомления молча пропадали все до
+    # единого — fail-closed вместо заявленного fail-open. Возвращаем unknown:
+    # лучше лишнее уведомление, чем пропущенное живое колесо. Настоящий
+    # ответ с окном или is_early обрабатывается как прежде, поэтому проверка
+    # сама себя отключит, если BetBoom вернёт поля назад.
+    if start is None and not isinstance(is_early, bool):
+        return "unknown"
+    if is_ended:
+        return "expired"
     if start is not None and end is not None:
         now = datetime.now(timezone.utc)
         if now >= end:
@@ -131,15 +144,13 @@ def api_info_to_status(info: dict[str, Any]) -> str:
     # поэтому он надёжнее расчёта по start_dttm: бывает, что start_dttm
     # уже в прошлом, а розыгрыш стример ещё не запустил. is_early=True
     # всегда означает «ещё не началось» (если не истекло по времени выше).
-    is_early = info.get("is_early")
     if isinstance(is_early, bool) and is_early:
         return "soon"
     if time_status is not None:
         return time_status
-    if not isinstance(is_early, bool):
-        return "unknown"
-    # Сюда попадают колёса без пригодного start_dttm. Розыгрыш идёт только
-    # с момента старта, поэтому у активного колеса время старта в info есть
+    # Сюда попадают колёса без пригодного start_dttm (is_early здесь уже
+    # заведомо булев — иначе ответ отсеян как заглушка выше). Розыгрыш идёт
+    # только с момента старта, поэтому у активного колеса время старта есть
     # всегда. Его отсутствие означает «стример создал колесо, но не запустил»:
     # на странице «Акция скоро начнётся» и кнопки участия нет — даже при
     # is_early=false. Такое колесо в /active показывать нельзя.
