@@ -572,6 +572,9 @@ def retry_expired_links(
 ) -> list[dict[str, Any]]:
     """Перепроверяет ссылки, ранее пропущенные как expired/soon (см. PENDING_EXPIRED_RETRY).
 
+    Уведомление уходит только по статусу 'active' — по положительному ответу
+    API, а не по его отсутствию (unknown), см. комментарий в теле функции.
+
     Окно ограничено так же, как у retry_failed_notifications
     (NOTIFY_RETRY_WINDOW_MINUTES): дольше ждать бессмысленно — колесо либо
     давно завершилось по-настоящему, либо перезапустится новым постом и
@@ -613,8 +616,18 @@ def retry_expired_links(
         status, referral, ends_at = precheck_wheel(
             url, post_text=info["post_text"], use_cache=False
         )
-        if status in ("expired", "soon"):
-            continue  # всё ещё завершено или ещё не началось — ждём следующего цикла
+        # Оповещаем только по положительному ответу API. Здесь, в отличие от
+        # collect_pending_entries, fail-open по unknown неуместен: ссылка
+        # попала в список уже отвергнутой, нового поста за ней нет, и
+        # «проверить не удалось» не сообщает о ней ничего нового. Рассылка по
+        # unknown превращала весь накопленный список в пачку устаревших
+        # уведомлений — заглушка API BetBoom (см. betboom.api_info_to_status)
+        # отдаёт unknown для всех колёс подряд, и после рестарта разом
+        # «ожили» ссылки, которым было по несколько часов. Свежий пост в
+        # уведомлении не теряется: его fail-open отрабатывает сразу в
+        # collect_pending_entries, не доходя до этого ретрая.
+        if status != "active":
+            continue  # ещё не ожило (или проверить нечем) — ждём следующего цикла
         _drop_pending_expired(url)
         entry = {
             "url": url,

@@ -407,6 +407,24 @@ class RetryExpiredLinksTests(unittest.TestCase):
         # Кулдаун должен встать — иначе обычный цикл тут же продублирует.
         self.assertTrue(alerts.cooldown_active(self.url, self.now))
 
+    def test_unknown_status_does_not_resurrect_link(self):
+        # unknown — это «проверить не удалось», а не «ожило». Ссылка сюда
+        # попала уже отвергнутой, нового поста за ней нет, и оповещать по
+        # отсутствию информации значит рассылать мертвецов: именно так
+        # заглушка API BetBoom (все статусы unknown) превращала весь
+        # накопленный список в пачку устаревших уведомлений после рестарта.
+        self._seed()
+        with patch.object(
+            parser, "precheck_wheel", return_value=("unknown", False, "")
+        ), patch.object(parser, "send_telegram_notification") as send:
+            entries = parser.retry_expired_links(self.now, {})
+
+        self.assertEqual(entries, [])
+        send.assert_not_called()
+        # Ссылка остаётся на перепроверке: вдруг API оживёт до конца окна.
+        self.assertIn(self.url, parser.PENDING_EXPIRED_RETRY)
+        self.assertFalse(alerts.cooldown_active(self.url, self.now))
+
     def test_retry_recovers_wheel_through_real_expired_cache(self):
         """Регрессия: precheck_wheel раньше отдавал expired из кэша betboom.py
         (TTL был = REALERT_COOLDOWN_MINUTES, 30 мин), и ретрай ни разу не

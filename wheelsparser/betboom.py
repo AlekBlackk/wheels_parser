@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,7 @@ from typing import Any
 import requests
 
 from .config import (
+    ACTION_SIGNATURE_TTL_SECONDS,
     ACTIVE_CHECK_CONCURRENCY,
     EXPIRED_CACHE_TTL_SECONDS,
     HEADERS,
@@ -38,6 +40,76 @@ from .urls import normalize_url
 # active-api-потока, поэтому доступ — только под _expired_cache_lock.
 _expired_cache: dict[str, datetime] = {}
 _expired_cache_lock = threading.Lock()
+
+
+# Подписи действий: url -> (action_uid, подпись, момент получения).
+# get-info принимает action_uid, а не адрес колеса, и требует заголовка
+# x-action-signature (см. _fetch_action_signature). Оба значения лежат в
+# __NEXT_DATA__ страницы колеса, поэтому проверка стоит двух запросов —
+# кэш сводит их обратно к одному. TTL — ACTION_SIGNATURE_TTL_SECONDS.
+# Кэш общий для parser-потока, twitch-worker и пула /active, поэтому доступ
+# — только под _signature_cache_lock.
+_signature_cache: dict[str, tuple[str, str, datetime]] = {}
+_signature_cache_lock = threading.Lock()
+
+# Состояние страницы колеса Next.js кладёт в этот тег. bs4 здесь не нужен:
+# из двадцати килобайт разметки берётся один известный скрипт.
+NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+
+
+def _cached_signature(url: str) -> tuple[str, str] | None:
+    cutoff = timedelta(seconds=ACTION_SIGNATURE_TTL_SECONDS)
+    now = now_msk()
+    with _signature_cache_lock:
+        for stale_url, (_uid, _sig, when) in list(_signature_cache.items()):
+            if now - when > cutoff:
+                _signature_cache.pop(stale_url, None)
+        entry = _signature_cache.get(url)
+    return (entry[0], entry[1]) if entry is not None else None
+
+
+def _fetch_action_signature(
+    url: str, session: requests.Session
+) -> tuple[str, str] | None:
+    """action_uid колеса и подпись запроса со страницы колеса.
+
+    Возвращает (action_uid, signature) или None, если страницу не удалось
+    получить или разобрать. Значения берутся из __NEXT_DATA__:
+    ``props.pageProps.uid`` — постоянный идентификатор действия,
+    ``props.pageProps.hash`` — JWT со сроком жизни сутки, который API ждёт
+    в заголовке x-action-signature. Результат кэшируется, см. _signature_cache.
+    """
+    cached = _cached_signature(url)
+    if cached is not None:
+        return cached
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            log.debug("wheel-page: HTTP %s для %s", response.status_code, url)
+            return None
+        match = NEXT_DATA_RE.search(response.text)
+        if match is None:
+            log.debug("wheel-page: __NEXT_DATA__ не найден на %s", url)
+            return None
+        page_props = json.loads(match.group(1))["props"]["pageProps"]
+        action_uid = page_props.get("uid")
+        signature = page_props.get("hash")
+    except Exception as error:
+        log.debug("wheel-page: не удалось разобрать %s: %s", url, error)
+        return None
+    if not (
+        isinstance(action_uid, str)
+        and isinstance(signature, str)
+        and action_uid
+        and signature
+    ):
+        log.debug("wheel-page: на %s нет uid/hash", url)
+        return None
+    with _signature_cache_lock:
+        _signature_cache[url] = (action_uid, signature, now_msk())
+    return action_uid, signature
 
 
 # У API BetBoom нет флага «колесо для рефералов» — стример помечает это
@@ -165,19 +237,31 @@ def fetch_wheel_info(
     Возвращает словарь info или None при любой ошибке (сеть, не-200,
     неожиданный формат). Сессия передаётся явно: у каждого потока она
     своя (см. net.py).
+
+    Запрос идёт по подписанному контракту: тело — {"action_uid": ...},
+    подпись — в заголовке x-action-signature (см. _fetch_action_signature).
+    Прежний вариант (тело {"streamer_link": ...} без подписи) API с августа
+    2026 не отвергает, а отвечает заглушкой: одинаковый ответ на любой
+    адрес, с is_ended=true и без duration_min/is_early — то есть живое
+    колесо выглядело завершившимся, и уведомления пропадали все до единого.
     """
     canonical = normalize_url(url)
     if not canonical:
         return None
+    signature = _fetch_action_signature(canonical, session)
+    if signature is None:
+        return None
+    action_uid, action_signature = signature
     try:
         response = session.post(
             STREAMER_WHEEL_INFO_API,
-            json={"streamer_link": canonical},
+            json={"action_uid": action_uid},
             headers={
                 **HEADERS,
                 "Accept": "application/json",
                 "X-Platform": "web",
                 "Referer": canonical,
+                "x-action-signature": action_signature,
             },
             timeout=REQUEST_TIMEOUT,
         )

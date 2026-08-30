@@ -193,6 +193,16 @@ TWITCH_ROLE_ICONS = {
 }
 
 STREAMER_WHEEL_INFO_API = "https://betboom.ru/api/streamer-wheel/action/get-info"
+# Сколько секунд переиспользуется подпись действия (action_uid + JWT) со
+# страницы колеса. get-info принимает не адрес колеса, а его action_uid, и
+# требует подписи в заголовке x-action-signature — оба значения берутся из
+# __NEXT_DATA__ страницы, то есть на каждую проверку приходится ДВА запроса
+# (страница + API). action_uid у колеса постоянен, а у JWT срок жизни сутки,
+# поэтому пара кэшируется: без этого ретрай одной ссылки (раз в минуту до
+# трёх часов, см. NOTIFY_RETRY_WINDOW_MINUTES) тянул бы страницу колеса
+# каждый цикл. TTL берётся с большим запасом до истечения JWT — просроченная
+# подпись роняет ответ в заглушку, а её парсер трактует как 'unknown'.
+ACTION_SIGNATURE_TTL_SECONDS = env_int("ACTION_SIGNATURE_TTL_SECONDS", 3600, 60)
 
 # Схема и www. — опциональны: Twitch-боты (nightbot, StreamElements и т.п.)
 # нередко режут https:// в сообщениях чата, а обычный regex с обязательным

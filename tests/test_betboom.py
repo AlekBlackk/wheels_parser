@@ -51,6 +51,32 @@ def stub_info(**extra):
     }
 
 
+WHEEL_PAGE_HTML = (
+    "<html><body>"
+    '<script id="__NEXT_DATA__" type="application/json">'
+    '{"props": {"pageProps": {"uid": "action-uid-1", "hash": "signature-1"}}}'
+    "</script></body></html>"
+)
+
+
+def wheel_page_response():
+    """Страница колеса с __NEXT_DATA__: оттуда берутся action_uid и подпись."""
+    return Mock(status_code=200, text=WHEEL_PAGE_HTML)
+
+
+def wheel_session(post_response=None):
+    """Сессия, отдающая страницу колеса на GET и заданный ответ API на POST.
+
+    Проверка статуса стоит двух запросов: страница (за подписью) и сам
+    get-info (см. betboom._fetch_action_signature).
+    """
+    session = Mock()
+    session.get.return_value = wheel_page_response()
+    if post_response is not None:
+        session.post.return_value = post_response
+    return session
+
+
 class ApiStatusTests(unittest.TestCase):
     def test_rejects_stub_info_without_classifiable_fields(self):
         # is_ended=true в одиночку доверия не заслуживает: заглушка API
@@ -129,6 +155,13 @@ class ApiStatusTests(unittest.TestCase):
 
 
 class ApiCheckTests(unittest.TestCase):
+    def setUp(self):
+        # Подпись действия кэшируется по URL (см. betboom._signature_cache):
+        # без сброса тест получил бы подпись, оставленную соседним тестом,
+        # и страницу колеса вообще не запросил.
+        betboom._signature_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
+
     def test_api_check_posts_normalized_freestream_url(self):
         response = Mock()
         response.status_code = 200
@@ -137,25 +170,95 @@ class ApiCheckTests(unittest.TestCase):
             "status": "OK",
             "info": running_info(),
         }
-        session = Mock()
-        session.post.return_value = response
+        session = wheel_session(response)
 
         status = betboom.check_wheel_status(
             "https://betboom.ru/freestream/zonertg10?utm_source=test", session
         )
 
         self.assertEqual(status, "active")
+        # Новый контракт: тело — action_uid со страницы, подпись — в заголовке.
+        # Прежнее {"streamer_link": ...} без подписи API не отвергает, а
+        # отдаёт заглушку с is_ended=true (см. fetch_wheel_info).
         self.assertEqual(
-            session.post.call_args.kwargs["json"],
-            {"streamer_link": "https://betboom.ru/freestream/zonertg10"},
+            session.post.call_args.kwargs["json"], {"action_uid": "action-uid-1"}
+        )
+        self.assertEqual(
+            session.post.call_args.kwargs["headers"]["x-action-signature"],
+            "signature-1",
+        )
+        # Страница берётся по канонизированному адресу, без query-параметров.
+        self.assertEqual(
+            session.get.call_args.args[0], "https://betboom.ru/freestream/zonertg10"
         )
 
     def test_api_check_returns_unknown_for_http_failure(self):
         response = Mock(status_code=503)
-        session = Mock()
-        session.post.return_value = response
+        session = wheel_session(response)
         self.assertEqual(
             betboom.check_wheel_status("https://betboom.ru/freestream/a", session),
+            "unknown",
+        )
+
+
+class ActionSignatureTests(unittest.TestCase):
+    """action_uid и подпись берутся со страницы колеса и переиспользуются.
+
+    get-info принимает не адрес колеса, а его action_uid, плюс требует
+    заголовок x-action-signature — иначе отвечает заглушкой (одинаковый
+    ответ на любой запрос, is_ended=true), из-за которой живые колёса
+    выглядели завершившимися."""
+
+    def setUp(self):
+        betboom._signature_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
+
+    def test_signature_is_reused_within_ttl(self):
+        session = wheel_session(
+            Mock(status_code=200, json=Mock(return_value={"info": running_info()}))
+        )
+        url = "https://betboom.ru/freestream/demo"
+
+        betboom.fetch_wheel_info(url, session)
+        betboom.fetch_wheel_info(url, session)
+
+        # Страница — один раз, API — оба: подпись живёт сутки, а статус
+        # колеса меняется, и кэшировать его здесь нельзя.
+        self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(session.post.call_count, 2)
+
+    def test_page_without_next_data_gives_no_info(self):
+        session = Mock()
+        session.get.return_value = Mock(status_code=200, text="<html>пусто</html>")
+
+        self.assertIsNone(
+            betboom.fetch_wheel_info(
+                "https://betboom.ru/freestream/demo", session
+            )
+        )
+        # Без подписи запрос к API бессмысленен — он бы вернул заглушку.
+        session.post.assert_not_called()
+
+    def test_unavailable_page_gives_no_info(self):
+        session = Mock()
+        session.get.return_value = Mock(status_code=503, text="")
+
+        self.assertIsNone(
+            betboom.fetch_wheel_info(
+                "https://betboom.ru/freestream/demo", session
+            )
+        )
+        session.post.assert_not_called()
+
+    def test_missing_info_falls_back_to_unknown(self):
+        # Недоступная страница не должна выглядеть как «колесо завершилось»:
+        # статус unknown уходит fail-open (см. модульную докстроку).
+        session = Mock()
+        session.get.return_value = Mock(status_code=503, text="")
+        self.assertEqual(
+            betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", session
+            ),
             "unknown",
         )
 
@@ -239,6 +342,13 @@ class WheelDeadlineTests(unittest.TestCase):
 
 
 class PrecheckWheelTests(unittest.TestCase):
+    def setUp(self):
+        # Подпись действия кэшируется по URL (см. betboom._signature_cache):
+        # без сброса тест получил бы подпись, оставленную соседним тестом,
+        # и страницу колеса вообще не запросил.
+        betboom._signature_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
+
     def test_precheck_returns_status_and_referral_flag(self):
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -249,8 +359,7 @@ class PrecheckWheelTests(unittest.TestCase):
                 description="Розыгрыш для рефералов",
             ),
         }
-        session = Mock()
-        session.post.return_value = response
+        session = wheel_session(response)
 
         status, referral, ends_at = betboom.precheck_wheel(
             "https://betboom.ru/freestream/plainslug", session
@@ -267,8 +376,7 @@ class PrecheckWheelTests(unittest.TestCase):
             "status": "OK",
             "info": running_info(title="КОЛЕСО", description="УЧАСТВУЙ"),
         }
-        session = Mock()
-        session.post.return_value = response
+        session = wheel_session(response)
 
         _status, referral, _ends_at = betboom.precheck_wheel(
             "https://betboom.ru/freestream/plainslug",
@@ -300,6 +408,8 @@ class ExpiredCacheTests(unittest.TestCase):
     def setUp(self):
         betboom._expired_cache.clear()
         self.addCleanup(betboom._expired_cache.clear)
+        betboom._signature_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
 
     def _expired_response(self):
         return Mock(
@@ -314,8 +424,7 @@ class ExpiredCacheTests(unittest.TestCase):
         )
 
     def test_expired_status_is_served_from_cache_within_cooldown(self):
-        session = Mock()
-        session.post.return_value = self._expired_response()
+        session = wheel_session(self._expired_response())
         base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
 
         with patch("wheelsparser.betboom.now_msk", return_value=base):
@@ -337,8 +446,7 @@ class ExpiredCacheTests(unittest.TestCase):
         session.post.assert_not_called()
 
     def test_expired_cache_forgets_after_cooldown_window(self):
-        session = Mock()
-        session.post.return_value = self._expired_response()
+        session = wheel_session(self._expired_response())
         base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
 
         with patch("wheelsparser.betboom.now_msk", return_value=base):
@@ -360,8 +468,7 @@ class ExpiredCacheTests(unittest.TestCase):
     def test_precheck_use_cache_false_bypasses_cache(self):
         # retry_expired_links передаёт use_cache=False: его смысл в честной
         # перепроверке, а не в ожидании TTL (см. config.EXPIRED_CACHE_TTL_SECONDS).
-        session = Mock()
-        session.post.return_value = self._expired_response()
+        session = wheel_session(self._expired_response())
         base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
 
         with patch("wheelsparser.betboom.now_msk", return_value=base):
@@ -384,9 +491,8 @@ class ExpiredCacheTests(unittest.TestCase):
         session_calls = []
 
         def fake_build_session():
-            session = Mock()
+            session = wheel_session(self._expired_response())
             session_calls.append(session)
-            session.post.return_value = self._expired_response()
             return session
 
         base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
@@ -400,9 +506,7 @@ class ExpiredCacheTests(unittest.TestCase):
         self.assertEqual(active_items, [])
 
         def fake_build_session_active():
-            session = Mock()
-            session.post.return_value = self._active_response()
-            return session
+            return wheel_session(self._active_response())
 
         after_ttl = base + timedelta(seconds=config.EXPIRED_CACHE_TTL_SECONDS + 1)
         with (
