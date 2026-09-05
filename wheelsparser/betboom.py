@@ -382,6 +382,7 @@ def precheck_wheel(
     session: requests.Session | None = None,
     post_text: str = "",
     use_cache: bool = True,
+    feed_stub_guard: bool = True,
 ) -> tuple[str, bool, str]:
     """Статус колеса, реф-флаг и дедлайн перед отправкой уведомления.
 
@@ -399,6 +400,11 @@ def precheck_wheel(
     перепроверке ссылки, а не в ожидании EXPIRED_CACHE_TTL_SECONDS. Успешный
     результат всё равно пишется в кэш (если снова expired) — другие «хвосты»
     того же URL по-прежнему выигрывают от дедупликации.
+    feed_stub_guard=False исключает результат из счётчика заглушки
+    (см. _apply_stub_guard). Нужен перебору слагов (predictive.py): он
+    намеренно проверяет старые адреса серии, и серия expired подряд для
+    него — норма, а не признак сбоя API. Без этого сканер сам сваливал бы
+    парсер в fail-open на первом же проходе по пропущенным колёсам.
     """
     canonical = normalize_url(url)
     if not canonical:
@@ -412,7 +418,12 @@ def precheck_wheel(
         )
         return "expired", is_referral_wheel(canonical, None, post_text), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
-    status = "unknown" if info is None else _apply_stub_guard(api_info_to_status(info))
+    if info is None:
+        status = "unknown"
+    else:
+        status = api_info_to_status(info)
+        if feed_stub_guard:
+            status = _apply_stub_guard(status)
     referral = is_referral_wheel(canonical, info, post_text)
     log.info(
         "precheck [api]: %s → %s%s",
