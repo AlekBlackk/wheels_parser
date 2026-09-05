@@ -38,6 +38,7 @@ from .config import (
 from .keywords import find_keywords
 from .logging_setup import log
 from .net import PARSER_SESSION, build_session
+from .predictive import drain_predictive_entries
 from .runtime import STOP_EVENT
 from .storage import (
     load_pending_expired,
@@ -1007,7 +1008,10 @@ def process_cycle(
     channels = registry.channels_snapshot()
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), len(channels))
     now = now_msk()
-    twitch_entries = drain_twitch_entries()
+    # Находки сторонних потоков (Twitch, сканер слагов): уведомления по
+    # ним уже отправлены, осталось записать их в историю — вместе, до
+    # расчёта окна кулдауна, чтобы они в это окно попали.
+    twitch_entries = drain_twitch_entries() + drain_predictive_entries()
     drain_twitch_retry_registrations()
     try:
         db.insert_entries(twitch_entries)

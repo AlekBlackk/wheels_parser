@@ -129,6 +129,12 @@ def send_telegram_notification(
             f"(сообщение от {badge_icons}@{entry.get('author', '?')})\n"
         )
         post_line = f"Чат: {entry['message_url']}"
+    elif entry.get("source") == "predictive":
+        # У находки сканера нет ни канала, ни поста: адрес угадан по серии
+        # (см. predictive.py). Показывать «Канал: @zonertg / Пост: <url>»
+        # было бы враньём — такого канала и поста не существует.
+        origin_line = f"{icon('scan')} Найдено перебором серии «{entry['channel']}»\n"
+        post_line = f"Страница: {entry['message_url']}"
     else:
         origin_line = f"Канал: @{entry['channel']}\n"
         post_line = f"Пост: {entry['message_url']}"

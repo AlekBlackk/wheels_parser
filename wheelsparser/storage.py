@@ -26,6 +26,7 @@ from .config import (
     PENDING_EXPIRED_FILE,
     REMOVED_WHEELS_FILE,
     SEEN_FILE,
+    STREAMERS_FILE,
     SUGGESTED_CHANNELS_FILE,
 )
 from .logging_setup import log
@@ -277,6 +278,61 @@ def mark_channel_suggested(channel: str) -> bool:
     except OSError as error:
         log.warning("Не удалось сохранить %s: %s", SUGGESTED_CHANNELS_FILE.name, error)
     return True
+
+
+# ----------------------------------------------------------------------------
+# Рубеж перебора слагов (streamers.json)
+# ----------------------------------------------------------------------------
+# Для каждой серии колёс (префикс слага) — до какого индекса адреса уже
+# проверены, какой ширины числовой хвост и какие адреса ждут старта
+# (pending: колесо создано, но не запущено). Без файла сканер после
+# рестарта заново перебирал бы давно завершившиеся адреса: в базу находок
+# они не попадают (уведомлять о прошедшем колесе незачем), и «помнить» их
+# больше негде.
+
+def _clean_pending(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+    ]
+
+
+def load_streamer_frontier() -> dict[str, dict[str, Any]]:
+    raw = read_json(STREAMERS_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    frontier: dict[str, dict[str, Any]] = {}
+    for prefix, info in raw.items():
+        if not isinstance(prefix, str) or not isinstance(info, dict):
+            continue
+        index = info.get("index")
+        width = info.get("width")
+        if not isinstance(index, int) or not isinstance(width, int):
+            continue
+        if isinstance(index, bool) or isinstance(width, bool) or width < 1:
+            continue
+        frontier[prefix] = {
+            "index": index,
+            "width": width,
+            "pending": _clean_pending(info.get("pending")),
+        }
+    return frontier
+
+
+def save_streamer_frontier(frontier: dict[str, dict[str, Any]]) -> None:
+    """Атомарно сохраняет рубеж перебора.
+
+    Сбой записи не должен ронять поток сканера: в пределах текущего
+    запуска он продолжит работать по памяти, просто рестарт заставит
+    перебрать серию заново.
+    """
+    try:
+        atomic_write_json(STREAMERS_FILE, frontier)
+    except OSError as error:
+        log.warning("Не удалось сохранить %s: %s", STREAMERS_FILE.name, error)
 
 
 # ----------------------------------------------------------------------------

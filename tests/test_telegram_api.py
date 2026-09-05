@@ -176,6 +176,27 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("https://betboom.ru/freestream/a (колесо активно)", text)
         self.assertIn("https://betboom.ru/freestream/b (уже завершилось)", text)
 
+    def test_predictive_notification_does_not_invent_a_channel_or_post(self):
+        # У находки сканера нет ни канала, ни поста: адрес угадан по серии.
+        # «Канал: @zonertg / Пост: <url>» было бы враньём.
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/zonertg10",
+            "found_at": "2026-09-05T20:40:31+03:00",
+            "channel": "zonertg",
+            "source": "predictive",
+            "message_url": "https://betboom.ru/freestream/zonertg10",
+            "status": "active",
+        }
+
+        telegram_api.send_telegram_notification(entry, session)
+
+        text = self.sent_text(session)
+        self.assertIn("zonertg", text)
+        self.assertNotIn("Канал: @", text)
+        self.assertNotIn("Пост:", text)
+        self.assertIn("https://betboom.ru/freestream/zonertg10", text)
+
     def test_notifications_are_disabled_without_chat_id(self):
         session = fake_session()
         with patch.object(telegram_api, "TELEGRAM_CHAT_ID", ""):

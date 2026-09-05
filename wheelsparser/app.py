@@ -4,7 +4,8 @@
     parser        — обход Telegram-каналов раз в CHECK_INTERVAL;
     bot           — приём команд Telegram (если заданы токен и chat_id);
     twitch-irc    — чтение Twitch-чатов по IRC (если TWITCH_ENABLED);
-    twitch-worker — обработка сообщений из чатов (precheck, уведомления).
+    twitch-worker — обработка сообщений из чатов (precheck, уведомления);
+    predictive    — перебор слагов колёс (если PREDICTIVE_ENABLED).
 
 Все рабочие потоки запускаются через runtime.supervise: необработанное
 исключение перезапускает поток и уходит сервисным уведомлением, а не
@@ -29,6 +30,10 @@ from .config import (
     ALERT_ON_FIRST_RUN,
     CHECK_INTERVAL,
     LOCK_FILE,
+    PREDICTIVE_DAILY_BUDGET,
+    PREDICTIVE_ENABLED,
+    PREDICTIVE_LOOKAHEAD,
+    PREDICTIVE_SCAN_INTERVAL,
     REQUEST_TIMEOUT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -39,6 +44,7 @@ from .db import close_connection, init_db
 from .logging_setup import force_utf8_console, log, redact_token, setup_logging
 from .net import SUPERVISOR_LOCK, SUPERVISOR_SESSION
 from .parser import load_pending_expired_retry, process_cycle
+from .predictive import predictive_loop
 from .runtime import (
     STOP_EVENT,
     acquire_single_instance_lock,
@@ -154,6 +160,25 @@ def _start_twitch_thread() -> None:
         )
 
 
+def _start_predictive_thread() -> None:
+    if not PREDICTIVE_ENABLED:
+        log.info("%s Перебор слагов выключен (PREDICTIVE_ENABLED=false)", icon("bell"))
+        return
+    # Кулдаун общий с Telegram и Twitch: колесо, найденное перебором, не
+    # должно продублироваться постом стримера (и наоборот). Для Twitch
+    # историю уже засеяли выше — повторный вызов дёшев и идемпотентен.
+    seed_url_alerts_from_history()
+    _start_supervised(predictive_loop, "predictive")
+    log.info(
+        "%s Перебор слагов запущен · раз в %s с · +%s адресов вперёд · "
+        "не больше %s запросов в сутки",
+        icon("scan"),
+        PREDICTIVE_SCAN_INTERVAL,
+        PREDICTIVE_LOOKAHEAD,
+        PREDICTIVE_DAILY_BUDGET,
+    )
+
+
 def _run_parse_loop(seen: dict[str, dict[str, str]], baseline: bool) -> None:
     """Цикл парсинга (daemon-поток).
 
@@ -239,6 +264,7 @@ def main() -> int:
 
     _start_bot_thread()
     _start_twitch_thread()
+    _start_predictive_thread()
 
     baseline = not has_state and not ALERT_ON_FIRST_RUN
     if baseline:
