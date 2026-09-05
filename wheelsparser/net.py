@@ -10,16 +10,19 @@ requests.Session НЕ потокобезопасна, поэтому одна о
                            (поток twitch-irc в сеть не ходит вообще — см.
                            :mod:`wheelsparser.twitch`);
     ACTIVE_CHECK_SESSION — фоновый поток active-api: отправка результата /active;
-    SUPERVISOR_SESSION   — сообщения о падении потоков (см. runtime.supervise):
-                           отправляются из упавшего потока, каким бы он ни был,
-                           поэтому владельца у этой сессии нет и обращения к ней
-                           сериализуются локом в :mod:`wheelsparser.app`.
+    SUPERVISOR_SESSION   — сервисные уведомления не из своего потока (падение
+                           рабочего потока, см. runtime.supervise; срабатывание
+                           betboom._apply_stub_guard): у сессии нет одного
+                           владельца, поэтому обращения к ней сериализуются
+                           локом SUPERVISOR_LOCK ниже.
 
 Рабочие потоки пула /active создают собственные сессии через
 threading.local (см. :mod:`wheelsparser.betboom`).
 """
 
 from __future__ import annotations
+
+import threading
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -58,3 +61,7 @@ BOT_SESSION = build_session()
 TWITCH_SESSION = build_session()
 ACTIVE_CHECK_SESSION = build_session()
 SUPERVISOR_SESSION = build_session()
+# requests.Session не потокобезопасна — любой код, отправляющий сервисное
+# уведомление через SUPERVISOR_SESSION не из своего потока, обязан сначала
+# взять этот лок (см. docstring модуля).
+SUPERVISOR_LOCK = threading.Lock()

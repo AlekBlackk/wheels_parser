@@ -37,7 +37,7 @@ from .config import (
 )
 from .db import close_connection, init_db
 from .logging_setup import force_utf8_console, log, redact_token, setup_logging
-from .net import SUPERVISOR_SESSION
+from .net import SUPERVISOR_LOCK, SUPERVISOR_SESSION
 from .parser import load_pending_expired_retry, process_cycle
 from .runtime import (
     STOP_EVENT,
@@ -49,11 +49,6 @@ from .storage import ensure_data_dir, load_seen, save_seen
 from .telegram_api import send_service_notification
 from .twitch import twitch_loop, twitch_worker_loop
 
-# Сообщения о падении потоков шлются из самого упавшего потока, каким бы он
-# ни был, поэтому у SUPERVISOR_SESSION нет владельца: сериализуем обращения
-# к ней локом (requests.Session не потокобезопасна — см. net.py).
-_CRASH_NOTICE_LOCK = threading.Lock()
-
 
 def _notify_thread_crash(name: str, error: BaseException, backoff: float) -> None:
     """Сервисное уведомление о падении рабочего потока (см. runtime.supervise).
@@ -63,7 +58,7 @@ def _notify_thread_crash(name: str, error: BaseException, backoff: float) -> Non
     в чат нельзя.
     """
     reason = redact_token(f"{type(error).__name__}: {error}")
-    with _CRASH_NOTICE_LOCK:
+    with SUPERVISOR_LOCK:
         send_service_notification(
             f"{icon('warn')} Поток «{name}» аварийно завершился: {reason}\n"
             f"Перезапускаю автоматически (пауза {backoff:.0f} с). "

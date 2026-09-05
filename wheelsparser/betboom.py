@@ -19,14 +19,17 @@ import requests
 from .config import (
     ACTION_SIGNATURE_TTL_SECONDS,
     ACTIVE_CHECK_CONCURRENCY,
+    BETBOOM_STUB_GUARD_THRESHOLD,
     EXPIRED_CACHE_TTL_SECONDS,
     HEADERS,
     MSK_TZ,
     REQUEST_TIMEOUT,
     STREAMER_WHEEL_INFO_API,
+    icon,
 )
 from .logging_setup import log
-from .net import PARSER_SESSION, build_session
+from .net import PARSER_SESSION, SUPERVISOR_LOCK, SUPERVISOR_SESSION, build_session
+from .telegram_api import send_service_notification
 from .timeutils import now_msk
 from .urls import normalize_url
 
@@ -282,7 +285,7 @@ def check_wheel_status(url: str, session: requests.Session) -> str:
     info = fetch_wheel_info(url, session)
     if info is None:
         return "unknown"
-    return api_info_to_status(info)
+    return _apply_stub_guard(api_info_to_status(info))
 
 
 def _prune_expired_cache() -> None:
@@ -304,6 +307,74 @@ def _is_cached_expired(url: str) -> bool:
 def _cache_expired(url: str) -> None:
     with _expired_cache_lock:
         _expired_cache[url] = now_msk()
+
+
+# Аварийный выключатель на случай новой заглушки API BetBoom — см.
+# config.BETBOOM_STUB_GUARD_THRESHOLD. Общий на все URL и все потоки
+# (parser, twitch-worker, пул /active): признак сбоя — подряд идущие
+# expired БЕЗ единого active/soon для разных колёс, а не поведение одного
+# конкретного адреса, поэтому счётчик глобальный, а не per-URL.
+_stub_guard_lock = threading.Lock()
+_consecutive_expired = 0
+_stub_guard_active = False
+
+
+def _apply_stub_guard(status: str) -> str:
+    """Подменяет 'expired' на 'unknown', если заподозрена новая заглушка API.
+
+    Вызывать только для СВЕЖЕГО результата api_info_to_status (не для
+    ответов из _expired_cache — повтор старого решения ничего не
+    доказывает и не опровергает). 'unknown' счётчик не трогает: сбой сети
+    или отсутствие подписи — это отдельный, уже обработанный fail-open,
+    он не говорит ничего ни за, ни против гипотезы о заглушке.
+    """
+    global _consecutive_expired, _stub_guard_active
+    if status not in ("expired", "active", "soon"):
+        return status
+    notify_recovery = False
+    notify_trip = False
+    with _stub_guard_lock:
+        if status in ("active", "soon"):
+            notify_recovery = _stub_guard_active
+            _consecutive_expired = 0
+            _stub_guard_active = False
+        else:
+            _consecutive_expired += 1
+            if _consecutive_expired >= BETBOOM_STUB_GUARD_THRESHOLD:
+                notify_trip = not _stub_guard_active
+                _stub_guard_active = True
+                status = "unknown"
+    if notify_trip:
+        log.error(
+            "%s BetBoom API: %s подряд ответов expired без единого "
+            "active/soon — похоже на новую заглушку API. Дальнейшие "
+            "expired считаются unknown (fail-open) до первого настоящего "
+            "active/soon.",
+            icon("warn"),
+            _consecutive_expired,
+        )
+        with SUPERVISOR_LOCK:
+            send_service_notification(
+                f"{icon('warn')} BetBoom API: {_consecutive_expired} подряд "
+                "ответов expired без единого active/soon — похоже, что API "
+                "снова отдаёт заглушку. Уведомления о колёсах временно "
+                "работают в режиме fail-open (unknown вместо expired). "
+                "Подробности — в parser.log.",
+                SUPERVISOR_SESSION,
+            )
+    elif notify_recovery:
+        log.info(
+            "%s BetBoom API: получен настоящий active/soon — подозрение "
+            "на заглушку снято, expired снова доверяем как обычно.",
+            icon("ok"),
+        )
+        with SUPERVISOR_LOCK:
+            send_service_notification(
+                f"{icon('ok')} BetBoom API: пришёл настоящий active/soon — "
+                "API снова отвечает нормально, режим fail-open снят.",
+                SUPERVISOR_SESSION,
+            )
+    return status
 
 
 def precheck_wheel(
@@ -341,7 +412,7 @@ def precheck_wheel(
         )
         return "expired", is_referral_wheel(canonical, None, post_text), ""
     info = fetch_wheel_info(canonical, session or PARSER_SESSION)
-    status = "unknown" if info is None else api_info_to_status(info)
+    status = "unknown" if info is None else _apply_stub_guard(api_info_to_status(info))
     referral = is_referral_wheel(canonical, info, post_text)
     log.info(
         "precheck [api]: %s → %s%s",
@@ -399,7 +470,7 @@ def classify_wheels(
                 results.append((index, "expired"))
             return
         info = fetch_wheel_info(url, worker_session())
-        status = "unknown" if info is None else api_info_to_status(info)
+        status = "unknown" if info is None else _apply_stub_guard(api_info_to_status(info))
         # Реф-флаг и дедлайн обновляются по свежему info: старые записи
         # (до появления этих полей) получают их прямо при /active.
         if not item.get("referral") and is_referral_wheel(url, info):

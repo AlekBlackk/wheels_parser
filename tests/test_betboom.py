@@ -517,6 +517,175 @@ class ExpiredCacheTests(unittest.TestCase):
         self.assertEqual(active_items, [item])
 
 
+class StubGuardTests(unittest.TestCase):
+    """Аварийный выключатель на случай новой заглушки API (см.
+    config.BETBOOM_STUB_GUARD_THRESHOLD и betboom._apply_stub_guard):
+    подряд идущие expired без единого active/soon — при живом API
+    статистически невероятная серия, поэтому после порога expired
+    считается недоверенным и подменяется на unknown (fail-open), с
+    единственным сервисным уведомлением админу.
+    """
+
+    def setUp(self):
+        betboom._signature_cache.clear()
+        betboom._consecutive_expired = 0
+        betboom._stub_guard_active = False
+        self.addCleanup(betboom._signature_cache.clear)
+        self.addCleanup(setattr, betboom, "_consecutive_expired", 0)
+        self.addCleanup(setattr, betboom, "_stub_guard_active", False)
+        patcher = patch("wheelsparser.betboom.send_service_notification")
+        self.notify = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _expired_session(self):
+        return wheel_session(
+            Mock(status_code=200, json=Mock(return_value={"info": ended_info()}))
+        )
+
+    def _active_session(self):
+        return wheel_session(
+            Mock(status_code=200, json=Mock(return_value={"info": running_info()}))
+        )
+
+    def test_expired_passes_through_below_threshold(self):
+        session = self._expired_session()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            status = betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", session
+            )
+            self.assertEqual(status, "expired")
+        self.notify.assert_not_called()
+
+    def test_expired_downgrades_to_unknown_at_threshold(self):
+        session = self._expired_session()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            betboom.check_wheel_status("https://betboom.ru/freestream/demo", session)
+        self.notify.assert_not_called()
+
+        status = betboom.check_wheel_status(
+            "https://betboom.ru/freestream/demo", session
+        )
+
+        self.assertEqual(status, "unknown")
+        self.notify.assert_called_once()
+        # Дальнейшие expired тоже уходят в unknown, но повторного
+        # уведомления быть не должно — админа не спамим при каждой ссылке.
+        self.notify.reset_mock()
+        status = betboom.check_wheel_status(
+            "https://betboom.ru/freestream/demo", session
+        )
+        self.assertEqual(status, "unknown")
+        self.notify.assert_not_called()
+
+    def test_unknown_does_not_advance_or_reset_the_counter(self):
+        # Ответ без окна и без is_early — честный unknown (см.
+        # ApiStatusTests.test_rejects_incomplete_info), а не сигнал в
+        # пользу или против гипотезы о заглушке: счётчик не должен ни расти,
+        # ни сбрасываться из-за него.
+        expired_session = self._expired_session()
+        unknown_session = wheel_session(
+            Mock(
+                status_code=200,
+                json=Mock(return_value={"info": {"is_ended": False}}),
+            )
+        )
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", expired_session
+            )
+            status = betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo2", unknown_session
+            )
+            self.assertEqual(status, "unknown")
+        self.notify.assert_not_called()
+
+        status = betboom.check_wheel_status(
+            "https://betboom.ru/freestream/demo", expired_session
+        )
+        self.assertEqual(status, "unknown")
+        self.notify.assert_called_once()
+
+    def test_real_active_or_soon_resets_the_counter(self):
+        expired_session = self._expired_session()
+        active_session = self._active_session()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", expired_session
+            )
+
+        status = betboom.check_wheel_status(
+            "https://betboom.ru/freestream/other", active_session
+        )
+        self.assertEqual(status, "active")
+
+        # Счётчик сброшен: тот же почти-порог expired снова проходит без
+        # подмены на unknown.
+        self.notify.reset_mock()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            status = betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", expired_session
+            )
+            self.assertEqual(status, "expired")
+        self.notify.assert_not_called()
+
+    def test_recovery_after_trip_sends_one_notification_and_reopens_guard(self):
+        expired_session = self._expired_session()
+        active_session = self._active_session()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
+            betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", expired_session
+            )
+        self.assertEqual(self.notify.call_count, 1)
+
+        self.notify.reset_mock()
+        status = betboom.check_wheel_status(
+            "https://betboom.ru/freestream/other", active_session
+        )
+        self.assertEqual(status, "active")
+        self.notify.assert_called_once()  # уведомление о снятии подозрения
+
+        # Гипотеза может подтвердиться снова: новая серия expired обязана
+        # заново сработать (guard не остаётся навсегда "уже уведомлял").
+        self.notify.reset_mock()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
+            betboom.check_wheel_status(
+                "https://betboom.ru/freestream/demo", expired_session
+            )
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_downgraded_expired_is_not_written_to_expired_cache(self):
+        # precheck_wheel кэширует expired на EXPIRED_CACHE_TTL_SECONDS —
+        # если guard подменил статус на unknown, кэшировать как expired
+        # нельзя: иначе настоящий active потом ждал бы TTL кэша вместо
+        # немедленного обнаружения. Разные URL — реальный сбой заглушки
+        # выглядит как поток РАЗНЫХ колёс подряд, а не повтор одного и
+        # того же адреса (тот уже гасится _expired_cache, см. тест ниже).
+        betboom._expired_cache.clear()
+        self.addCleanup(betboom._expired_cache.clear)
+        session = self._expired_session()
+        last_url = ""
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
+            last_url = f"https://betboom.ru/freestream/demo{i}"
+            betboom.precheck_wheel(last_url, session)
+
+        self.assertFalse(betboom._is_cached_expired(last_url))
+
+    def test_expired_cache_hit_does_not_feed_the_counter(self):
+        # Один и тот же URL, повторно найденный в нескольких постах подряд,
+        # не должен приближать порог: после первого свежего expired
+        # _expired_cache гасит все повторы без обращения к API, и они не
+        # являются новым свидетельством в пользу заглушки.
+        betboom._expired_cache.clear()
+        self.addCleanup(betboom._expired_cache.clear)
+        session = self._expired_session()
+        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD * 2):
+            status, *_ = betboom.precheck_wheel(
+                "https://betboom.ru/freestream/demo", session
+            )
+            self.assertEqual(status, "expired")
+        self.notify.assert_not_called()
+
+
 class RegressionTests(unittest.TestCase):
     def test_active_check_does_not_require_playwright(self):
         self.assertFalse(hasattr(betboom, "async_playwright"))
