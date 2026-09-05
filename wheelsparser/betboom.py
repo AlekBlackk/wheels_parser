@@ -28,8 +28,7 @@ from .config import (
     icon,
 )
 from .logging_setup import log
-from .net import PARSER_SESSION, SUPERVISOR_LOCK, SUPERVISOR_SESSION, build_session
-from .telegram_api import send_service_notification
+from .net import PARSER_SESSION, build_session
 from .timeutils import now_msk
 from .urls import normalize_url
 
@@ -327,24 +326,27 @@ def _apply_stub_guard(status: str) -> str:
     доказывает и не опровергает). 'unknown' счётчик не трогает: сбой сети
     или отсутствие подписи — это отдельный, уже обработанный fail-open,
     он не говорит ничего ни за, ни против гипотезы о заглушке.
+
+    Срабатывание и снятие guard'а только пишутся в parser.log — сервисных
+    уведомлений в Telegram по ним намеренно нет (слишком шумно).
     """
     global _consecutive_expired, _stub_guard_active
     if status not in ("expired", "active", "soon"):
         return status
-    notify_recovery = False
-    notify_trip = False
+    log_recovery = False
+    log_trip = False
     with _stub_guard_lock:
         if status in ("active", "soon"):
-            notify_recovery = _stub_guard_active
+            log_recovery = _stub_guard_active
             _consecutive_expired = 0
             _stub_guard_active = False
         else:
             _consecutive_expired += 1
             if _consecutive_expired >= BETBOOM_STUB_GUARD_THRESHOLD:
-                notify_trip = not _stub_guard_active
+                log_trip = not _stub_guard_active
                 _stub_guard_active = True
                 status = "unknown"
-    if notify_trip:
+    if log_trip:
         log.error(
             "%s BetBoom API: %s подряд ответов expired без единого "
             "active/soon — похоже на новую заглушку API. Дальнейшие "
@@ -353,27 +355,12 @@ def _apply_stub_guard(status: str) -> str:
             icon("warn"),
             _consecutive_expired,
         )
-        with SUPERVISOR_LOCK:
-            send_service_notification(
-                f"{icon('warn')} BetBoom API: {_consecutive_expired} подряд "
-                "ответов expired без единого active/soon — похоже, что API "
-                "снова отдаёт заглушку. Уведомления о колёсах временно "
-                "работают в режиме fail-open (unknown вместо expired). "
-                "Подробности — в parser.log.",
-                SUPERVISOR_SESSION,
-            )
-    elif notify_recovery:
+    elif log_recovery:
         log.info(
             "%s BetBoom API: получен настоящий active/soon — подозрение "
             "на заглушку снято, expired снова доверяем как обычно.",
             icon("ok"),
         )
-        with SUPERVISOR_LOCK:
-            send_service_notification(
-                f"{icon('ok')} BetBoom API: пришёл настоящий active/soon — "
-                "API снова отвечает нормально, режим fail-open снят.",
-                SUPERVISOR_SESSION,
-            )
     return status
 
 

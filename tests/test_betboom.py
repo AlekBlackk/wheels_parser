@@ -522,8 +522,9 @@ class StubGuardTests(unittest.TestCase):
     config.BETBOOM_STUB_GUARD_THRESHOLD и betboom._apply_stub_guard):
     подряд идущие expired без единого active/soon — при живом API
     статистически невероятная серия, поэтому после порога expired
-    считается недоверенным и подменяется на unknown (fail-open), с
-    единственным сервисным уведомлением админу.
+    считается недоверенным и подменяется на unknown (fail-open).
+    Срабатывание и снятие guard'а пишутся в parser.log один раз;
+    сервисных уведомлений в Telegram по ним намеренно нет.
     """
 
     def setUp(self):
@@ -533,9 +534,16 @@ class StubGuardTests(unittest.TestCase):
         self.addCleanup(betboom._signature_cache.clear)
         self.addCleanup(setattr, betboom, "_consecutive_expired", 0)
         self.addCleanup(setattr, betboom, "_stub_guard_active", False)
-        patcher = patch("wheelsparser.betboom.send_service_notification")
-        self.notify = patcher.start()
+        patcher = patch("wheelsparser.betboom.log")
+        self.log = patcher.start()
         self.addCleanup(patcher.stop)
+
+    def assert_guard_tripped_once(self):
+        """Guard сработал: одна запись в лог, ноль уведомлений в Telegram."""
+        self.log.error.assert_called_once()
+
+    def assert_guard_silent(self):
+        self.log.error.assert_not_called()
 
     def _expired_session(self):
         return wheel_session(
@@ -554,28 +562,28 @@ class StubGuardTests(unittest.TestCase):
                 "https://betboom.ru/freestream/demo", session
             )
             self.assertEqual(status, "expired")
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
     def test_expired_downgrades_to_unknown_at_threshold(self):
         session = self._expired_session()
         for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
             betboom.check_wheel_status("https://betboom.ru/freestream/demo", session)
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
         status = betboom.check_wheel_status(
             "https://betboom.ru/freestream/demo", session
         )
 
         self.assertEqual(status, "unknown")
-        self.notify.assert_called_once()
-        # Дальнейшие expired тоже уходят в unknown, но повторного
-        # уведомления быть не должно — админа не спамим при каждой ссылке.
-        self.notify.reset_mock()
+        self.assert_guard_tripped_once()
+        # Дальнейшие expired тоже уходят в unknown, но повторной записи
+        # в лог быть не должно — не спамим при каждой ссылке.
+        self.log.error.reset_mock()
         status = betboom.check_wheel_status(
             "https://betboom.ru/freestream/demo", session
         )
         self.assertEqual(status, "unknown")
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
     def test_unknown_does_not_advance_or_reset_the_counter(self):
         # Ответ без окна и без is_early — честный unknown (см.
@@ -597,13 +605,13 @@ class StubGuardTests(unittest.TestCase):
                 "https://betboom.ru/freestream/demo2", unknown_session
             )
             self.assertEqual(status, "unknown")
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
         status = betboom.check_wheel_status(
             "https://betboom.ru/freestream/demo", expired_session
         )
         self.assertEqual(status, "unknown")
-        self.notify.assert_called_once()
+        self.assert_guard_tripped_once()
 
     def test_real_active_or_soon_resets_the_counter(self):
         expired_session = self._expired_session()
@@ -620,38 +628,39 @@ class StubGuardTests(unittest.TestCase):
 
         # Счётчик сброшен: тот же почти-порог expired снова проходит без
         # подмены на unknown.
-        self.notify.reset_mock()
+        self.log.error.reset_mock()
         for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
             status = betboom.check_wheel_status(
                 "https://betboom.ru/freestream/demo", expired_session
             )
             self.assertEqual(status, "expired")
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
-    def test_recovery_after_trip_sends_one_notification_and_reopens_guard(self):
+    def test_recovery_after_trip_logs_once_and_reopens_guard(self):
         expired_session = self._expired_session()
         active_session = self._active_session()
         for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
             betboom.check_wheel_status(
                 "https://betboom.ru/freestream/demo", expired_session
             )
-        self.assertEqual(self.notify.call_count, 1)
+        self.assert_guard_tripped_once()
 
-        self.notify.reset_mock()
+        self.log.error.reset_mock()
+        self.log.info.reset_mock()
         status = betboom.check_wheel_status(
             "https://betboom.ru/freestream/other", active_session
         )
         self.assertEqual(status, "active")
-        self.notify.assert_called_once()  # уведомление о снятии подозрения
+        self.log.info.assert_called_once()  # снятие подозрения — одна запись в лог
 
         # Гипотеза может подтвердиться снова: новая серия expired обязана
-        # заново сработать (guard не остаётся навсегда "уже уведомлял").
-        self.notify.reset_mock()
+        # заново сработать (guard не остаётся навсегда "уже отметил").
+        self.log.error.reset_mock()
         for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
             betboom.check_wheel_status(
                 "https://betboom.ru/freestream/demo", expired_session
             )
-        self.assertEqual(self.notify.call_count, 1)
+        self.assert_guard_tripped_once()
 
     def test_downgraded_expired_is_not_written_to_expired_cache(self):
         # precheck_wheel кэширует expired на EXPIRED_CACHE_TTL_SECONDS —
@@ -683,7 +692,7 @@ class StubGuardTests(unittest.TestCase):
                 "https://betboom.ru/freestream/demo", session
             )
             self.assertEqual(status, "expired")
-        self.notify.assert_not_called()
+        self.assert_guard_silent()
 
 
 class RegressionTests(unittest.TestCase):
