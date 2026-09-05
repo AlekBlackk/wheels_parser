@@ -7,9 +7,21 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
+from bs4 import BeautifulSoup
 
 from tests.dbfixture import entries_since, use_temp_db
-from wheelsparser import alerts, betboom, config, db, parser, registry, storage, twitch, urls
+from wheelsparser import (
+    alerts,
+    betboom,
+    config,
+    db,
+    menu,
+    parser,
+    registry,
+    storage,
+    twitch,
+    urls,
+)
 
 
 def make_message(message_id, text, links, disallowed_domains=()):
@@ -103,6 +115,26 @@ class FetchChannelTests(unittest.TestCase):
         )
         head.assert_called_once()
 
+    def test_extracts_forward_source_from_repost(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/42">
+            <a class="tgme_widget_message_forwarded_from_name"
+               href="https://t.me/origchannel">Первоисточник</a>
+            <div class="tgme_widget_message_text">
+              Колесо <a href="https://betboom.ru/freestream/abc">тут</a>
+            </div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response):
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(messages[0]["forwarded_from"], "origchannel")
+
     def test_returns_none_instead_of_raising_on_parse_crash(self):
         # Ошибка разбора одного канала (не requests.RequestException) не
         # должна вылетать наружу: у fetch_channel есть свой try/except,
@@ -123,6 +155,191 @@ class FetchChannelTests(unittest.TestCase):
                  parser, "message_preview_html", side_effect=RecursionError("boom")
              ):
             self.assertIsNone(parser.fetch_channel("broken-markup"))
+
+
+def forward_html(href=None, tag="a"):
+    """Пост-репост в разметке веб-превью t.me/s."""
+    attribute = f' href="{href}"' if href is not None else ""
+    return BeautifulSoup(
+        f'<div class="tgme_widget_message">'
+        f'<{tag} class="tgme_widget_message_forwarded_from_name"{attribute}>'
+        f"Первоисточник</{tag}>"
+        f'<div class="tgme_widget_message_text">колесо</div></div>',
+        "html.parser",
+    )
+
+
+class ForwardedFromChannelTests(unittest.TestCase):
+    """Первоисточник репоста — кандидат в мониторинг (см.
+    parser.suggest_forward_source). href из чужой разметки доверенным
+    вводом не является и проходит тот же USERNAME_RE, что и /add."""
+
+    def test_extracts_channel_from_forward_header(self):
+        self.assertEqual(
+            parser.forwarded_from_channel(forward_html("https://t.me/origchannel")),
+            "origchannel",
+        )
+
+    def test_extracts_channel_when_href_points_at_exact_post(self):
+        self.assertEqual(
+            parser.forwarded_from_channel(forward_html("https://t.me/origchannel/1234")),
+            "origchannel",
+        )
+
+    def test_post_without_forward_header_has_no_source(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message">'
+            '<div class="tgme_widget_message_text">колесо</div></div>',
+            "html.parser",
+        )
+        self.assertEqual(parser.forwarded_from_channel(html), "")
+
+    def test_hidden_source_without_href_is_ignored(self):
+        # Репост из закрытого канала: тот же класс, но <span> без href —
+        # первоисточник Telegram не раскрывает, добавлять нечего.
+        self.assertEqual(parser.forwarded_from_channel(forward_html(tag="span")), "")
+
+    def test_foreign_host_is_ignored(self):
+        self.assertEqual(
+            parser.forwarded_from_channel(forward_html("https://evil.example/channel")),
+            "",
+        )
+
+    def test_private_invite_link_is_ignored(self):
+        # t.me/+hash — приглашение в закрытый канал, а не юзернейм:
+        # такой «канал» парсер читать не сможет.
+        self.assertEqual(
+            parser.forwarded_from_channel(forward_html("https://t.me/+AbCdEfGh")), ""
+        )
+
+    def test_preview_path_is_ignored(self):
+        self.assertEqual(
+            parser.forwarded_from_channel(forward_html("https://t.me/s/origchannel")),
+            "",
+        )
+
+
+class SuggestForwardSourceTests(unittest.TestCase):
+    """Репост колеса выдаёт канал-первоисточник — самый дешёвый способ
+    найти того, кто постит колёса раньше отслеживаемых каналов."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wheelsparser-suggest-"))
+        self._patch(patch.object(
+            storage, "SUGGESTED_CHANNELS_FILE", self.tmp / "suggested_channels.json"
+        ))
+        self._patch(patch.object(storage, "SUGGESTED_CHANNELS", set()))
+        self._patch(patch.object(registry, "CHANNELS", ["watched"]))
+        # registry.KEYWORDS наполняется registry.init() при старте приложения,
+        # в тестах он пуст — задаём явно, как остальные тесты про слова.
+        self._patch(patch.object(registry, "KEYWORDS", ["колесо"]))
+        self.notify = self._patch(patch.object(parser, "send_service_notification"))
+
+    def _patch(self, patcher):
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    def _message(self, forwarded_from="origchannel", urls=None, text="колесо"):
+        message = make_message("watched/1", text, urls or [])
+        message["forwarded_from"] = forwarded_from
+        return message
+
+    def test_suggests_unmonitored_source_of_a_wheel_repost(self):
+        parser.suggest_forward_source(
+            self._message(urls=["https://betboom.ru/freestream/a"]), "watched"
+        )
+
+        self.notify.assert_called_once()
+        text = self.notify.call_args.args[0]
+        self.assertIn("@origchannel", text)
+        self.assertEqual(
+            self.notify.call_args.kwargs["reply_markup"],
+            menu.channel_suggestion_keyboard("origchannel"),
+        )
+
+    def test_suggests_source_of_a_keyword_only_repost(self):
+        parser.suggest_forward_source(self._message(text="розыгрыш колесо"), "watched")
+
+        self.notify.assert_called_once()
+
+    def test_post_without_wheel_or_keyword_is_not_suggested(self):
+        parser.suggest_forward_source(self._message(text="всем привет"), "watched")
+
+        self.notify.assert_not_called()
+
+    def test_post_without_forward_header_is_not_suggested(self):
+        parser.suggest_forward_source(
+            self._message(forwarded_from="", urls=["https://betboom.ru/freestream/a"]),
+            "watched",
+        )
+
+        self.notify.assert_not_called()
+
+    def test_already_monitored_source_is_not_suggested(self):
+        # Регистр юзернеймов Telegram не важен: @Watched и @watched — один
+        # канал, и предлагать добавить уже отслеживаемый нельзя.
+        parser.suggest_forward_source(
+            self._message(
+                forwarded_from="WATCHED", urls=["https://betboom.ru/freestream/a"]
+            ),
+            "other",
+        )
+
+        self.notify.assert_not_called()
+
+    def test_repost_inside_the_same_channel_is_not_suggested(self):
+        parser.suggest_forward_source(
+            self._message(
+                forwarded_from="watched", urls=["https://betboom.ru/freestream/a"]
+            ),
+            "watched",
+        )
+
+        self.notify.assert_not_called()
+
+    def test_same_source_is_suggested_only_once(self):
+        message = self._message(urls=["https://betboom.ru/freestream/a"])
+
+        parser.suggest_forward_source(message, "watched")
+        parser.suggest_forward_source(message, "watched")
+
+        self.notify.assert_called_once()
+
+    def test_suggestion_survives_restart(self):
+        # Молчание админа — тоже ответ: после рестарта то же предложение
+        # приходить заново не должно (см. storage.mark_channel_suggested).
+        message = self._message(urls=["https://betboom.ru/freestream/a"])
+        parser.suggest_forward_source(message, "watched")
+        self.notify.reset_mock()
+
+        # Имитируем рестарт: состояние в памяти сброшено, файл остался.
+        with patch.object(storage, "SUGGESTED_CHANNELS", None):
+            parser.suggest_forward_source(message, "watched")
+
+        self.notify.assert_not_called()
+
+    def test_suppressed_wheel_still_reveals_the_source(self):
+        # Самый частый случай: репост несёт ссылку, о которой уже
+        # оповестили из другого канала (кулдаун гасит уведомление) —
+        # находки нет, а первоисточник есть. Предложение обязано уйти.
+        # Текст без ключевого слова — иначе сработал бы штатный фолбэк
+        # «ссылки отсеяны, шлём по ключевому слову», и сценарий перестал
+        # бы быть чистым «уведомления нет, а первоисточник есть».
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("watched/1", "смотрите тут", [url])
+        message["forwarded_from"] = "origchannel"
+
+        with patch.dict(alerts.LAST_URL_ALERT, {url: parser.now_msk()}, clear=True), \
+             patch.object(parser, "precheck_wheel", return_value=("active", False, "")), \
+             patch.object(parser, "send_telegram_notification") as send:
+            entries = parser.process_message(
+                message, "watched", {}, False, parser.now_msk(), {url: parser.now_msk()}
+            )
+
+        self.assertEqual(entries, [])
+        send.assert_not_called()
+        self.notify.assert_called_once()
 
 
 class ProcessMessageTests(unittest.TestCase):

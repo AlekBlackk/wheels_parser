@@ -110,6 +110,16 @@ def words_section_text() -> str:
     return f"🔑 <b>Ключевые слова ({len(words)}):</b>\nНажмите ❌, чтобы убрать слово."
 
 
+def channel_suggestion_keyboard(channel: str) -> dict[str, Any]:
+    """Кнопка «➕ Добавить» под предложением канала-первоисточника.
+
+    Обработчик — в bot.py, а не здесь: добавление канала требует
+    check_channel_preview (проверка ленты t.me/s перед добавлением),
+    которая живёт в bot.py, а menu.py его не импортирует (цикл).
+    """
+    return _kb([[{"text": f"➕ Добавить @{channel}", "callback_data": f"ch:add:{channel}"}]])
+
+
 def wheel_removal_keyboard(rows: list[tuple[int, str]]) -> dict[str, Any]:
     """Клавиатура ❌ под списком колёс (/active, /wheels).
 

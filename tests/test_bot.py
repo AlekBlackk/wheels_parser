@@ -415,6 +415,76 @@ class CallbackDispatchTests(unittest.TestCase):
         delegate.assert_called_once_with("1", 55, "cb1", "m:root")
 
 
+class SuggestedChannelButtonTests(unittest.TestCase):
+    """Кнопка «➕ Добавить» под предложением первоисточника (см.
+    parser.suggest_forward_source). Добавление обязано пройти ту же
+    проверку ленты t.me/s, что и /add: иначе в мониторинг попадёт канал,
+    посты которого парсер прочитать не сможет."""
+
+    def test_adds_channel_after_preview_check(self):
+        with patch.object(registry, "CHANNELS", ["existing"]), \
+             patch.object(bot, "check_channel_preview", return_value="ok") as check, \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(bot, "answer_callback_query") as answer, \
+             patch.object(bot, "bot_send"):
+            bot.handle_callback("1", 55, "cb1", "ch:add:origchannel")
+            self.assertIn("origchannel", registry.CHANNELS)
+
+        check.assert_called_once_with("origchannel")
+        save.assert_called_once_with()
+        self.assertIn("добавлен", answer.call_args.args[1])
+
+    def test_channel_without_web_preview_is_not_added(self):
+        with patch.object(registry, "CHANNELS", ["existing"]), \
+             patch.object(bot, "check_channel_preview", return_value="no_preview"), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(bot, "answer_callback_query") as answer, \
+             patch.object(bot, "bot_send"):
+            bot.handle_callback("1", 55, "cb1", "ch:add:origchannel")
+
+        save.assert_not_called()
+        self.assertNotIn("origchannel", registry.CHANNELS)
+        self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+
+    def test_missing_channel_is_not_added(self):
+        with patch.object(registry, "CHANNELS", ["existing"]), \
+             patch.object(bot, "check_channel_preview", return_value="not_found"), \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(bot, "answer_callback_query"), \
+             patch.object(bot, "bot_send"):
+            bot.handle_callback("1", 55, "cb1", "ch:add:origchannel")
+
+        save.assert_not_called()
+        self.assertNotIn("origchannel", registry.CHANNELS)
+
+    def test_already_monitored_channel_is_not_added_twice(self):
+        with patch.object(registry, "CHANNELS", ["origchannel"]), \
+             patch.object(bot, "check_channel_preview") as check, \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(bot, "answer_callback_query") as answer:
+            bot.handle_callback("1", 55, "cb1", "ch:add:origchannel")
+            self.assertEqual(registry.CHANNELS, ["origchannel"])
+
+        # До сетевой проверки дело доходить не должно.
+        check.assert_not_called()
+        save.assert_not_called()
+        self.assertIn("уже в списке", answer.call_args.args[1])
+
+    def test_invalid_username_in_callback_is_rejected(self):
+        # callback_data — не доверенный ввод: сообщение с кнопкой могло
+        # быть переслано и отредактировано.
+        with patch.object(registry, "CHANNELS", ["existing"]), \
+             patch.object(bot, "check_channel_preview") as check, \
+             patch.object(registry, "save_channels_file") as save, \
+             patch.object(bot, "answer_callback_query") as answer:
+            bot.handle_callback("1", 55, "cb1", "ch:add:../../etc/passwd")
+            self.assertEqual(registry.CHANNELS, ["existing"])
+
+        check.assert_not_called()
+        save.assert_not_called()
+        self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+
+
 class CallbackQueryLoopTests(unittest.TestCase):
     """update с callback_query обрабатывается в bot_loop наравне с message."""
 
