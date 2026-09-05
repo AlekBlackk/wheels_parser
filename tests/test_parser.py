@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from tests.dbfixture import entries_since, use_temp_db
-from wheelsparser import alerts, betboom, config, db, parser, registry, storage, urls
+from wheelsparser import alerts, betboom, config, db, parser, registry, storage, twitch, urls
 
 
 def make_message(message_id, text, links, disallowed_domains=()):
@@ -72,6 +72,36 @@ class FetchChannelTests(unittest.TestCase):
             side_effect=requests.Timeout("connection timed out"),
         ):
             self.assertIsNone(parser.fetch_channel("offline"))
+
+    def test_shortlink_in_post_is_resolved_via_the_channel_session(self):
+        # Раскрытие сокращателя должно идти через ту же сессию, что и обход
+        # канала (см. fetch_channel: http_session = session or PARSER_SESSION).
+        urls._shortlink_cache.clear()
+        self.addCleanup(urls._shortlink_cache.clear)
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/42">
+            <div class="tgme_widget_message_text">
+              Колесо <a href="https://vk.cc/aB3xZ">тут</a>
+            </div>
+          </div>
+        </div>
+        """.encode()
+        redirect = Mock(
+            status_code=301,
+            headers={"Location": "https://betboom.ru/freestream/hidden"},
+        )
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response), \
+             patch.object(parser.PARSER_SESSION, "head", return_value=redirect) as head:
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(
+            messages[0]["urls"], ["https://betboom.ru/freestream/hidden"]
+        )
+        head.assert_called_once()
 
     def test_returns_none_instead_of_raising_on_parse_crash(self):
         # Ошибка разбора одного канала (не requests.RequestException) не
@@ -536,6 +566,51 @@ class RetryExpiredLinksTests(unittest.TestCase):
         # Подавление не должно быть молчаливым — иначе «почему не пришло»
         # диагностировать неоткуда.
         self.assertTrue(any(self.url in line for line in logs.output))
+
+
+class TwitchRetryDrainTests(unittest.TestCase):
+    """twitch-worker не пишет в PENDING_EXPIRED_RETRY напрямую (см.
+    storage.py — словарь и файл без лока): он кладёт заявку в
+    twitch.TWITCH_PENDING_RETRY, а parser регистрирует её на ретрай в
+    начале своего цикла, как и находки из TWITCH_NEW_ENTRIES."""
+
+    def setUp(self):
+        self.addCleanup(parser.PENDING_EXPIRED_RETRY.clear)
+        parser.PENDING_EXPIRED_RETRY.clear()
+        while not twitch.TWITCH_PENDING_RETRY.empty():
+            twitch.TWITCH_PENDING_RETRY.get_nowait()
+        self.addCleanup(self._drain_leftovers)
+        self.now = parser.now_msk()
+
+    def _drain_leftovers(self):
+        while not twitch.TWITCH_PENDING_RETRY.empty():
+            twitch.TWITCH_PENDING_RETRY.get_nowait()
+
+    def test_queued_job_is_registered_for_retry(self):
+        url = "https://betboom.ru/freestream/a"
+        twitch.TWITCH_PENDING_RETRY.put({
+            "url": url,
+            "channel": "aunkere",
+            "message": {
+                "id": "abc123",
+                "message_url": "https://www.twitch.tv/aunkere",
+                "text": f"колесо {url}",
+            },
+            "post_text": f"колесо {url}",
+            "now": self.now,
+        })
+
+        parser.drain_twitch_retry_registrations()
+
+        self.assertIn(url, parser.PENDING_EXPIRED_RETRY)
+        info = parser.PENDING_EXPIRED_RETRY[url]
+        self.assertEqual(info["channel"], "aunkere")
+        self.assertEqual(info["msg_id"], "abc123")
+        self.assertEqual(info["message_url"], "https://www.twitch.tv/aunkere")
+
+    def test_empty_queue_is_a_cheap_noop(self):
+        parser.drain_twitch_retry_registrations()
+        self.assertEqual(parser.PENDING_EXPIRED_RETRY, {})
 
 
 class PendingExpiredPersistenceTests(unittest.TestCase):

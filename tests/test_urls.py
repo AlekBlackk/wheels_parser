@@ -1,8 +1,10 @@
 import unittest
+from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
 
 from bs4 import BeautifulSoup
 
-from wheelsparser import urls
+from wheelsparser import config, urls
 
 
 class NormalizeUrlTests(unittest.TestCase):
@@ -184,6 +186,222 @@ class FindDisallowedDomainsTests(unittest.TestCase):
         html = BeautifulSoup("<div>просто текст про колесо</div>", "html.parser")
         self.assertEqual(
             urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
+        )
+
+
+def redirecting_session(location, head_status=301):
+    """Сессия, отдающая редирект на HEAD (по умолчанию) или GET-фолбэк."""
+    session = Mock()
+    session.head.return_value = Mock(status_code=head_status, headers={"Location": location})
+    return session
+
+
+class ShortlinkCandidateTests(unittest.TestCase):
+    def test_finds_known_shortener_in_text(self):
+        self.assertEqual(
+            urls.find_shortlink_candidates_in_text("го колесо vk.cc/aB3xZ налетай"),
+            ["https://vk.cc/aB3xZ"],
+        )
+
+    def test_ignores_unknown_shortener(self):
+        self.assertEqual(
+            urls.find_shortlink_candidates_in_text("зайди на short.io/xyz"), []
+        )
+
+    def test_finds_candidate_in_href_and_text_and_dedups(self):
+        html = BeautifulSoup(
+            '<div><a href="https://vk.cc/aB3xZ">колесо</a> vk.cc/aB3xZ</div>',
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_shortlink_candidates(html, html.get_text(" ", strip=True)),
+            ["https://vk.cc/aB3xZ"],
+        )
+
+
+class ResolveShortlinkTests(unittest.TestCase):
+    def setUp(self):
+        urls._shortlink_cache.clear()
+        self.addCleanup(urls._shortlink_cache.clear)
+
+    def test_resolves_via_head_redirect(self):
+        session = redirecting_session("https://betboom.ru/freestream/demo")
+
+        resolved = urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+
+        self.assertEqual(resolved, "https://betboom.ru/freestream/demo")
+
+    def test_falls_back_to_get_when_head_is_not_a_redirect(self):
+        # bit.ly и подобные нередко отвечают на HEAD 404/405, а Location
+        # отдают только на GET.
+        session = Mock()
+        session.head.return_value = Mock(status_code=405, headers={})
+        session.get.return_value = Mock(
+            status_code=301, headers={"Location": "https://betboom.ru/freestream/demo"}
+        )
+
+        resolved = urls.resolve_shortlink("https://bit.ly/aB3xZ", session)
+
+        self.assertEqual(resolved, "https://betboom.ru/freestream/demo")
+        self.assertEqual(session.get.call_args.kwargs.get("allow_redirects"), False)
+
+    def test_non_shortener_domain_is_not_resolved(self):
+        session = redirecting_session("https://betboom.ru/freestream/demo")
+
+        self.assertIsNone(urls.resolve_shortlink("https://example.com/abc", session))
+        session.head.assert_not_called()
+
+    def test_network_error_gives_none(self):
+        session = Mock()
+        session.head.side_effect = OSError("timeout")
+
+        self.assertIsNone(urls.resolve_shortlink("https://vk.cc/aB3xZ", session))
+
+    def test_chain_longer_than_max_hops_gives_none(self):
+        # Сокращатель, ведущий на другой сокращатель, до бесконечности —
+        # гоняться за такой цепочкой незачем (см. docstring resolve_shortlink).
+        session = Mock()
+        session.head.return_value = Mock(
+            status_code=301, headers={"Location": "https://clck.ru/next"}
+        )
+
+        self.assertIsNone(
+            urls.resolve_shortlink("https://vk.cc/aB3xZ", session, max_hops=2)
+        )
+
+    def test_chained_shorteners_resolve_within_hop_limit(self):
+        session = Mock()
+        session.head.side_effect = [
+            Mock(status_code=301, headers={"Location": "https://clck.ru/next"}),
+            Mock(
+                status_code=301,
+                headers={"Location": "https://betboom.ru/freestream/demo"},
+            ),
+        ]
+
+        resolved = urls.resolve_shortlink("https://vk.cc/aB3xZ", session, max_hops=2)
+
+        self.assertEqual(resolved, "https://betboom.ru/freestream/demo")
+
+    def test_result_is_cached_and_second_call_skips_the_network(self):
+        session = redirecting_session("https://betboom.ru/freestream/demo")
+
+        first = urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+        second = urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+
+        self.assertEqual(first, second)
+        session.head.assert_called_once()
+
+    def test_failed_resolution_is_also_cached(self):
+        session = Mock()
+        session.head.side_effect = OSError("timeout")
+
+        urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+        urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+
+        session.head.assert_called_once()
+
+    def test_cache_expires_after_ttl(self):
+        session = redirecting_session("https://betboom.ru/freestream/demo")
+        base = datetime(2026, 1, 1, 12, 0, tzinfo=config.MSK_TZ)
+
+        with patch("wheelsparser.urls.now_msk", return_value=base):
+            urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+
+        after_ttl = base + timedelta(
+            seconds=config.SHORTENER_CACHE_TTL_SECONDS + 1
+        )
+        with patch("wheelsparser.urls.now_msk", return_value=after_ttl):
+            urls.resolve_shortlink("https://vk.cc/aB3xZ", session)
+
+        self.assertEqual(session.head.call_count, 2)
+
+
+class FindUrlsShortlinkIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        urls._shortlink_cache.clear()
+        self.addCleanup(urls._shortlink_cache.clear)
+
+    def test_resolved_shortlink_is_added_to_found_urls(self):
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">тут</a></div>', "html.parser"
+        )
+        session = redirecting_session("https://betboom.ru/freestream/demo")
+
+        found = urls.find_urls(html, html.get_text(" ", strip=True), session)
+
+        self.assertEqual(found, ["https://betboom.ru/freestream/demo"])
+
+    def test_without_session_shortlink_is_ignored(self):
+        # Обратная совместимость: вызывающий без сети (тесты, старый код)
+        # получает прежнее поведение — сокращатель просто не раскрывается.
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">тут</a></div>', "html.parser"
+        )
+
+        self.assertEqual(urls.find_urls(html, html.get_text(" ", strip=True)), [])
+
+    def test_shortlink_resolving_to_non_wheel_is_not_added(self):
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">тут</a></div>', "html.parser"
+        )
+        session = redirecting_session("https://vk.com/somepost")
+
+        self.assertEqual(
+            urls.find_urls(html, html.get_text(" ", strip=True), session), []
+        )
+
+
+class FindDisallowedDomainsShortlinkIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        urls._shortlink_cache.clear()
+        self.addCleanup(urls._shortlink_cache.clear)
+
+    def test_shortlink_resolving_to_allowed_domain_is_not_flagged(self):
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">вк</a></div>', "html.parser"
+        )
+        session = redirecting_session("https://vk.com/somepost")
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
+            [],
+        )
+
+    def test_shortlink_resolving_to_scam_domain_is_flagged(self):
+        html = BeautifulSoup(
+            '<div>Колесо на 60000$ <a href="https://vk.cc/aB3xZ">тут</a></div>',
+            "html.parser",
+        )
+        session = redirecting_session("https://mellehdw.life/?open=register")
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
+            ["mellehdw.life"],
+        )
+
+    def test_without_session_shortener_domain_itself_is_flagged(self):
+        # Fail-secure по умолчанию: без раскрытия сокращатель — подозрительный
+        # домен, а не заведомо разрешённый (см. docstring find_disallowed_domains).
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">тут</a></div>', "html.parser"
+        )
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["vk.cc"],
+        )
+
+    def test_unresolvable_shortlink_keeps_shortener_domain_flagged(self):
+        session = Mock()
+        session.head.side_effect = OSError("timeout")
+        html = BeautifulSoup(
+            '<div>Колесо <a href="https://vk.cc/aB3xZ">тут</a></div>', "html.parser"
+        )
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
+            ["vk.cc"],
         )
 
 

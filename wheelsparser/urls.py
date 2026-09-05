@@ -9,11 +9,25 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+import threading
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from .config import ALLOWED_KEYWORD_DOMAINS, FREESTREAM_RE, TRAILING_PUNCTUATION
+import requests
+
+from .config import (
+    ALLOWED_KEYWORD_DOMAINS,
+    FREESTREAM_RE,
+    SHORTENER_CACHE_TTL_SECONDS,
+    SHORTENER_CANDIDATE_RE,
+    SHORTENER_DOMAINS,
+    SHORTENER_RESOLVE_TIMEOUT,
+    TRAILING_PUNCTUATION,
+)
+from .logging_setup import log
+from .timeutils import now_msk
 
 _SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -88,12 +102,166 @@ def extract_urls(
     return urls
 
 
-def find_urls(node: Any, text: str) -> list[str]:
-    """Канонические ссылки на колёса из сообщения."""
-    return extract_urls(node, text, normalize_url)
+def find_shortlink_candidates_in_text(text: str) -> list[str]:
+    """Ссылки на известные сокращатели (см. config.SHORTENER_DOMAINS) —
+    кандидаты на раскрытие через resolve_shortlink. Используется и здесь
+    (текст без HTML-узла — Twitch-чат), и внутри find_shortlink_candidates."""
+    candidates: list[str] = []
+    for raw in SHORTENER_CANDIDATE_RE.findall(text):
+        normalized = raw if _SCHEME_RE.match(raw) else f"https://{raw}"
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
 
 
-def find_disallowed_domains(node: Any, text: str) -> list[str]:
+def find_shortlink_candidates(node: Any, text: str) -> list[str]:
+    """Ссылки на известные сокращатели из HTML-узла и текста поста.
+
+    Источники те же, что у extract_urls: <a href> и голый текст."""
+    candidates = find_shortlink_candidates_in_text(text)
+    for link in node.find_all("a", href=True):
+        href = str(link.get("href", "")).strip()
+        match = SHORTENER_CANDIDATE_RE.match(href)
+        if not match:
+            continue
+        normalized = match.group(0)
+        if not _SCHEME_RE.match(normalized):
+            normalized = f"https://{normalized}"
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _is_shortener_domain(domain: str) -> bool:
+    return any(
+        domain == shortener or domain.endswith(f".{shortener}")
+        for shortener in SHORTENER_DOMAINS
+    )
+
+
+# Раскрытые сокращатели: url -> (конечный адрес или None, момент раскрытия).
+# Канал перечитывает последние MESSAGES_PER_CHANNEL сообщений каждый цикл
+# независимо от того, видели их уже или нет (см. config.SHORTENER_CACHE_TTL_SECONDS)
+# — без кэша один и тот же URL резолвился бы заново каждый CHECK_INTERVAL,
+# пока пост не вывалится из окна. None кэшируется наравне с успехом: сбой
+# сети или мёртвая ссылка не должны бить по сокращателю на каждом цикле.
+_shortlink_cache: dict[str, tuple[str | None, datetime]] = {}
+_shortlink_cache_lock = threading.Lock()
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+def _cached_resolution(url: str) -> tuple[bool, str | None]:
+    """(есть_в_кэше, значение). Отдельный булев — закэшированное значение
+    само может быть None (сокращатель не раскрылся)."""
+    cutoff = timedelta(seconds=SHORTENER_CACHE_TTL_SECONDS)
+    now = now_msk()
+    with _shortlink_cache_lock:
+        for stale_url, (_value, when) in list(_shortlink_cache.items()):
+            if now - when > cutoff:
+                _shortlink_cache.pop(stale_url, None)
+        if url in _shortlink_cache:
+            return True, _shortlink_cache[url][0]
+    return False, None
+
+
+def _cache_resolution(url: str, value: str | None) -> None:
+    with _shortlink_cache_lock:
+        _shortlink_cache[url] = (value, now_msk())
+
+
+def _fetch_redirect_location(url: str, session: requests.Session) -> str | None:
+    """Location одного редиректа с известного сокращателя.
+
+    HEAD дешевле GET, но часть сокращателей отвечает на него 404/405 и
+    отдаёт Location только на GET — тогда пробуем GET с allow_redirects=False
+    и сразу закрываем ответ (stream=True не даёт requests скачать тело:
+    Location уже есть в заголовках, а качать саму страницу-цель не нужно).
+    """
+    try:
+        response = session.head(
+            url, timeout=SHORTENER_RESOLVE_TIMEOUT, allow_redirects=False
+        )
+        if response.status_code not in _REDIRECT_STATUSES:
+            response = session.get(
+                url,
+                timeout=SHORTENER_RESOLVE_TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+            response.close()
+    except Exception as error:
+        # Широкий except — как в betboom.fetch_wheel_info: это один
+        # вспомогательный сетевой вызов, различать типы ошибок незачем,
+        # любая означает «раскрыть не удалось».
+        log.debug("resolve_shortlink: ошибка запроса к %s: %s", url, error)
+        return None
+    if response.status_code not in _REDIRECT_STATUSES:
+        return None
+    return response.headers.get("Location")
+
+
+def resolve_shortlink(
+    url: str, session: requests.Session, max_hops: int = 2
+) -> str | None:
+    """Раскрывает известный сокращатель (см. config.SHORTENER_DOMAINS) до
+    конечного адреса или возвращает None.
+
+    None означает: это не сокращатель, редирект прочитать не удалось
+    (таймаут, сеть, отсутствующий заголовок Location) или цепочка длиннее
+    max_hops — стример почти никогда не прячет колесо больше, чем за одним
+    сокращателем, а более длинная цепочка — либо чужая реклама, либо
+    попытка обойти проверку, гоняться за ней незачем.
+    Результат (включая None) кэшируется на SHORTENER_CACHE_TTL_SECONDS.
+    """
+    if not _is_shortener_domain(urlsplit(url).netloc.lower()):
+        return None
+    hit, cached = _cached_resolution(url)
+    if hit:
+        return cached
+    current = url
+    result: str | None = None
+    for _ in range(max_hops):
+        location = _fetch_redirect_location(current, session)
+        if not location:
+            result = None
+            break
+        current = urljoin(current, location)
+        if not _is_shortener_domain(urlsplit(current).netloc.lower()):
+            result = current
+            break
+    _cache_resolution(url, result)
+    return result
+
+
+def find_urls(node: Any, text: str, session: requests.Session | None = None) -> list[str]:
+    """Канонические ссылки на колёса из сообщения.
+
+    session, если передан, раскрывает известные сокращатели (см.
+    resolve_shortlink) — без него ссылка вида vk.cc/abc, спрятанная за
+    сокращателем, даже не матчится FREESTREAM_RE и теряется молча, до
+    прекчека дело не доходит. Без session (тесты, вызовы без сети) шаг
+    просто пропускается — остальное поведение не меняется.
+    """
+    urls = extract_urls(node, text, normalize_url)
+    if session is None:
+        return urls
+    for candidate in find_shortlink_candidates(node, text):
+        resolved = resolve_shortlink(candidate, session)
+        if resolved is None:
+            continue
+        match = FREESTREAM_RE.match(resolved)
+        if not match:
+            continue
+        normalized = normalize_url(match.group(0))
+        if normalized not in urls:
+            urls.append(normalized)
+    return urls
+
+
+def find_disallowed_domains(
+    node: Any, text: str, session: requests.Session | None = None
+) -> list[str]:
     """Домены ссылок поста, не входящие в ALLOWED_KEYWORD_DOMAINS.
 
     Ссылочная (freestream) находка уже домен-специфична сама по себе
@@ -103,6 +271,13 @@ def find_disallowed_domains(node: Any, text: str) -> list[str]:
     на свой сайт — без проверки такой пост уходил бы алертом наравне с
     настоящим колесом (пример: канал слал колесо и рекламу казино вперемешку,
     оба текста содержат слово «колесо»).
+    session, если передан, раскрывает известные сокращатели и проверяет уже
+    конечный домен (см. resolve_shortlink): сам сокращатель в
+    ALLOWED_KEYWORD_DOMAINS попадать не должен — им прикрывается и легитимная
+    ссылка (vk.cc -> vk.com), и скам, поэтому доверять домену сокращателя
+    напрямую нельзя. Без session или при неудачном раскрытии домен
+    сокращателя остаётся как есть — fail-secure: расценивается как
+    подозрительный, а не как разрешённый.
     Смотрим только <a href> — веб-превью t.me/s автоматически превращает
     голые URL в посте в такие ссылки, отдельный regex по тексту не нужен.
     Порядок сохраняется, дубликаты домена схлопываются.
@@ -112,7 +287,12 @@ def find_disallowed_domains(node: Any, text: str) -> list[str]:
         href = str(link.get("href", "")).strip()
         if not href:
             continue
-        domain = urlsplit(normalize_url(href)).netloc
+        normalized_href = normalize_url(href)
+        domain = urlsplit(normalized_href).netloc
+        if domain and session is not None and _is_shortener_domain(domain):
+            resolved = resolve_shortlink(normalized_href, session)
+            if resolved is not None:
+                domain = urlsplit(resolved).netloc
         if not domain or domain in domains:
             continue
         if any(
