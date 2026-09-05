@@ -117,6 +117,19 @@ REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
 # всегда обходит этот кэш (precheck_wheel(..., use_cache=False)) — его смысл
 # как раз в честной перепроверке, а не в ожидании TTL.
 EXPIRED_CACHE_TTL_SECONDS = env_int("EXPIRED_CACHE_TTL_SECONDS", 120, 5)
+# Аварийный выключатель на случай новой заглушки API BetBoom (см.
+# betboom-api-stub-breaks-precheck в памяти проекта): прошлая заглушка
+# (is_ended=true без окна розыгрыша и без is_early) уже распознаётся и
+# гасится в api_info_to_status как unknown, но если BetBoom когда-нибудь
+# отдаст заглушку с правдоподобным окном, api_info_to_status честно
+# ответит 'expired' на каждый запрос, и парсер снова замолчит целиком —
+# тем же способом, что уже случался (2321 проверка, 1792 пропуска, 0
+# уведомлений за 35 часов). Единственный внешний признак такого сбоя —
+# подряд идущие expired БЕЗ единого active/soon для разных колёс: у живого
+# API такая серия статистически невероятна. Столько подряд expired
+# переводит все следующие в unknown (fail-open) до первого настоящего
+# active/soon — см. betboom._apply_stub_guard.
+BETBOOM_STUB_GUARD_THRESHOLD = env_int("BETBOOM_STUB_GUARD_THRESHOLD", 8, 2)
 # Проверять колесо через API BetBoom перед отправкой уведомления. Посты
 # нередко содержат «хвосты» — старые href на прошлые колёса, невидимые
 # в Telegram, но попадающие в HTML-разметку (стример скопировал прошлый пост
