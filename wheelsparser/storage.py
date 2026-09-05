@@ -26,6 +26,7 @@ from .config import (
     PENDING_EXPIRED_FILE,
     REMOVED_WHEELS_FILE,
     SEEN_FILE,
+    SUGGESTED_CHANNELS_FILE,
 )
 from .logging_setup import log
 from .timeutils import parse_msk, today_msk
@@ -221,6 +222,60 @@ def unmark_wheel_removed(url: str) -> bool:
         del removed[url]
         snapshot = dict(removed)
     atomic_write_json(REMOVED_WHEELS_FILE, snapshot)
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Предложенные каналы-первоисточники (suggested_channels.json)
+# ----------------------------------------------------------------------------
+# Пост с колесом часто оказывается репостом из канала, которого нет в
+# мониторинге, — парсер предлагает админу добавить первоисточник (см.
+# parser.suggest_forward_source). Предложение делается ОДИН раз на канал
+# и переживает рестарт: молчание админа — тоже ответ, и после перезапуска
+# он не должен получить то же предложение заново.
+
+SUGGESTED_CHANNELS_LOCK = threading.Lock()
+
+
+def load_suggested_channels() -> set[str]:
+    data = read_json(SUGGESTED_CHANNELS_FILE, [])
+    if not isinstance(data, list):
+        return set()
+    return {str(channel) for channel in data if isinstance(channel, str)}
+
+
+# Ленивая загрузка — как у REMOVED_WHEELS: файл читается после
+# ensure_data_dir(), а не при импорте модуля.
+SUGGESTED_CHANNELS: set[str] | None = None
+
+
+def _suggested_channels_locked() -> set[str]:
+    """Возвращает множество, загружая при первом обращении. Только под локом."""
+    global SUGGESTED_CHANNELS
+    if SUGGESTED_CHANNELS is None:
+        SUGGESTED_CHANNELS = load_suggested_channels()
+    return SUGGESTED_CHANNELS
+
+
+def mark_channel_suggested(channel: str) -> bool:
+    """Помечает канал как «уже предлагали».
+
+    Возвращает True, если предложение делается впервые (и его нужно
+    отправить), False — если канал уже предлагали раньше. Сбой записи не
+    должен ронять цикл парсинга: предложение всё равно уходит, просто без
+    гарантии пережить рестарт (тогда админ увидит его ещё раз — это
+    неприятно, но безопаснее, чем потерять находку из-за ошибки диска).
+    """
+    with SUGGESTED_CHANNELS_LOCK:
+        suggested = _suggested_channels_locked()
+        if channel in suggested:
+            return False
+        suggested.add(channel)
+        snapshot = sorted(suggested)
+    try:
+        atomic_write_json(SUGGESTED_CHANNELS_FILE, snapshot)
+    except OSError as error:
+        log.warning("Не удалось сохранить %s: %s", SUGGESTED_CHANNELS_FILE.name, error)
     return True
 
 

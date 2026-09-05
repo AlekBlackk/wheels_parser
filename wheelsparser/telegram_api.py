@@ -235,19 +235,27 @@ def send_keyword_notification(entry: dict[str, Any]) -> bool:
 
 
 def send_service_notification(
-    text: str, session: requests.Session | None = None
+    text: str,
+    session: requests.Session | None = None,
+    reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     """Сервисное сообщение в доверенный чат.
 
     По умолчанию отправляется из parser-потока его сессией. Вызывающему из
     другого потока нужно передать свою сессию: requests.Session не
     потокобезопасна (см. net.py).
+    reply_markup — inline-клавиатура, если сообщение предлагает действие
+    (например «➕ Добавить канал» под предложением первоисточника, см.
+    parser.suggest_forward_source).
     """
     if not notifications_enabled():
         return False
     try:
         _post_message(
-            session or PARSER_SESSION, TELEGRAM_CHAT_ID, text
+            session or PARSER_SESSION,
+            TELEGRAM_CHAT_ID,
+            text,
+            reply_markup=reply_markup,
         ).raise_for_status()
         return True
     except requests.RequestException as error:

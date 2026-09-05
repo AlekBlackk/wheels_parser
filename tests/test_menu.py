@@ -395,5 +395,28 @@ class RemoveWheelCallbackTests(unittest.TestCase):
         self.assertTrue(answer.call_args.kwargs.get("show_alert"))
 
 
+class ChannelSuggestionKeyboardTests(unittest.TestCase):
+    def test_button_carries_the_channel_in_callback_data(self):
+        keyboard = menu.channel_suggestion_keyboard("origchannel")
+
+        (row,) = keyboard["inline_keyboard"]
+        (button,) = row
+        self.assertEqual(button["callback_data"], "ch:add:origchannel")
+        self.assertIn("origchannel", button["text"])
+
+    def test_callback_data_fits_the_telegram_limit(self):
+        # Telegram режет callback_data на 64 байтах: максимальный юзернейм
+        # (32 символа по USERNAME_RE) плюс префикс обязаны поместиться.
+        keyboard = menu.channel_suggestion_keyboard("c" * 32)
+
+        callback_data = keyboard["inline_keyboard"][0][0]["callback_data"]
+        self.assertLessEqual(len(callback_data.encode("utf-8")), 64)
+
+    def test_suggestion_button_is_not_handled_by_menu_itself(self):
+        # Обработчик живёт в bot.py (нужен check_channel_preview) — menu
+        # обязан вернуть False, иначе кнопка молча перестанет работать.
+        self.assertFalse(menu.handle_callback("1", 55, "cb1", "ch:add:origchannel"))
+
+
 if __name__ == "__main__":
     unittest.main()

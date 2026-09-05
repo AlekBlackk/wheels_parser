@@ -41,6 +41,11 @@ REMOVED_WHEELS_FILE = DATA_DIR / "removed_wheels.json"
 # «увиденным» в seen_ids.json, и без этого файла рестарт терял бы находку
 # навсегда вместо повторной проверки на следующих циклах.
 PENDING_EXPIRED_FILE = DATA_DIR / "pending_expired.json"
+# Каналы-первоисточники, о которых админу уже предлагали добавление
+# (см. parser.suggest_forward_source). Помним навсегда и переживаем
+# рестарт: одно предложение на канал — админ либо добавил его кнопкой,
+# либо сознательно проигнорировал, и повторять это не нужно.
+SUGGESTED_CHANNELS_FILE = DATA_DIR / "suggested_channels.json"
 LOG_FILE = DATA_DIR / "parser.log"
 LOCK_FILE = DATA_DIR / "wheelsparser.lock"
 

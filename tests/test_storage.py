@@ -236,6 +236,52 @@ class PendingExpiredStateTests(TempDirTestCase):
             storage.save_pending_expired({})
 
 
+class SuggestedChannelsTests(TempDirTestCase):
+    """Предложение добавить канал-первоисточник делается один раз на канал
+    и переживает рестарт: молчание админа — тоже ответ (см.
+    parser.suggest_forward_source)."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.tmp / "suggested_channels.json"
+        patcher = patch.object(storage, "SUGGESTED_CHANNELS_FILE", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        reset = patch.object(storage, "SUGGESTED_CHANNELS", set())
+        reset.start()
+        self.addCleanup(reset.stop)
+
+    def test_first_suggestion_is_allowed_and_second_is_not(self):
+        self.assertTrue(storage.mark_channel_suggested("origchannel"))
+        self.assertFalse(storage.mark_channel_suggested("origchannel"))
+
+    def test_different_channels_are_tracked_separately(self):
+        self.assertTrue(storage.mark_channel_suggested("first"))
+        self.assertTrue(storage.mark_channel_suggested("second"))
+        self.assertEqual(
+            sorted(json.loads(self.path.read_text(encoding="utf-8"))),
+            ["first", "second"],
+        )
+
+    def test_state_is_restored_from_disk_after_restart(self):
+        storage.mark_channel_suggested("origchannel")
+
+        # Рестарт: состояние в памяти сброшено (ленивая загрузка), файл цел.
+        with patch.object(storage, "SUGGESTED_CHANNELS", None):
+            self.assertFalse(storage.mark_channel_suggested("origchannel"))
+
+    def test_broken_file_does_not_crash_loading(self):
+        self.path.write_text("{ не json", encoding="utf-8")
+        with patch.object(storage, "SUGGESTED_CHANNELS", None):
+            self.assertTrue(storage.mark_channel_suggested("origchannel"))
+
+    def test_write_failure_still_allows_the_suggestion(self):
+        # Сбой диска не должен «съесть» находку: предложение уходит,
+        # просто без гарантии пережить рестарт.
+        with patch.object(storage, "atomic_write_json", side_effect=OSError("disk")):
+            self.assertTrue(storage.mark_channel_suggested("origchannel"))
+
+
 class BotOffsetTests(TempDirTestCase):
     def test_offset_round_trip(self):
         path = self.tmp / "bot_state.json"

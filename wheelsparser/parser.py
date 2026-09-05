@@ -10,11 +10,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 
-from . import db, registry
+from . import db, menu, registry
 from .alerts import last_alert, mark_url_alert
 from .betboom import is_referral_wheel, precheck_wheel
 from .config import (
@@ -31,13 +32,19 @@ from .config import (
     PREVIEW_CHAR_LIMIT,
     REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
+    USERNAME_RE,
     icon,
 )
 from .keywords import find_keywords
 from .logging_setup import log
 from .net import PARSER_SESSION, build_session
 from .runtime import STOP_EVENT
-from .storage import load_pending_expired, save_pending_expired, save_seen
+from .storage import (
+    load_pending_expired,
+    mark_channel_suggested,
+    save_pending_expired,
+    save_seen,
+)
 from .telegram_api import (
     notifications_enabled,
     send_keyword_notification,
@@ -114,6 +121,35 @@ def message_preview_html(text_element: Any, limit: int = PREVIEW_CHAR_LIMIT) -> 
     return " ".join(parts)
 
 
+# Заголовок репоста в веб-превью: <a class="tgme_widget_message_forwarded_from_name"
+# href="https://t.me/orig">Название</a>. У репоста из скрытого источника
+# (закрытый канал, пользователь без юзернейма) тег тот же, но это <span>
+# без href — такой репост первоисточника не выдаёт.
+FORWARD_SOURCE_SELECTOR = "a.tgme_widget_message_forwarded_from_name"
+_TELEGRAM_HOSTS = frozenset({"t.me", "www.t.me", "telegram.me", "www.telegram.me"})
+
+
+def forwarded_from_channel(message: Any) -> str:
+    """Юзернейм канала-первоисточника репоста или "" если его нет.
+
+    href из разметки не является доверенным вводом: берём из него только
+    первый сегмент пути и пропускаем его через USERNAME_RE — тот же
+    фильтр, что и у /add. Иначе в channels.txt мог бы приехать мусор
+    (t.me/+инвайт, ссылка на чужой домен, путь вида t.me/s/...).
+    """
+    link = message.select_one(FORWARD_SOURCE_SELECTOR)
+    if link is None:
+        return ""
+    parts = urlsplit(str(link.get("href", "")).strip())
+    if parts.netloc.lower() not in _TELEGRAM_HOSTS:
+        return ""
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if not segments:
+        return ""
+    match = USERNAME_RE.match(segments[0])
+    return match.group(1) if match else ""
+
+
 def fetch_channel(
     channel: str, session: requests.Session | None = None
 ) -> list[dict[str, Any]] | None:
@@ -171,6 +207,9 @@ def fetch_channel(
                 # («колесо на 60000$», ведущее на сторонний сайт), см.
                 # notify_keywords и urls.find_disallowed_domains.
                 "disallowed_domains": find_disallowed_domains(message, text, http_session),
+                # Канал-первоисточник, если пост — репост (см.
+                # suggest_forward_source): кандидат в мониторинг.
+                "forwarded_from": forwarded_from_channel(message),
                 "hash": message_content_hash(text, urls),
                 # Хэш в формате старых версий (URL с query-параметрами):
                 # сравнение с ним не даёт принять смену формата хэша за
@@ -863,6 +902,52 @@ def notify_keywords(message: dict[str, Any], channel: str) -> list[dict[str, Any
     return [entry]
 
 
+def suggest_forward_source(message: dict[str, Any], channel: str) -> None:
+    """Предлагает админу добавить канал-первоисточник репоста.
+
+    Репост колеса — самый дешёвый способ найти первоисточник: канал,
+    который постит колёса раньше тех, за кем мы уже следим. Предложение
+    уходит сервисным сообщением с кнопкой «➕ Добавить» (обработчик —
+    bot.handle_callback, префикс ch:add:).
+
+    Сознательно НЕ зависит от того, ушло ли уведомление о самом колесе:
+    чаще всего репост несёт ссылку, о которой уже оповестили из другого
+    канала, и она гасится кулдауном — то есть в самом частом случае
+    находки нет, а первоисточник как раз есть. Привязка к отправленному
+    уведомлению обнулила бы весь смысл.
+
+    Одно предложение на канал за всю историю (см.
+    storage.mark_channel_suggested): молчание админа — тоже ответ.
+    """
+    source = message.get("forwarded_from", "")
+    if not source:
+        return
+    # Юзернеймы Telegram регистронезависимы: сравниваем и запоминаем в
+    # едином регистре, иначе @Aunkere и @aunkere будут разными каналами.
+    source_key = source.casefold()
+    if source_key == channel.casefold():
+        return  # репост внутри того же канала — добавлять нечего
+    monitored = {name.casefold() for name in registry.channels_snapshot()}
+    if source_key in monitored:
+        return
+    if not (message["urls"] or find_keywords(message["text"])):
+        return
+    if not mark_channel_suggested(source_key):
+        return  # уже предлагали — второй раз не спрашиваем
+    log.info(
+        "%s Найден первоисточник репоста: @%s (репост в @%s)",
+        icon("scan"),
+        source,
+        channel,
+    )
+    send_service_notification(
+        f"{icon('scan')} Похоже, нашёлся первоисточник: @{source}\n"
+        f"Его пост с колесом репостнул @{channel}, но самого канала нет "
+        f"в мониторинге.\n{message['message_url']}",
+        reply_markup=menu.channel_suggestion_keyboard(source),
+    )
+
+
 def process_message(
     message: dict[str, Any],
     channel: str,
@@ -904,6 +989,9 @@ def process_message(
     # правка текста с ключевым словом слала бы повторное уведомление.
     if is_new_message and not pending:
         pending.extend(notify_keywords(message, channel))
+    # После уведомлений: сначала само колесо, потом служебное предложение
+    # добавить первоисточник — порядок сообщений в чате важнее краткости.
+    suggest_forward_source(message, channel)
     return pending
 
 

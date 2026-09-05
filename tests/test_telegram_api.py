@@ -327,6 +327,25 @@ class ReplyMarkupTests(unittest.TestCase):
             telegram_api.background_bot_send("1", "text", reply_markup=keyboard)
         self.assertEqual(session.post.call_args.kwargs["json"]["reply_markup"], keyboard)
 
+    def test_service_notification_includes_reply_markup_when_given(self):
+        # Предложение добавить канал-первоисточник уходит сервисным
+        # сообщением с кнопкой (см. parser.suggest_forward_source).
+        session = fake_session()
+        keyboard = {"inline_keyboard": [[{"text": "➕", "callback_data": "ch:add:x"}]]}
+        with patch.object(telegram_api, "TELEGRAM_BOT_TOKEN", "token"), \
+             patch.object(telegram_api, "TELEGRAM_CHAT_ID", "42"):
+            telegram_api.send_service_notification(
+                "text", session, reply_markup=keyboard
+            )
+        self.assertEqual(session.post.call_args.kwargs["json"]["reply_markup"], keyboard)
+
+    def test_service_notification_omits_reply_markup_when_not_given(self):
+        session = fake_session()
+        with patch.object(telegram_api, "TELEGRAM_BOT_TOKEN", "token"), \
+             patch.object(telegram_api, "TELEGRAM_CHAT_ID", "42"):
+            telegram_api.send_service_notification("text", session)
+        self.assertNotIn("reply_markup", session.post.call_args.kwargs["json"])
+
 
 class EditMessageTextTests(unittest.TestCase):
     def test_sends_chat_message_id_text_and_keyboard(self):

@@ -701,6 +701,66 @@ _MENU_RUN_COMMANDS: dict[str, str] = {
 }
 
 
+CHANNEL_ADD_PREFIX = "ch:add:"
+
+
+def _cb_add_suggested_channel(chat_id: str, callback_id: str, raw_channel: str) -> None:
+    """Добавляет канал по кнопке «➕ Добавить» под предложением репоста.
+
+    Живёт здесь, а не в menu.py: добавление обязано пройти ту же проверку
+    ленты t.me/s, что и /add (check_channel_preview) — иначе в мониторинг
+    попадёт канал, посты которого парсер прочитать не сможет. Юзернейм
+    из callback_data проверяется заново: доверять ему как «своему» нельзя,
+    сообщение с кнопкой могло быть переслано и отредактировано.
+    """
+    match = USERNAME_RE.match(raw_channel)
+    if not match:
+        answer_callback_query(callback_id, "Некорректное имя канала", show_alert=True)
+        return
+    channel = match.group(1)
+    if channel.casefold() in {name.casefold() for name in registry.channels_snapshot()}:
+        answer_callback_query(callback_id, f"@{channel} уже в списке")
+        return
+    status = check_channel_preview(channel)
+    if status == "not_found":
+        answer_callback_query(
+            callback_id,
+            f"@{channel} не найден: канал не существует или приватный. Не добавлен.",
+            show_alert=True,
+        )
+        return
+    if status == "no_preview":
+        answer_callback_query(
+            callback_id,
+            f"У @{channel} недоступна лента t.me/s — парсер не сможет "
+            "читать его посты. Не добавлен.",
+            show_alert=True,
+        )
+        return
+    with registry.CHANNELS_LOCK:
+        if channel.casefold() in {name.casefold() for name in registry.CHANNELS}:
+            answer_callback_query(callback_id, f"@{channel} уже в списке")
+            return
+        registry.CHANNELS.append(channel)
+        registry.save_channels_file()
+        total = len(registry.CHANNELS)
+    answer_callback_query(callback_id, f"@{channel} добавлен")
+    note = (
+        ""
+        if status == "ok"
+        else (
+            f"\n{icon('warn')} Проверить канал не удалось "
+            "(сетевая ошибка) — добавлен без проверки."
+        )
+    )
+    bot_send(
+        chat_id,
+        f"{icon('ok')} @{html.escape(channel)} добавлен. Каналов: {total}{note}",
+        reply_markup=menu.root_open_keyboard(),
+    )
+    log.info("Бот: канал @%s добавлен кнопкой из предложения, всего %s", channel, total)
+
+
 def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) -> None:
     """Разбирает callback inline-кнопки.
 
@@ -709,6 +769,8 @@ def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) 
     модуля. Диспетчер хранит имена функций, а не сами объекты: вызов через
     globals() резолвится в момент обращения, поэтому patch.object(bot,
     "cmd_wheels", ...) в тестах подменяет и то, что вызовется отсюда.
+    Здесь же ch:add: — добавление предложенного первоисточника: ему нужен
+    check_channel_preview из этого модуля (см. _cb_add_suggested_channel).
     Всё остальное (навигация, списки, undo) — в menu.handle_callback,
     который bot.py не трогает, чтобы не тащить его внутренности сюда.
     Неопознанный data молча игнорируется — как неизвестные команды.
@@ -717,6 +779,11 @@ def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) 
     if command_name is not None:
         answer_callback_query(callback_id)
         globals()[command_name](chat_id, "")
+        return
+    if data.startswith(CHANNEL_ADD_PREFIX):
+        _cb_add_suggested_channel(
+            chat_id, callback_id, data[len(CHANNEL_ADD_PREFIX):]
+        )
         return
     menu.handle_callback(chat_id, message_id, callback_id, data)
 
