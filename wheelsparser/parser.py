@@ -46,7 +46,7 @@ from .telegram_api import (
     send_telegram_notification,
 )
 from .timeutils import now_msk, parse_found_at
-from .twitch import TWITCH_NEW_ENTRIES
+from .twitch import TWITCH_NEW_ENTRIES, TWITCH_PENDING_RETRY
 from .urls import (
     extract_urls,
     find_disallowed_domains,
@@ -129,8 +129,9 @@ def fetch_channel(
     requests.Session не потокобезопасна.
     """
     url = f"https://t.me/s/{channel}"
+    http_session = session or PARSER_SESSION
     try:
-        response = (session or PARSER_SESSION).get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         if response.status_code == 404:
             log.warning("[%s] канал не найден или приватный (404)", channel)
             return None
@@ -156,7 +157,11 @@ def fetch_channel(
                 continue
             text_element = message.select_one(".tgme_widget_message_text")
             text = text_element.get_text(" ", strip=True) if text_element else ""
-            urls = find_urls(message, text)
+            # session передаётся дальше, чтобы раскрыть известные
+            # сокращатели (vk.cc и т.п., см. urls.resolve_shortlink) —
+            # иначе колесо, спрятанное за ними, даже не матчится
+            # FREESTREAM_RE и теряется молча, до прекчека дело не доходит.
+            urls = find_urls(message, text, http_session)
             results.append({
                 "id": message_id,
                 "text": text,
@@ -165,7 +170,7 @@ def fetch_channel(
                 # Домены поста вне betboom.ru/t.me — сигнал скам-рекламы
                 # («колесо на 60000$», ведущее на сторонний сайт), см.
                 # notify_keywords и urls.find_disallowed_domains.
-                "disallowed_domains": find_disallowed_domains(message, text),
+                "disallowed_domains": find_disallowed_domains(message, text, http_session),
                 "hash": message_content_hash(text, urls),
                 # Хэш в формате старых версий (URL с query-параметрами):
                 # сравнение с ним не даёт принять смену формата хэша за
@@ -402,6 +407,25 @@ def drain_twitch_entries() -> list[dict[str, Any]]:
             entries.append(TWITCH_NEW_ENTRIES.get_nowait())
         except queue.Empty:
             return entries
+
+
+def drain_twitch_retry_registrations() -> None:
+    """Регистрирует на ретрай ссылки twitch-worker'а, пропущенные как
+    expired/soon (см. twitch.TWITCH_PENDING_RETRY).
+
+    PENDING_EXPIRED_RETRY трогает только parser-поток (см. storage.py —
+    словарь и файл без лока), поэтому twitch-worker не пишет туда
+    напрямую, а кладёт заявку в очередь; parser забирает её в начале
+    каждого цикла, как и TWITCH_NEW_ENTRIES.
+    """
+    while True:
+        try:
+            job = TWITCH_PENDING_RETRY.get_nowait()
+        except queue.Empty:
+            return
+        _register_pending_expired(
+            job["url"], job["channel"], job["message"], job["post_text"], job["now"]
+        )
 
 
 def load_cooldown_window(now: datetime) -> list[dict[str, Any]]:
@@ -896,6 +920,7 @@ def process_cycle(
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), len(channels))
     now = now_msk()
     twitch_entries = drain_twitch_entries()
+    drain_twitch_retry_registrations()
     try:
         db.insert_entries(twitch_entries)
     except Exception:

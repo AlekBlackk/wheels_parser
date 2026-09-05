@@ -90,12 +90,20 @@ class HandleMessageTests(unittest.TestCase):
         )
         while not twitch.TWITCH_NEW_ENTRIES.empty():
             twitch.TWITCH_NEW_ENTRIES.get_nowait()
+        while not twitch.TWITCH_PENDING_RETRY.empty():
+            twitch.TWITCH_PENDING_RETRY.get_nowait()
 
     def queued(self):
         entries = []
         while not twitch.TWITCH_NEW_ENTRIES.empty():
             entries.append(twitch.TWITCH_NEW_ENTRIES.get_nowait())
         return entries
+
+    def queued_retries(self):
+        jobs = []
+        while not twitch.TWITCH_PENDING_RETRY.empty():
+            jobs.append(twitch.TWITCH_PENDING_RETRY.get_nowait())
+        return jobs
 
     def test_broadcaster_link_is_notified_and_queued(self):
         twitch.handle_twitch_message(
@@ -108,6 +116,8 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(entries[0]["source"], "twitch")
         self.assertEqual(entries[0]["author_roles"], ["broadcaster"])
         self.notify.assert_called_once()
+        # Уведомление ушло сразу — регистрировать на ретрай нечего.
+        self.assertEqual(self.queued_retries(), [])
 
     def test_viewer_link_is_ignored(self):
         twitch.handle_twitch_message("demo", "viewer", {}, f"колесо {WHEEL}")
@@ -128,6 +138,13 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
         self.assertIsNone(alerts.last_alert(WHEEL))
+        # Зарегистрирован на ретрай (см. TWITCH_PENDING_RETRY): у IRC нет
+        # истории, поэтому это единственный шанс поймать колесо, которое
+        # на самом деле ещё живо (ошибочный is_ended).
+        (job,) = self.queued_retries()
+        self.assertEqual(job["url"], WHEEL)
+        self.assertEqual(job["channel"], "demo")
+        self.assertEqual(job["message"]["message_url"], "https://www.twitch.tv/demo")
 
     def test_expired_wheel_does_not_block_later_restart_notification(self):
         with patch.object(twitch, "precheck_wheel", return_value=("expired", False, "")):
@@ -160,6 +177,8 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.queued(), [])
         self.notify.assert_not_called()
         self.assertIsNone(alerts.last_alert(WHEEL))
+        (job,) = self.queued_retries()
+        self.assertEqual(job["url"], WHEEL)
 
     def test_wheel_starting_later_is_notified_once_active(self):
         with patch.object(twitch, "precheck_wheel", return_value=("soon", False, "")):
@@ -256,6 +275,73 @@ class HandleMessageTests(unittest.TestCase):
         self.assertIsNotNone(alerts.last_alert(WHEEL))
 
 
+class ShortlinkResolutionTests(unittest.TestCase):
+    """Ссылка, спрятанная за сокращателем (vk.cc и т.п.), должна находиться
+    и обрабатываться так же, как прямая ссылка на betboom.ru/freestream."""
+
+    def _start(self, patcher):
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    def setUp(self):
+        self._start(patch.dict(alerts.LAST_URL_ALERT, clear=True))
+        self._start(patch.object(twitch, "precheck_wheel", return_value=("active", False, "")))
+        self.notify = self._start(
+            patch.object(twitch, "send_telegram_notification", return_value=True)
+        )
+        self.resolve = self._start(patch.object(twitch, "resolve_shortlink"))
+        while not twitch.TWITCH_NEW_ENTRIES.empty():
+            twitch.TWITCH_NEW_ENTRIES.get_nowait()
+
+    def queued(self):
+        entries = []
+        while not twitch.TWITCH_NEW_ENTRIES.empty():
+            entries.append(twitch.TWITCH_NEW_ENTRIES.get_nowait())
+        return entries
+
+    def test_resolved_shortlink_is_notified(self):
+        self.resolve.return_value = WHEEL
+
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, "колесо vk.cc/aB3xZ"
+        )
+
+        self.resolve.assert_called_once_with("https://vk.cc/aB3xZ", twitch.TWITCH_SESSION)
+        entries = self.queued()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], WHEEL)
+        self.notify.assert_called_once()
+
+    def test_unresolved_shortlink_from_privileged_author_is_ignored(self):
+        self.resolve.return_value = None
+
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, "колесо vk.cc/aB3xZ"
+        )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+
+    def test_shortlink_resolving_to_unrelated_page_is_ignored(self):
+        self.resolve.return_value = "https://vk.com/somepost"
+
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, "колесо vk.cc/aB3xZ"
+        )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+
+    def test_shortlink_from_viewer_is_not_resolved(self):
+        # Раскрытие — сетевой вызов; тратить его на сообщения зрителей
+        # незачем, роль проверяется раньше (см. handle_twitch_message).
+        twitch.handle_twitch_message("demo", "viewer", {}, "колесо vk.cc/aB3xZ")
+
+        self.resolve.assert_not_called()
+        self.assertEqual(self.queued(), [])
+
+
 class EnqueueTests(unittest.TestCase):
     """IRC-поток обязан только читать сокет: любой сетевой вызов в нём
     задерживает ответ на PING, и Twitch выбрасывает парсер из чата."""
@@ -286,6 +372,15 @@ class EnqueueTests(unittest.TestCase):
             twitch.enqueue_twitch_message("demo", "viewer", {}, "го колесо когда")
         )
         self.assertTrue(twitch.TWITCH_JOBS.empty())
+
+    def test_message_with_shortlink_candidate_is_queued(self):
+        # Раскрытие (сеть) происходит позже, в handle_twitch_message — сам
+        # факт сокращённой ссылки цену этого фильтра не поднимает.
+        self.assertTrue(
+            twitch.enqueue_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, "колесо vk.cc/aB3xZ"
+            )
+        )
 
     def test_full_queue_drops_message_without_raising(self):
         for _ in range(2):

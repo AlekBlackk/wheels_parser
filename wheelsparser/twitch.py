@@ -39,6 +39,7 @@ from .config import (
     PREVIEW_CHAR_LIMIT,
     REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
+    SHORTENER_CANDIDATE_RE,
     TWITCH_BOTS,
     TWITCH_IDLE_TIMEOUT_SECONDS,
     TWITCH_IRC_HOST,
@@ -51,12 +52,20 @@ from .net import TWITCH_SESSION
 from .runtime import STOP_EVENT
 from .telegram_api import send_telegram_notification
 from .timeutils import now_msk
-from .urls import normalize_url
+from .urls import find_shortlink_candidates_in_text, normalize_url, resolve_shortlink
 
 # Находки twitch-потока: уведомления по ним уже отправлены, parser-поток
 # забирает записи в начале каждого цикла и пишет их в базу вместе с
 # остальными находками цикла.
 TWITCH_NEW_ENTRIES: queue.Queue[dict[str, Any]] = queue.Queue()
+
+# Ссылки из Twitch-чата, пропущенные как expired/soon и ждущие регистрации
+# на ретрай (см. parser.PENDING_EXPIRED_RETRY, parser.retry_expired_links —
+# тот же механизм, что уже есть для Telegram). PENDING_EXPIRED_RETRY трогает
+# только parser-поток (см. storage.py: словарь и файл без лока), поэтому
+# twitch-worker не пишет туда напрямую — кладёт заявку сюда, а parser
+# забирает её в начале каждого цикла вместе с TWITCH_NEW_ENTRIES.
+TWITCH_PENDING_RETRY: queue.Queue[dict[str, Any]] = queue.Queue()
 
 # Сообщения со ссылкой, ждущие обработки: (канал, автор, теги, текст, время).
 # Время фиксируется в момент получения сообщения, а не обработки: found_at
@@ -113,7 +122,11 @@ def handle_twitch_message(
         normalized = normalize_url(candidate)
         if normalized and normalized not in urls:
             urls.append(normalized)
-    if not urls:
+    # Кандидаты на сокращатель (vk.cc и т.п.) — регэксп, без сети: сама
+    # ссылка на сокращатель ничего не доказывает, поэтому цену раскрытия
+    # (сетевой запрос) платим только ниже, после проверки роли автора.
+    shortlink_candidates = find_shortlink_candidates_in_text(text)
+    if not urls and not shortlink_candidates:
         return
     roles = author_roles(tags, login)
     if not roles:
@@ -122,6 +135,18 @@ def handle_twitch_message(
             channel,
             login,
         )
+        return
+    for candidate in shortlink_candidates:
+        resolved = resolve_shortlink(candidate, TWITCH_SESSION)
+        if resolved is None:
+            continue
+        match = FREESTREAM_RE.match(resolved)
+        if not match:
+            continue
+        normalized = normalize_url(match.group(0))
+        if normalized not in urls:
+            urls.append(normalized)
+    if not urls:
         return
     # Текст сообщения — сигнал «колесо для рефералов». Только для сообщения
     # с одной ссылкой: иначе непонятно, к какому колесу относится «для рефов».
@@ -160,11 +185,23 @@ def handle_twitch_message(
             # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
             # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
             # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES,
-            # и относится только к expired). Персистентного ретрая тут нет
-            # (см. parser.PENDING_EXPIRED_RETRY для Telegram) — сообщение из
-            # чата Twitch не «правится» повторно, поэтому колесо, ставшее
-            # active позже, попадёт в уведомления только по новому сообщению
-            # в чате (тот же зазор, что уже был для expired).
+            # и относится только к expired). Регистрируем ссылку на ретрай —
+            # тем же способом, что и Telegram (см. TWITCH_PENDING_RETRY выше
+            # и parser.retry_expired_links): у IRC нет истории, и без ретрая
+            # колесо, ставшее active позже, попало бы в уведомления только
+            # по НОВОМУ сообщению в чате — а зрители после анонса обычно
+            # ссылку не повторяют, и находка терялась бы навсегда.
+            TWITCH_PENDING_RETRY.put({
+                "url": url,
+                "channel": channel,
+                "message": {
+                    "id": tags.get("id", ""),
+                    "message_url": f"https://www.twitch.tv/{channel}",
+                    "text": text,
+                },
+                "post_text": post_text,
+                "now": now,
+            })
             continue
         entry = {
             "url": url,
@@ -216,12 +253,17 @@ def enqueue_twitch_message(
 ) -> bool:
     """Ставит сообщение в очередь обработки (вызывается из потока twitch-irc).
 
-    Делает только дешёвую работу: сообщения без ссылки на колесо (а это
-    практически весь чат) отсеиваются регэкспом здесь же, поэтому очередь
-    наполняется единицами сообщений и не растёт от обычной болтовни.
+    Делает только дешёвую работу: сообщения без ссылки на колесо и без
+    кандидата на сокращатель (а это практически весь чат) отсеиваются
+    регэкспом здесь же, поэтому очередь наполняется единицами сообщений
+    и не растёт от обычной болтовни. Сокращатель (см. SHORTENER_CANDIDATE_RE)
+    добавлен в фильтр тем же способом, что и прямая ссылка: сам факт
+    сокращённой ссылки ничего не доказывает и не стоит сети — раскрытие
+    происходит позже, в handle_twitch_message, и только для сообщений от
+    стримера/модов/VIP/ботов (см. её докстроку).
     Возвращает True, если сообщение принято в обработку.
     """
-    if not FREESTREAM_RE.search(text):
+    if not (FREESTREAM_RE.search(text) or SHORTENER_CANDIDATE_RE.search(text)):
         return False
     try:
         TWITCH_JOBS.put_nowait((channel, login, tags, text, now_msk()))
