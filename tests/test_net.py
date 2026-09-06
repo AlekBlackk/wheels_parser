@@ -105,6 +105,29 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(server.requests, ["GET", "GET"])
 
+    def test_retry_limits_are_configured(self):
+        from wheelsparser.net import (
+            HTTP_BACKOFF_MAX,
+            HTTP_RETRY_AFTER_MAX,
+            HTTP_TOTAL_RETRIES,
+            MAX_REQUEST_DURATION,
+        )
+
+        session = build_session()
+        adapter = session.adapters["https://"]
+        retry = adapter.max_retries
+        self.assertEqual(retry.total, HTTP_TOTAL_RETRIES)
+        self.assertEqual(retry.retry_after_max, HTTP_RETRY_AFTER_MAX)
+        self.assertEqual(retry.retry_after_max, 30)
+        self.assertEqual(retry.backoff_max, HTTP_BACKOFF_MAX)
+        self.assertEqual(retry.backoff_max, 10)
+        self.assertGreater(MAX_REQUEST_DURATION, 0)
+
+    def test_custom_status_forcelist(self):
+        session = build_session(status_forcelist=(500, 502))
+        adapter = session.adapters["https://"]
+        self.assertEqual(adapter.max_retries.status_forcelist, (500, 502))
+
 
 if __name__ == "__main__":
     unittest.main()

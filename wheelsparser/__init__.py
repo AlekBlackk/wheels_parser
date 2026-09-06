@@ -6,12 +6,13 @@
 Слои пакета (стрелка — направление зависимости, циклов нет):
 
     config → logging_setup → net/runtime/registry/storage/urls/timeutils
-           → keywords/alerts/betboom/telegram_api
-           → active_report → bot / twitch / parser → app
+           → db/keywords/alerts/betboom/telegram_api
+           → telegram_scrape/channel_health/retries
+           → active_report/reports → menu → bot/twitch/predictive/parser → app
 
-Файлы состояния (channels.txt, wheels.db, seen_ids.json и прочие)
-лежат в корне репозитория, на уровень выше каталога пакета:
-см. ``config.BASE_DIR``.
+Файлы машинного состояния (wheels.db, seen_ids.json и прочие)
+лежат в каталоге data/ (см. ``config.DATA_DIR``), а списки-источники
+правды (channels.txt, keywords.txt, twitch_channels.txt) — в корне (``config.BASE_DIR``).
 """
 
 __all__ = ["__version__"]

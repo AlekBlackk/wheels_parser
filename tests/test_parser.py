@@ -157,6 +157,51 @@ class FetchChannelTests(unittest.TestCase):
             self.assertIsNone(parser.fetch_channel("broken-markup"))
 
 
+class MessagePreviewHtmlTests(unittest.TestCase):
+    def test_betboom_link_preserves_anchor_tag(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_text">'
+            'Колесо: <a href="https://betboom.ru/freestream/demo">клик</a>'
+            '</div>',
+            "html.parser",
+        ).find("div")
+        preview = parser.message_preview_html(html)
+        self.assertIn('<a href="https://betboom.ru/freestream/demo">клик</a>', preview)
+
+    def test_third_party_link_rendered_as_plain_text(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_text">'
+            'Наш чат: <a href="https://t.me/channel">канал</a>'
+            '</div>',
+            "html.parser",
+        ).find("div")
+        preview = parser.message_preview_html(html)
+        self.assertNotIn("<a ", preview)
+        self.assertIn("канал (https://t.me/channel)", preview)
+
+    def test_spoofed_link_unmasked_as_text(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_text">'
+            '<a href="https://t.me/fake_bot">https://betboom.ru/freestream/wheel1</a>'
+            '</div>',
+            "html.parser",
+        ).find("div")
+        preview = parser.message_preview_html(html)
+        self.assertNotIn("<a ", preview)
+        self.assertIn("https://betboom.ru/freestream/wheel1 (https://t.me/fake_bot)", preview)
+
+    def test_identical_label_and_href_rendered_without_duplication(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_text">'
+            '<a href="https://t.me/channel">https://t.me/channel</a>'
+            '</div>',
+            "html.parser",
+        ).find("div")
+        preview = parser.message_preview_html(html)
+        self.assertNotIn("<a ", preview)
+        self.assertEqual(preview, "https://t.me/channel")
+
+
 def forward_html(href=None, tag="a"):
     """Пост-репост в разметке веб-превью t.me/s."""
     attribute = f' href="{href}"' if href is not None else ""
@@ -510,6 +555,18 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertEqual(entries, [])
         self.single.assert_not_called()
         self.assertTrue(any(url in line and "кулдаун" in line for line in logs.output))
+
+    def test_cooldown_claimed_by_twitch_suppresses_parser_alert(self):
+        # Если Twitch-поток уже занял кулдаун через claim_url_alert,
+        # parser не должен слать повторное уведомление.
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        self.assertTrue(alerts.claim_url_alert(url, self.now))
+
+        entries = self.process(message, {})
+
+        self.assertEqual(entries, [])
+        self.single.assert_not_called()
 
     def test_expired_wheel_does_not_block_later_restart_notification(self):
         # Пропуск expired-«хвоста» — не уведомление: кулдаун ставить нельзя,
@@ -1430,6 +1487,16 @@ class ProcessCycleTests(unittest.TestCase):
             [entry["url"] for entry in self.stored()],
             ["https://betboom.ru/freestream/2", "https://betboom.ru/freestream/fresh"],
         )
+
+
+class FetchChannelsParallelTests(unittest.TestCase):
+    def test_fetch_aborts_immediately_when_stop_event_is_set(self):
+        with patch.object(parser.STOP_EVENT, "is_set", return_value=True), \
+             patch.object(parser, "fetch_channel") as fetch:
+            results = parser._fetch_all_channels(["ch1", "ch2"])
+
+        fetch.assert_not_called()
+        self.assertEqual(results, [("ch1", None), ("ch2", None)])
 
 
 if __name__ == "__main__":

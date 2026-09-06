@@ -53,36 +53,42 @@ pytest tests/test_parser.py
 
 ```
 config → logging_setup → net/runtime/registry/storage/urls/timeutils
-       → keywords/alerts/betboom/telegram_api
-       → active_report → bot/twitch/parser → app
+       → db/keywords/alerts/betboom/telegram_api
+       → telegram_scrape/channel_health/retries
+       → active_report/reports → menu → bot/twitch/predictive/parser → app
 ```
 
 | Модуль | Роль |
 |---|---|
 | `config.py` | Пути, переменные окружения, константы. Ни от чего внутри пакета не зависит, читается первым. Значения фиксируются при импорте. |
 | `logging_setup.py` | Общий `log`, ротация файла, маскировка токена. Обработчики ставятся только в `setup_logging()` из `app.main()`. |
-| `net.py` | HTTP-сессии по потокам. `requests.Session` не потокобезопасна — у каждого потока своя сессия с фиксированным владельцем. |
-| `runtime.py` | Стоп-флаг, сигналы, single instance, `supervise()` для перезапуска упавших потоков. |
-| `registry.py` | Списки под мониторингом (каналы, слова, Twitch). Источник правды — txt-файлы, меняются на лету командами бота. |
+| `net.py` | HTTP-сессии по потокам. `requests.Session` не потокобезопасна — у каждого потока своя сессия с фиксированным владельцем. `ThreadLocalSession` для пулов воркеров. |
+| `runtime.py` | Стоп-флаг, сигналы, single instance, `supervise()` для перезапуска упавших потоков, хендшейк внепланового обхода каналов по `/active` (`request_rescan` / `wait_before_next_cycle` / `take_rescan_request` / `mark_rescan_done`). |
+| `registry.py` | Списки под мониторингом (каналы, слова, Twitch). Источник правды — txt-файлы, меняются на лету командами бота. Атомарная запись через `atomic_write_text`. |
 | `storage.py` | Мелкий JSON-стейт, атомарная запись (temp + replace). |
-| `db.py` | История находок в SQLite (`data/wheels.db`), WAL, соединение на поток. |
+| `db.py` | История находок в SQLite (`data/wheels.db`), WAL, типизация `WheelEntry`, фабрика `make_wheel_entry`, соединение на поток. |
 | `urls.py` | Канонизация ссылок и хэш поста — единая форма URL для дедупликации, кулдауна, кэшей. |
 | `timeutils.py` | Всё время проекта — МСК, независимо от таймзоны сервера. |
 | `keywords.py` | Поиск ключевых слов с учётом русской морфологии. |
 | `alerts.py` | Кулдаун повторных уведомлений, общий для Telegram и Twitch. |
-| `betboom.py` | Клиент API BetBoom: `active` / `soon` / `expired` / `unknown`. |
+| `betboom.py` | Клиент API BetBoom: `active` / `soon` / `expired` / `unknown`. Общая функция `process_candidate_wheel`. |
 | `telegram_api.py` | Отправка сообщений в Telegram Bot API. |
-| `parser.py` | Основной цикл обхода Telegram-каналов. |
+| `telegram_scrape.py` | BeautifulSoup-парсинг HTML публичных Telegram-каналов (`fetch_channel`, превью, форварды). |
+| `channel_health.py` | Здоровье каналов: подсчёт пустых постов, серий сетевых ошибок, алерты об изменении вёрстки. |
+| `retries.py` | Очереди и повторные попытки: доставка недошедших уведомлений и перепроверка `expired` колёс. |
+| `reports.py` | Генерация форматированных текстов для команд бота (`/help`, `/status`, `/top`, списки каналов). |
+| `menu.py` | Inline-меню бота, роутинг callback'ов, undo. |
+| `active_report.py` | Команда `/active` — внеплановый обход каналов (`request_rescan`), затем параллельная проверка колёс в пуле потоков. |
+| `predictive.py` | Сканер серий стримеров (перебор номеров слагов для обнаружения колёс до публикации). |
 | `twitch.py` | Анонимный IRC-ридер чатов, два потока: `twitch-irc` и `twitch-worker`. |
-| `bot.py` | Команды бота, цикл `getUpdates`. |
-| `menu.py` | Inline-меню, роутинг callback'ов, undo. |
-| `active_report.py` | Команда `/active` — проверка колёс в фоновом потоке. |
-| `app.py` | Точка входа, запуск потоков. |
+| `parser.py` | Координатор обхода Telegram-каналов, сбор и сохранение находок. |
+| `bot.py` | Команды бота, валидация отправителя, цикл `getUpdates`. |
+| `app.py` | Точка входа, запуск и координация потоков. |
 
 ### Потоки
 
-`parser`, `bot`, `twitch-irc`, `twitch-worker`, `active-api`. Все рабочие
-потоки поднимаются через `runtime.supervise` — необработанное исключение
+`parser`, `bot`, `twitch-irc`, `twitch-worker`, `active-api`, `predictive`. Все
+рабочие потоки поднимаются через `runtime.supervise` — необработанное исключение
 перезапускает поток и уходит сервисным уведомлением.
 
 ## Правила, которые легко нарушить

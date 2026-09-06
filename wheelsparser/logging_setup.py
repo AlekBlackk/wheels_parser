@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 from .config import LOG_FILE, TELEGRAM_BOT_TOKEN, USE_COLORS
 
@@ -47,7 +48,23 @@ class RedactTokenFilter(logging.Filter):
         return True
 
 
-class ConsoleFormatter(logging.Formatter):
+class RedactingFormatter(logging.Formatter):
+    """Форматтер с гарантированной маскировкой токена во всей строке (включая traceback)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        return redact_token(message)
+
+    def formatException(self, ei: Any) -> str:
+        text = super().formatException(ei)
+        return redact_token(text)
+
+    def formatStack(self, stack_info: str) -> str:
+        text = super().formatStack(stack_info)
+        return redact_token(text)
+
+
+class ConsoleFormatter(RedactingFormatter):
     """Цвета для консоли: предупреждения жёлтые, ошибки красные, новые ссылки зелёные."""
 
     def format(self, record: logging.LogRecord) -> str:
@@ -73,7 +90,7 @@ def setup_logging() -> logging.Logger:
     logger = logging.getLogger("wheelsparser")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    formatter = logging.Formatter(
+    formatter = RedactingFormatter(
         "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     console = logging.StreamHandler()
@@ -86,7 +103,6 @@ def setup_logging() -> logging.Logger:
     file_handler.setFormatter(formatter)
     for existing in list(logger.filters):
         logger.removeFilter(existing)
-    logger.addFilter(RedactTokenFilter())
     logger.addHandler(console)
     logger.addHandler(file_handler)
     return logger

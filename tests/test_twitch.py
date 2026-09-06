@@ -1,7 +1,8 @@
 import queue
+import ssl
 import unittest
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from wheelsparser import alerts, registry, twitch
 
@@ -249,6 +250,18 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(entries[0]["url"], WHEEL)
         self.notify.assert_called_once()
 
+    def test_cooldown_claimed_by_telegram_suppresses_twitch_alert(self):
+        # Если Telegram-парсер занял кулдаун до precheck, Twitch-поток обязан пропустить
+        # ту же ссылку без отправки дубликата в Telegram.
+        self.assertTrue(alerts.claim_url_alert(WHEEL, twitch.now_msk()))
+
+        twitch.handle_twitch_message(
+            "demo", "streamer", {"badges": "broadcaster/1"}, f"колесо {WHEEL}"
+        )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+
     def test_message_without_wheel_link_is_skipped(self):
         twitch.handle_twitch_message(
             "demo", "streamer", {"badges": "broadcaster/1"}, "просто колесо"
@@ -487,6 +500,30 @@ class ReceivedAtTests(unittest.TestCase):
             entry["found_at"], received_at.isoformat(timespec="seconds")
         )
         self.assertEqual(alerts.last_alert(WHEEL), received_at)
+
+
+class ConnectSocketCleanupTests(unittest.TestCase):
+    def test_raw_socket_closed_when_wrap_socket_fails(self):
+        raw_socket = Mock()
+        with patch.object(twitch.socket, "create_connection", return_value=raw_socket), \
+             patch("ssl.create_default_context") as ctx:
+            ctx.return_value.wrap_socket.side_effect = ssl.SSLError("handshake failed")
+            with self.assertRaises(ssl.SSLError):
+                twitch._connect(["channel1"])
+
+        raw_socket.close.assert_called_once()
+
+    def test_ssl_socket_closed_when_sendall_fails(self):
+        raw_socket = Mock()
+        ssl_socket = Mock()
+        ssl_socket.sendall.side_effect = OSError("network down")
+        with patch.object(twitch.socket, "create_connection", return_value=raw_socket), \
+             patch("ssl.create_default_context") as ctx:
+            ctx.return_value.wrap_socket.return_value = ssl_socket
+            with self.assertRaises(OSError):
+                twitch._connect(["channel1"])
+
+        ssl_socket.close.assert_called_once()
 
 
 if __name__ == "__main__":

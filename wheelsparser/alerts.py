@@ -29,6 +29,46 @@ def cooldown_active(url: str, now: datetime) -> bool:
     )
 
 
+def claim_url_alert(
+    url: str, now: datetime, last_found: dict[str, datetime] | None = None
+) -> bool:
+    """Атомарно проверяет кулдаун и занимает право отправить уведомление по URL.
+
+    Возвращает True, если кулдаун не активен и право успешно занято (метка
+    установлена на `now`).
+    Возвращает False, если URL уже находится под кулдауном.
+    При передаче `last_found` проверяет также локальный снимок цикла.
+    """
+    with LAST_URL_ALERT_LOCK:
+        previous = LAST_URL_ALERT.get(url)
+        if last_found and url in last_found:
+            lf_prev = last_found[url]
+            if previous is None or lf_prev > previous:
+                previous = lf_prev
+        if previous and now - previous <= timedelta(minutes=REALERT_COOLDOWN_MINUTES):
+            return False
+        LAST_URL_ALERT[url] = now
+    _prune_stale_alerts()
+    return True
+
+
+def release_url_alert(url: str, claimed_at: datetime | None = None) -> None:
+    """Освобождает занятый URL, если отправка уведомления была отменена (expired/soon).
+
+    Используется, когда precheck показал, что колесо не активно — чтобы не
+    блокировать отправку уведомления при последующем перезапуске колеса.
+    Если передан `claimed_at`, освобождение происходит только если метка
+    в точности совпадает с временем захвата (защита от случайного сброса
+    более свежего захвата другим потоком).
+    """
+    with LAST_URL_ALERT_LOCK:
+        if claimed_at is not None:
+            if LAST_URL_ALERT.get(url) == claimed_at:
+                LAST_URL_ALERT.pop(url, None)
+        else:
+            LAST_URL_ALERT.pop(url, None)
+
+
 def last_alert(url: str) -> datetime | None:
     with LAST_URL_ALERT_LOCK:
         return LAST_URL_ALERT.get(url)

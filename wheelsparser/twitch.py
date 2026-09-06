@@ -26,18 +26,18 @@ import queue
 import random
 import socket
 import ssl
+import sys
 import time
 from datetime import datetime
 from typing import Any
 
 from . import registry
-from .alerts import cooldown_active, mark_url_alert
-from .betboom import is_referral_wheel, precheck_wheel
+from .alerts import mark_url_alert
+from .betboom import precheck_wheel, process_candidate_wheel
 from .config import (
     FREESTREAM_RE,
-    PRECHECK_WHEELS,
+    MAX_SHORTLINKS_PER_MESSAGE,
     PREVIEW_CHAR_LIMIT,
-    REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     SHORTENER_CANDIDATE_RE,
     TWITCH_BOTS,
@@ -47,6 +47,7 @@ from .config import (
     TWITCH_QUEUE_MAXSIZE,
     icon,
 )
+from .db import WheelEntry
 from .logging_setup import log
 from .net import TWITCH_SESSION
 from .runtime import STOP_EVENT
@@ -57,7 +58,7 @@ from .urls import find_shortlink_candidates_in_text, normalize_url, resolve_shor
 # Находки twitch-потока: уведомления по ним уже отправлены, parser-поток
 # забирает записи в начале каждого цикла и пишет их в базу вместе с
 # остальными находками цикла.
-TWITCH_NEW_ENTRIES: queue.Queue[dict[str, Any]] = queue.Queue()
+TWITCH_NEW_ENTRIES: queue.Queue[WheelEntry] = queue.Queue(maxsize=1000)
 
 # Ссылки из Twitch-чата, пропущенные как expired/soon и ждущие регистрации
 # на ретрай (см. parser.PENDING_EXPIRED_RETRY, parser.retry_expired_links —
@@ -65,7 +66,7 @@ TWITCH_NEW_ENTRIES: queue.Queue[dict[str, Any]] = queue.Queue()
 # только parser-поток (см. storage.py: словарь и файл без лока), поэтому
 # twitch-worker не пишет туда напрямую — кладёт заявку сюда, а parser
 # забирает её в начале каждого цикла вместе с TWITCH_NEW_ENTRIES.
-TWITCH_PENDING_RETRY: queue.Queue[dict[str, Any]] = queue.Queue()
+TWITCH_PENDING_RETRY: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
 
 # Сообщения со ссылкой, ждущие обработки: (канал, автор, теги, текст, время).
 # Время фиксируется в момент получения сообщения, а не обработки: found_at
@@ -136,7 +137,7 @@ def handle_twitch_message(
             login,
         )
         return
-    for candidate in shortlink_candidates:
+    for candidate in shortlink_candidates[:MAX_SHORTLINKS_PER_MESSAGE]:
         resolved = resolve_shortlink(candidate, TWITCH_SESSION)
         if resolved is None:
             continue
@@ -153,99 +154,79 @@ def handle_twitch_message(
     post_text = text if len(urls) == 1 else ""
     for url in urls:
         now = received_at
-        if cooldown_active(url, now):
-            # Раньше это был continue без единой строки лога: если колесо
-            # перезапустили на том же адресе внутри REALERT_COOLDOWN_MINUTES,
-            # выяснить «почему не пришло уведомление» было неоткуда.
-            log.info(
-                "%s Пропускаю %s [twitch #%s]: недавно уже оповещали (кулдаун %s мин)",
-                icon("bell"),
-                url,
-                channel,
-                REALERT_COOLDOWN_MINUTES,
-            )
-            continue  # недавно уже оповещали об этом колесе (TG или Twitch)
-        if PRECHECK_WHEELS:
-            status, referral, ends_at = precheck_wheel(
-                url, TWITCH_SESSION, post_text=post_text
-            )
-        else:
-            status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
-        if status in ("expired", "soon"):
-            log.info(
-                "%s Пропускаю %s [twitch #%s]: %s (API BetBoom)",
-                icon("warn"),
-                url,
-                channel,
-                "колесо уже завершилось" if status == "expired" else "розыгрыш ещё не начался",
-            )
-            # Кулдаун НЕ ставим: это не уведомление, а отказ его слать —
-            # мы ничего не оповестили, и если колесо перезапустят на том
-            # же адресе в пределах REALERT_COOLDOWN_MINUTES, уведомление
-            # обязано уйти. Повторные precheck по тому же «хвосту» в пределах
-            # EXPIRED_CACHE_TTL_SECONDS и так дёшевы — их гасит expired-кэш
-            # в betboom.py (короткий TTL, НЕ связан с REALERT_COOLDOWN_MINUTES,
-            # и относится только к expired). Регистрируем ссылку на ретрай —
-            # тем же способом, что и Telegram (см. TWITCH_PENDING_RETRY выше
-            # и parser.retry_expired_links): у IRC нет истории, и без ретрая
-            # колесо, ставшее active позже, попало бы в уведомления только
-            # по НОВОМУ сообщению в чате — а зрители после анонса обычно
-            # ссылку не повторяют, и находка терялась бы навсегда.
-            TWITCH_PENDING_RETRY.put({
-                "url": url,
-                "channel": channel,
-                "message": {
-                    "id": tags.get("id", ""),
-                    "message_url": f"https://www.twitch.tv/{channel}",
-                    "text": text,
-                },
-                "post_text": post_text,
-                "now": now,
-            })
-            continue
-        entry = {
-            "url": url,
-            "found_at": now.isoformat(timespec="seconds"),
-            "channel": channel,
-            "source": "twitch",
-            "author": login,
-            "author_roles": roles,
-            "msg_id": tags.get("id", ""),
-            "message_url": f"https://www.twitch.tv/{channel}",
-            "preview": text[:PREVIEW_CHAR_LIMIT],
-            "edited": False,
-            "status": status,
-            "referral": referral,
-            "ends_at": ends_at,
-            "notified": False,
-        }
-        # Помечаем ДО отправки: даже при сбое уведомления повторной
-        # рассылки того же колеса в течение кулдауна не будет.
-        mark_url_alert(url, now)
-        try:
-            entry["notified"] = send_telegram_notification(entry, TWITCH_SESSION)
-        except Exception:
-            # send_telegram_notification сама ловит requests.RequestException
-            # и наружу не бросает — сюда попадают только неожиданные баги.
-            # entry обязана попасть в очередь несмотря ни на что: URL уже
-            # под кулдауном (mark_url_alert выше), и без записи в историю
-            # находка потерялась бы совсем — ни в базе, ни на ретрае.
-            log.exception(
-                "%s Twitch: не удалось отправить уведомление о %s [#%s]",
-                icon("warn"),
-                url,
-                channel,
-            )
-            entry["notified"] = False
-        TWITCH_NEW_ENTRIES.put(entry)
-        log.info(
-            "%s Новая ссылка из Twitch [#%s, от @%s]: %s",
-            icon("link"),
-            channel,
-            login,
-            url,
-            extra={"highlight": True},
+        precheck_fn = getattr(
+            sys.modules.get("wheelsparser.twitch"), "precheck_wheel", precheck_wheel
         )
+        entry, _status, retry_needed = process_candidate_wheel(
+            url,
+            channel,
+            now,
+            post_text=post_text,
+            session=TWITCH_SESSION,
+            source="twitch",
+            author=login,
+            author_roles=roles,
+            msg_id=tags.get("id", ""),
+            message_url=f"https://www.twitch.tv/{channel}",
+            preview=text[:PREVIEW_CHAR_LIMIT],
+            source_label=f"twitch #{channel}",
+            precheck_fn=precheck_fn,
+        )
+        if retry_needed:
+            try:
+                TWITCH_PENDING_RETRY.put_nowait({
+                    "url": url,
+                    "channel": channel,
+                    "message": {
+                        "id": tags.get("id", ""),
+                        "message_url": f"https://www.twitch.tv/{channel}",
+                        "text": text,
+                    },
+                    "post_text": post_text,
+                    "now": now,
+                })
+            except queue.Full:
+                log.warning(
+                    "Очередь TWITCH_PENDING_RETRY переполнена, ссылка %s пропущена", url
+                )
+            continue
+        if entry is not None:
+            # Помечаем ДО отправки: даже при сбое уведомления повторной
+            # рассылки того же колеса в течение кулдауна не будет.
+            mark_url_alert(url, now)
+            try:
+                entry["notified"] = send_telegram_notification(entry, TWITCH_SESSION)
+            except Exception:
+                # send_telegram_notification сама ловит requests.RequestException
+                # и наружу не бросает — сюда попадают только неожиданные баги.
+                # entry обязана попасть в очередь несмотря ни на что: URL уже
+                # под кулдауном (mark_url_alert выше), и без записи в историю
+                # находка потерялась бы совсем — ни в базе, ни на ретрае.
+                log.exception(
+                    "%s Twitch: не удалось отправить уведомление о %s [#%s]",
+                    icon("warn"),
+                    url,
+                    channel,
+                )
+                entry["notified"] = False
+            try:
+                TWITCH_NEW_ENTRIES.put_nowait(entry)
+            except queue.Full:
+                # Уведомление уже ушло, но запись в историю потеряна: значит
+                # поток parser не разгребает очередь (завис или мёртв).
+                log.error(
+                    "Очередь TWITCH_NEW_ENTRIES переполнена — parser не читает; "
+                    "находка %s не попадёт в историю",
+                    url,
+                )
+            log.info(
+                "%s Новая ссылка из Twitch [#%s, от @%s]: %s",
+                icon("link"),
+                channel,
+                login,
+                url,
+                extra={"highlight": True},
+            )
 
 
 def enqueue_twitch_message(
@@ -302,23 +283,37 @@ def _connect(channels: list[str]) -> ssl.SSLSocket:
     raw_socket = socket.create_connection(
         (TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=REQUEST_TIMEOUT
     )
-    sock = ssl.create_default_context().wrap_socket(
-        raw_socket, server_hostname=TWITCH_IRC_HOST
-    )
-    sock.settimeout(5.0)
-    # Анонимный вход: ник justinfan<цифры>, пароль не нужен. Читать чат
-    # можно без регистрации приложения и OAuth-токенов.
-    nick = f"justinfan{random.randint(10_000, 99_999)}"
-    # tags — бейджи авторов (broadcaster/moderator/vip),
-    # commands — служебные сообщения вроде RECONNECT.
-    sock.sendall(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
-    sock.sendall(f"NICK {nick}\r\n".encode())
-    for index, channel in enumerate(channels):
-        sock.sendall(f"JOIN #{channel}\r\n".encode())
-        # Лимит Twitch на частоту JOIN — обязательная пауза между каналами.
-        if index < len(channels) - 1:
-            STOP_EVENT.wait(0.6)
-    return sock
+    sock: ssl.SSLSocket | None = None
+    try:
+        sock = ssl.create_default_context().wrap_socket(
+            raw_socket, server_hostname=TWITCH_IRC_HOST
+        )
+        sock.settimeout(5.0)
+        # Анонимный вход: ник justinfan<цифры>, пароль не нужен. Читать чат
+        # можно без регистрации приложения и OAuth-токенов.
+        nick = f"justinfan{random.randint(10_000, 99_999)}"
+        # tags — бейджи авторов (broadcaster/moderator/vip),
+        # commands — служебные сообщения вроде RECONNECT.
+        sock.sendall(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
+        sock.sendall(f"NICK {nick}\r\n".encode())
+        for index, channel in enumerate(channels):
+            sock.sendall(f"JOIN #{channel}\r\n".encode())
+            # Лимит Twitch на частоту JOIN — обязательная пауза между каналами.
+            if index < len(channels) - 1:
+                STOP_EVENT.wait(0.6)
+        return sock
+    except BaseException:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        else:
+            try:
+                raw_socket.close()
+            except OSError:
+                pass
+        raise
 
 
 def _idle_timeout_exceeded(last_activity: float) -> bool:

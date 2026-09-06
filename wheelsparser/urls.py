@@ -20,6 +20,7 @@ import requests
 from .config import (
     ALLOWED_KEYWORD_DOMAINS,
     FREESTREAM_RE,
+    MAX_SHORTLINKS_PER_MESSAGE,
     SHORTENER_CACHE_TTL_SECONDS,
     SHORTENER_CANDIDATE_RE,
     SHORTENER_DOMAINS,
@@ -68,6 +69,19 @@ def normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, parts.path.rstrip("/"), "", ""))
 
 
+def is_betboom_host(url: str) -> bool:
+    """Проверяет, ведёт ли ссылка на betboom.ru или его поддомен."""
+    try:
+        norm = normalize_url(url)
+        host = urlsplit(norm).hostname
+        if not host:
+            return False
+        host = host.lower()
+        return host == "betboom.ru" or host.endswith(".betboom.ru")
+    except Exception:
+        return False
+
+
 def legacy_normalize_url(url: str) -> str:
     """Нормализация URL старых версий парсера (query-параметры сохранялись).
 
@@ -111,7 +125,7 @@ def find_shortlink_candidates_in_text(text: str) -> list[str]:
         normalized = raw if _SCHEME_RE.match(raw) else f"https://{raw}"
         if normalized not in candidates:
             candidates.append(normalized)
-    return candidates
+    return candidates[:MAX_SHORTLINKS_PER_MESSAGE]
 
 
 def find_shortlink_candidates(node: Any, text: str) -> list[str]:
@@ -129,7 +143,7 @@ def find_shortlink_candidates(node: Any, text: str) -> list[str]:
             normalized = f"https://{normalized}"
         if normalized not in candidates:
             candidates.append(normalized)
-    return candidates
+    return candidates[:MAX_SHORTLINKS_PER_MESSAGE]
 
 
 def _is_shortener_domain(domain: str) -> bool:

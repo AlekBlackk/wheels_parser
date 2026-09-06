@@ -68,6 +68,25 @@ class NormalizeUrlTests(unittest.TestCase):
         )
 
 
+class IsBetboomHostTests(unittest.TestCase):
+    def test_betboom_ru_is_accepted(self):
+        self.assertTrue(urls.is_betboom_host("https://betboom.ru/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("betboom.ru/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("https://www.betboom.ru/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("https://sub.betboom.ru/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("https://betboom.ru:443/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("https://sub.betboom.ru:8443/freestream/demo"))
+        self.assertTrue(urls.is_betboom_host("https://user:pass@betboom.ru/freestream/demo"))
+
+    def test_third_party_hosts_are_rejected(self):
+        self.assertFalse(urls.is_betboom_host("https://t.me/channel"))
+        self.assertFalse(urls.is_betboom_host("https://vk.com/wall"))
+        self.assertFalse(urls.is_betboom_host("https://notbetboom.ru/freestream/demo"))
+        self.assertFalse(urls.is_betboom_host("https://betboom.ru.evil.com/"))
+        self.assertFalse(urls.is_betboom_host("javascript:alert(1)"))
+        self.assertFalse(urls.is_betboom_host(""))
+
+
 class FindUrlsTests(unittest.TestCase):
     def test_finds_urls_in_text_and_html_and_deduplicates_normalized_values(self):
         html = BeautifulSoup(
@@ -217,6 +236,19 @@ class ShortlinkCandidateTests(unittest.TestCase):
             urls.find_shortlink_candidates(html, html.get_text(" ", strip=True)),
             ["https://vk.cc/aB3xZ"],
         )
+
+    def test_caps_candidates_to_max_shortlinks_per_message(self):
+        many_links = " ".join(f"vk.cc/link{i}" for i in range(20))
+        candidates = urls.find_shortlink_candidates_in_text(many_links)
+        self.assertEqual(len(candidates), urls.MAX_SHORTLINKS_PER_MESSAGE)
+        self.assertEqual(len(candidates), 5)
+
+    def test_caps_candidates_in_node_to_max_shortlinks_per_message(self):
+        links_html = "".join(f'<a href="https://vk.cc/link{i}">l{i}</a>' for i in range(20))
+        html = BeautifulSoup(f"<div>{links_html}</div>", "html.parser").find("div")
+        candidates = urls.find_shortlink_candidates(html, html.get_text(" ", strip=True))
+        self.assertEqual(len(candidates), urls.MAX_SHORTLINKS_PER_MESSAGE)
+        self.assertEqual(len(candidates), 5)
 
 
 class ResolveShortlinkTests(unittest.TestCase):

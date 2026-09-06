@@ -50,6 +50,8 @@ SUGGESTED_CHANNELS_FILE = DATA_DIR / "suggested_channels.json"
 # до какого индекса адреса уже проверены. Переживает рестарт, иначе
 # сканер каждый раз заново перебирал бы давно завершившиеся колёса.
 STREAMERS_FILE = DATA_DIR / "streamers.json"
+# Серии слагов, отправленные в отставку после исчерпания пустых проверок.
+RETIRED_STREAMERS_FILE = DATA_DIR / "retired_streamers.json"
 LOG_FILE = DATA_DIR / "parser.log"
 LOCK_FILE = DATA_DIR / "wheelsparser.lock"
 
@@ -173,6 +175,7 @@ KEYWORD_MAX_LENGTH = 64
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
 
@@ -242,6 +245,13 @@ PREDICTIVE_DAILY_BUDGET = env_int("PREDICTIVE_DAILY_BUDGET", 500, 10)
 # Пауза после явного отказа (403/429) — сканер замолкает, а админ получает
 # уведомление. Бан по IP убил бы весь парсер, а не только сканер.
 PREDICTIVE_BLOCK_COOLDOWN_MINUTES = env_int("PREDICTIVE_BLOCK_COOLDOWN_MINUTES", 60, 5)
+# Потолок пустых проверок серии подряд (когда lookahead не нашёл ни одного
+# нового колеса), после которого серия считается завершённой и удаляется
+# из streamers.json, освобождая бюджет сканера.
+PREDICTIVE_MAX_EMPTY_SCANS = env_int("PREDICTIVE_MAX_EMPTY_SCANS", 8, 1)
+# Допустимый формат префикса серии слагов: от 2 до 32 символов (латиница,
+# цифры, дефис, подчёркивание). Защищает frontier от мусора и опечаток.
+PREDICTIVE_PREFIX_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
 # Слаг серии: имя (в исходном регистре — он значим, lolly08 отдаёт 404
 # там, где LOLLY08 отдаёт 200) плюс числовой хвост. Ширина хвоста важна:
 # LOLLY08 дополнен нулём, zonertg4 — нет.
@@ -294,6 +304,9 @@ SHORTENER_DOMAINS = frozenset({"vk.cc", "clck.ru", "bit.ly", "tinyurl.com"})
 # вспомогательный шаг обработки одного сообщения, а не запрос к целевому
 # сайту, и таймаут не должен ощутимо тормозить разбор всего канала.
 SHORTENER_RESOLVE_TIMEOUT = env_int("SHORTENER_RESOLVE_TIMEOUT", 2, 1)
+# Потолок кандидатов на сокращатель, раскрываемых для одного сообщения.
+# Защита от долгой блокировки воркера при посте со множеством ссылок на сокращатели.
+MAX_SHORTLINKS_PER_MESSAGE = env_int("MAX_SHORTLINKS_PER_MESSAGE", 5, 1)
 # TTL кэша раскрытых ссылок (сек, см. urls._shortlink_cache). Канал
 # перечитывает последние MESSAGES_PER_CHANNEL сообщений каждый цикл
 # (CHECK_INTERVAL, по умолчанию 60с) независимо от того, видели их уже

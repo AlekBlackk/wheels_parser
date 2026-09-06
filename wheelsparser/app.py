@@ -34,7 +34,6 @@ from .config import (
     PREDICTIVE_ENABLED,
     PREDICTIVE_LOOKAHEAD,
     PREDICTIVE_SCAN_INTERVAL,
-    REQUEST_TIMEOUT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TWITCH_ENABLED,
@@ -42,14 +41,17 @@ from .config import (
 )
 from .db import close_connection, init_db
 from .logging_setup import force_utf8_console, log, redact_token, setup_logging
-from .net import SUPERVISOR_LOCK, SUPERVISOR_SESSION
+from .net import MAX_REQUEST_DURATION, SUPERVISOR_LOCK, SUPERVISOR_SESSION
 from .parser import load_pending_expired_retry, process_cycle
 from .predictive import predictive_loop
 from .runtime import (
     STOP_EVENT,
     acquire_single_instance_lock,
     install_signal_handlers,
+    mark_rescan_done,
     supervise,
+    take_rescan_request,
+    wait_before_next_cycle,
 )
 from .storage import ensure_data_dir, load_seen, save_seen
 from .telegram_api import send_service_notification
@@ -186,6 +188,9 @@ def _run_parse_loop(seen: dict[str, dict[str, str]], baseline: bool) -> None:
     «длительность цикла + CHECK_INTERVAL» и расписание дрейфует.
     try/except вокруг process_cycle: одиночная ошибка цикла не должна
     убивать daemon-поток (сценарий «поток умер, процесс жив»).
+    Команда /active может разбудить поток досрочно (request_rescan) —
+    тогда после внепланового обхода вызывается mark_rescan_done, и /active
+    строит отчёт уже по свежей базе.
     """
     cycle_started = time.monotonic()
     try:
@@ -197,8 +202,10 @@ def _run_parse_loop(seen: dict[str, dict[str, str]], baseline: bool) -> None:
         )
     while not STOP_EVENT.is_set():
         elapsed = time.monotonic() - cycle_started
-        if STOP_EVENT.wait(max(5.0, CHECK_INTERVAL - elapsed)):
+        wait_before_next_cycle(max(5.0, CHECK_INTERVAL - elapsed))
+        if STOP_EVENT.is_set():
             break
+        on_demand = take_rescan_request()
         cycle_started = time.monotonic()
         try:
             process_cycle(seen)
@@ -207,6 +214,9 @@ def _run_parse_loop(seen: dict[str, dict[str, str]], baseline: bool) -> None:
                 "%s Необработанная ошибка в цикле парсинга — жду следующий цикл",
                 icon("warn"),
             )
+        finally:
+            if on_demand:
+                mark_rescan_done()
 
 
 def main() -> int:
@@ -283,7 +293,9 @@ def main() -> int:
         STOP_EVENT.wait(1)
 
     # Даём циклу шанс корректно дописать файлы, но не ждём вечно.
-    parser_thread.join(timeout=REQUEST_TIMEOUT + 5)
+    # Бюджет ожидания рассчитывается от верхнего предела одного запроса с ретраями
+    # (MAX_REQUEST_DURATION), а не от единичного REQUEST_TIMEOUT.
+    parser_thread.join(timeout=MAX_REQUEST_DURATION + 5)
     if parser_thread.is_alive():
         log.warning(
             "%s Цикл не успел завершиться за отведённое время — выхожу; "

@@ -24,7 +24,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypedDict
 
 from .config import DB_FILE, MAX_RESULTS, OUTPUT_FILE
 from .logging_setup import log
@@ -54,6 +54,85 @@ ALWAYS_READ = ("found_at", "channel", "source")
 JSON_FIELDS = ("keywords", "author_roles")
 FLAG_FIELDS = ("edited", "referral", "notified", "delivery_unknown")
 COLUMNS = TEXT_FIELDS + JSON_FIELDS + FLAG_FIELDS
+
+
+class WheelEntry(TypedDict, total=False):
+    """Типизированное представление записи о колесе или ключевом слове."""
+
+    id: int
+    url: str
+    found_at: str
+    channel: str
+    source: str
+    author: str
+    author_roles: list[str]
+    msg_id: str
+    message_url: str
+    preview: str
+    preview_html: str
+    status: str
+    ends_at: str
+    keywords: list[str]
+    edited: bool
+    referral: bool
+    notified: bool
+    delivery_unknown: bool
+
+
+def make_wheel_entry(
+    *,
+    channel: str,
+    url: str = "",
+    found_at: str | None = None,
+    source: str = "telegram",
+    author: str = "",
+    author_roles: list[str] | None = None,
+    msg_id: str = "",
+    message_url: str = "",
+    preview: str = "",
+    preview_html: str = "",
+    status: str = "",
+    ends_at: str = "",
+    keywords: list[str] | None = None,
+    edited: bool = False,
+    referral: bool = False,
+    notified: bool = False,
+    delivery_unknown: bool = False,
+    id: int | None = None,
+) -> WheelEntry:
+    """Строго типизированная фабрика записи для базы данных и уведомлений."""
+    entry: WheelEntry = {
+        "found_at": found_at or now_msk().isoformat(timespec="seconds"),
+        "channel": channel,
+        "source": source,
+        "message_url": message_url,
+        "edited": edited,
+        "referral": referral,
+        "notified": notified,
+    }
+    if url:
+        entry["url"] = url
+    if status:
+        entry["status"] = status
+    if ends_at:
+        entry["ends_at"] = ends_at
+    if msg_id:
+        entry["msg_id"] = msg_id
+    if preview:
+        entry["preview"] = preview
+    if preview_html:
+        entry["preview_html"] = preview_html
+    if author:
+        entry["author"] = author
+    if author_roles:
+        entry["author_roles"] = list(author_roles)
+    if keywords:
+        entry["keywords"] = list(keywords)
+    if delivery_unknown:
+        entry["delivery_unknown"] = delivery_unknown
+    if id is not None:
+        entry["id"] = id
+    return entry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wheels (
@@ -100,7 +179,7 @@ class WheelStats(NamedTuple):
 
     total: int
     today: int
-    last: dict[str, Any] | None
+    last: WheelEntry | None
 
 
 class ChannelCount(NamedTuple):
@@ -182,7 +261,7 @@ def _load_list(value: Any) -> list[str]:
     return [str(item) for item in loaded] if isinstance(loaded, list) else []
 
 
-def entry_to_row(entry: dict[str, Any]) -> tuple[Any, ...]:
+def entry_to_row(entry: WheelEntry | dict[str, Any]) -> tuple[Any, ...]:
     values: list[Any] = []
     for field in TEXT_FIELDS:
         if field == "found_at":
@@ -196,18 +275,18 @@ def entry_to_row(entry: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(values)
 
 
-def row_to_entry(row: sqlite3.Row) -> dict[str, Any]:
-    entry: dict[str, Any] = {"id": row["id"]}
+def row_to_entry(row: sqlite3.Row) -> WheelEntry:
+    entry: WheelEntry = {"id": row["id"]}
     for field in TEXT_FIELDS:
         value = row[field]
         if value or field in ALWAYS_READ:
-            entry[field] = value
+            entry[field] = value  # type: ignore[literal-required]
     for field in JSON_FIELDS:
         value = _load_list(row[field])
         if value:
-            entry[field] = value
+            entry[field] = value  # type: ignore[literal-required]
     for field in FLAG_FIELDS:
-        entry[field] = bool(row[field])
+        entry[field] = bool(row[field])  # type: ignore[literal-required]
     return entry
 
 
@@ -276,7 +355,7 @@ def _rename_legacy(path: Path, suffix: str) -> None:
 # Запись
 # ----------------------------------------------------------------------------
 
-def insert_entries(entries: list[dict[str, Any]]) -> None:
+def insert_entries(entries: list[WheelEntry] | list[dict[str, Any]]) -> None:
     """Сохраняет находки и проставляет им id (нужен для update_delivery)."""
     if not entries:
         return
@@ -284,10 +363,11 @@ def insert_entries(entries: list[dict[str, Any]]) -> None:
     with conn:
         for entry in entries:
             cursor = conn.execute(INSERT_SQL, entry_to_row(entry))
-            entry["id"] = cursor.lastrowid
+            if cursor.lastrowid is not None:
+                entry["id"] = cursor.lastrowid
 
 
-def update_delivery(entry: dict[str, Any]) -> None:
+def update_delivery(entry: WheelEntry | dict[str, Any]) -> None:
     """Сохраняет результат повторной отправки уведомления.
 
     Записи без id (созданные не из базы) молча пропускаются: обновлять
@@ -328,7 +408,7 @@ def _cutoff_key(cutoff: datetime) -> str:
     return cutoff.isoformat(timespec="seconds")
 
 
-def wheels_since(cutoff: datetime) -> list[dict[str, Any]]:
+def wheels_since(cutoff: datetime) -> list[WheelEntry]:
     """Находки со ссылкой не старше cutoff, от старых к свежим.
 
     Записи по ключевым словам (url пуст) лежат в той же таблице ради
@@ -342,7 +422,7 @@ def wheels_since(cutoff: datetime) -> list[dict[str, Any]]:
     return [row_to_entry(row) for row in rows]
 
 
-def pending_retry(cutoff: datetime, limit: int) -> list[dict[str, Any]]:
+def pending_retry(cutoff: datetime, limit: int) -> list[WheelEntry]:
     """Недоставленные уведомления не старше cutoff — кандидаты на повтор.
 
     delivery_unknown исключены: sendMessage не идемпотентен, и повтор

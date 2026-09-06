@@ -24,7 +24,9 @@ from .config import (
     MAX_SEEN_PER_CHANNEL,
     OUTPUT_FILE,
     PENDING_EXPIRED_FILE,
+    PREDICTIVE_PREFIX_RE,
     REMOVED_WHEELS_FILE,
+    RETIRED_STREAMERS_FILE,
     SEEN_FILE,
     STREAMERS_FILE,
     SUGGESTED_CHANNELS_FILE,
@@ -308,17 +310,27 @@ def load_streamer_frontier() -> dict[str, dict[str, Any]]:
     for prefix, info in raw.items():
         if not isinstance(prefix, str) or not isinstance(info, dict):
             continue
+        if not PREDICTIVE_PREFIX_RE.match(prefix):
+            continue
         index = info.get("index")
         width = info.get("width")
         if not isinstance(index, int) or not isinstance(width, int):
             continue
         if isinstance(index, bool) or isinstance(width, bool) or width < 1:
             continue
-        frontier[prefix] = {
+        entry: dict[str, Any] = {
             "index": index,
             "width": width,
             "pending": _clean_pending(info.get("pending")),
         }
+        empty_scans = info.get("empty_scans")
+        if (
+            isinstance(empty_scans, int)
+            and not isinstance(empty_scans, bool)
+            and empty_scans > 0
+        ):
+            entry["empty_scans"] = empty_scans
+        frontier[prefix] = entry
     return frontier
 
 
@@ -329,10 +341,50 @@ def save_streamer_frontier(frontier: dict[str, dict[str, Any]]) -> None:
     запуска он продолжит работать по памяти, просто рестарт заставит
     перебрать серию заново.
     """
+    cleaned = {
+        prefix: dict(info)
+        for prefix, info in frontier.items()
+        if isinstance(prefix, str)
+        and PREDICTIVE_PREFIX_RE.match(prefix)
+        and isinstance(info, dict)
+    }
     try:
-        atomic_write_json(STREAMERS_FILE, frontier)
+        atomic_write_json(STREAMERS_FILE, cleaned)
     except OSError as error:
         log.warning("Не удалось сохранить %s: %s", STREAMERS_FILE.name, error)
+
+
+def load_retired_series() -> dict[str, int]:
+    """Читает серии слагов, отправленные в отставку после пустых проходов."""
+    raw = read_json(RETIRED_STREAMERS_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    retired: dict[str, int] = {}
+    for prefix, index in raw.items():
+        if (
+            isinstance(prefix, str)
+            and PREDICTIVE_PREFIX_RE.match(prefix)
+            and isinstance(index, int)
+            and not isinstance(index, bool)
+        ):
+            retired[prefix] = index
+    return retired
+
+
+def save_retired_series(retired: dict[str, int]) -> None:
+    """Атомарно сохраняет серии, отправленные в отставку."""
+    cleaned = {
+        prefix: int(index)
+        for prefix, index in retired.items()
+        if isinstance(prefix, str)
+        and PREDICTIVE_PREFIX_RE.match(prefix)
+        and isinstance(index, int)
+        and not isinstance(index, bool)
+    }
+    try:
+        atomic_write_json(RETIRED_STREAMERS_FILE, cleaned)
+    except OSError as error:
+        log.warning("Не удалось сохранить %s: %s", RETIRED_STREAMERS_FILE.name, error)
 
 
 # ----------------------------------------------------------------------------

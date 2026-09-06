@@ -297,5 +297,54 @@ class BotOffsetTests(TempDirTestCase):
             self.assertEqual(storage.load_bot_offset(), 0)
 
 
+class StreamerFrontierTests(TempDirTestCase):
+    def test_frontier_round_trip_with_empty_scans(self):
+        path = self.tmp / "streamers.json"
+        with patch.object(storage, "STREAMERS_FILE", path):
+            self.assertEqual(storage.load_streamer_frontier(), {})
+            data = {
+                "valid_series": {"index": 10, "width": 2, "pending": [11], "empty_scans": 3},
+            }
+            storage.save_streamer_frontier(data)
+            loaded = storage.load_streamer_frontier()
+            self.assertEqual(loaded["valid_series"]["index"], 10)
+            self.assertEqual(loaded["valid_series"]["width"], 2)
+            self.assertEqual(loaded["valid_series"]["pending"], [11])
+            self.assertEqual(loaded["valid_series"]["empty_scans"], 3)
+
+    def test_invalid_prefix_regex_filtered_on_load_and_save(self):
+        path = self.tmp / "streamers.json"
+        with patch.object(storage, "STREAMERS_FILE", path):
+            data = {
+                "valid_name": {"index": 5, "width": 1, "pending": []},
+                "bad!name": {"index": 5, "width": 1, "pending": []},
+                "a": {"index": 5, "width": 1, "pending": []},
+                "toolongprefixwithmorethanthirtytwocharactersinit": {
+                    "index": 5, "width": 1, "pending": [],
+                },
+            }
+            storage.save_streamer_frontier(data)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn("valid_name", raw)
+            self.assertNotIn("bad!name", raw)
+            self.assertNotIn("a", raw)
+            self.assertNotIn("toolongprefixwithmorethanthirtytwocharactersinit", raw)
+
+            loaded = storage.load_streamer_frontier()
+            self.assertIn("valid_name", loaded)
+            self.assertNotIn("bad!name", loaded)
+
+
+class RetiredSeriesTests(TempDirTestCase):
+    def test_retired_series_round_trip(self):
+        path = self.tmp / "retired_streamers.json"
+        with patch.object(storage, "RETIRED_STREAMERS_FILE", path):
+            self.assertEqual(storage.load_retired_series(), {})
+            data = {"dead_streamer": 15, "invalid!name": 20, "valid_2": 8}
+            storage.save_retired_series(data)
+            loaded = storage.load_retired_series()
+            self.assertEqual(loaded, {"dead_streamer": 15, "valid_2": 8})
+
+
 if __name__ == "__main__":
     unittest.main()

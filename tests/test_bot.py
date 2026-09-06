@@ -1,3 +1,4 @@
+import threading
 import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -544,6 +545,37 @@ class CallbackQueryLoopTests(unittest.TestCase):
         save_offset.assert_called_once_with(11)
 
 
+class AuthorizedSenderTests(unittest.TestCase):
+    """Кто имеет право слать команды и жать кнопки бота."""
+
+    def test_wrong_chat_is_rejected(self):
+        with patch.object(bot, "TELEGRAM_CHAT_ID", "42"), \
+             patch.object(bot, "TELEGRAM_ADMIN_ID", ""):
+            self.assertFalse(bot.is_authorized_sender("999", "42"))
+
+    def test_private_chat_matches_sender(self):
+        with patch.object(bot, "TELEGRAM_CHAT_ID", "42"), \
+             patch.object(bot, "TELEGRAM_ADMIN_ID", ""):
+            self.assertTrue(bot.is_authorized_sender("42", "42"))
+            self.assertFalse(bot.is_authorized_sender("42", "7"))
+
+    def test_group_chat_without_admin_id_accepts_any_member(self):
+        with patch.object(bot, "TELEGRAM_CHAT_ID", "-100500"), \
+             patch.object(bot, "TELEGRAM_ADMIN_ID", ""):
+            self.assertTrue(bot.is_authorized_sender("-100500", "7"))
+
+    def test_admin_id_requires_exact_sender_match(self):
+        with patch.object(bot, "TELEGRAM_CHAT_ID", "-100500"), \
+             patch.object(bot, "TELEGRAM_ADMIN_ID", "7"):
+            self.assertTrue(bot.is_authorized_sender("-100500", "7"))
+            self.assertFalse(bot.is_authorized_sender("-100500", "8"))
+
+    def test_admin_id_rejects_anonymous_sender(self):
+        with patch.object(bot, "TELEGRAM_CHAT_ID", "-100500"), \
+             patch.object(bot, "TELEGRAM_ADMIN_ID", "7"):
+            self.assertFalse(bot.is_authorized_sender("-100500", None))
+
+
 class ListCommandKeyboardTests(unittest.TestCase):
     def test_channels_command_attaches_removal_keyboard(self):
         from wheelsparser import menu
@@ -565,6 +597,157 @@ class ListCommandKeyboardTests(unittest.TestCase):
              patch.object(bot, "bot_send") as send:
             bot.handle_command("1", "/words")
             self.assertEqual(send.call_args.kwargs["reply_markup"], menu.words_list_keyboard())
+
+
+class RegistryLocksReleasedBeforeNetworkTests(unittest.TestCase):
+    """Сетевые вызовы bot_send не должны выполняться под локами реестра."""
+
+    def test_cmd_addword_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.KEYWORDS_LOCK._is_owned())
+
+        with patch.object(registry, "KEYWORDS", ["существующее"]), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_addword("1", "существующее")
+            send.assert_called_once()
+
+    def test_cmd_removeword_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.KEYWORDS_LOCK._is_owned())
+
+        with patch.object(registry, "KEYWORDS", ["существующее"]), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_removeword("1", "отсутствующее")
+            send.assert_called_once()
+
+    def test_cmd_addtwitch_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.TWITCH_CHANNELS_LOCK._is_owned())
+
+        with patch.object(registry, "TWITCH_CHANNELS", ["streamer"]), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_addtwitch("1", "streamer")
+            send.assert_called_once()
+
+    def test_cmd_removetwitch_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.TWITCH_CHANNELS_LOCK._is_owned())
+
+        with patch.object(registry, "TWITCH_CHANNELS", ["streamer"]), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_removetwitch("1", "other")
+            send.assert_called_once()
+
+    def test_cmd_add_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.CHANNELS_LOCK._is_owned())
+
+        with patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(bot, "check_channel_preview", return_value="ok"), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_add("1", "@demo")
+            send.assert_called_once()
+
+    def test_cmd_remove_releases_lock_before_send(self):
+        def check_lock(*args, **kwargs):
+            self.assertFalse(registry.CHANNELS_LOCK._is_owned())
+
+        with patch.object(registry, "CHANNELS", ["demo"]), \
+             patch.object(bot, "bot_send", side_effect=check_lock) as send:
+            bot.cmd_remove("1", "@notfound")
+            send.assert_called_once()
+
+
+def _join_active_api() -> None:
+    for thread in threading.enumerate():
+        if thread.name == "active-api":
+            thread.join(timeout=2.0)
+
+
+class ActiveReportLockTests(unittest.TestCase):
+    def test_active_check_lock_held_until_after_send(self):
+        lock_held_during_send = False
+
+        def fake_send(chat_id, text, reply_markup=None):
+            nonlocal lock_held_during_send
+            # Пытаемся захватить лок без ожидания — если он занят фоновым
+            # потоком, acquire вернёт False.
+            acquired = active_report._active_check_lock.acquire(blocking=False)
+            lock_held_during_send = not acquired
+            if acquired:
+                active_report._active_check_lock.release()
+
+        with patch.object(active_report, "request_rescan", return_value=True), \
+             patch.object(active_report, "classify_wheels", return_value=([], [], 0)), \
+             patch.object(active_report, "background_bot_send", side_effect=fake_send):
+            active_report.fire_active_check(
+                "1", lambda: [{"url": "https://betboom.ru/freestream/1"}]
+            )
+            _join_active_api()
+
+        self.assertTrue(lock_held_during_send)
+        # После завершения лок свободен
+        self.assertTrue(active_report._active_check_lock.acquire(blocking=False))
+        active_report._active_check_lock.release()
+
+
+class ActiveReportRescanTests(unittest.TestCase):
+    """/active сначала гоняет внеплановый обход каналов, потом читает базу."""
+
+    def test_rescan_runs_before_items_are_loaded(self):
+        order: list[str] = []
+
+        def fake_load():
+            order.append("load")
+            return [{"url": "https://betboom.ru/freestream/1", "channel": "c"}]
+
+        with patch.object(
+            active_report, "request_rescan", side_effect=lambda _t: order.append("rescan")
+        ), \
+             patch.object(
+                 active_report, "classify_wheels",
+                 return_value=([{"url": "https://betboom.ru/freestream/1", "channel": "c"}], [], 0),
+             ), \
+             patch.object(active_report, "background_bot_send") as send:
+            active_report.fire_active_check("1", fake_load)
+            _join_active_api()
+
+        self.assertEqual(order, ["rescan", "load"])
+        send.assert_called_once()
+
+    def test_reports_no_wheels_when_base_empty_after_rescan(self):
+        with patch.object(active_report, "request_rescan", return_value=True), \
+             patch.object(active_report, "classify_wheels") as classify, \
+             patch.object(active_report, "background_bot_send") as send:
+            active_report.fire_active_check("1", list)
+            _join_active_api()
+
+        classify.assert_not_called()
+        self.assertIn("не найдено", send.call_args.args[1])
+
+    def test_still_reports_when_rescan_times_out(self):
+        with patch.object(active_report, "request_rescan", return_value=False), \
+             patch.object(
+                 active_report, "classify_wheels",
+                 return_value=([{"url": "https://betboom.ru/freestream/1", "channel": "c"}], [], 0),
+             ), \
+             patch.object(active_report, "background_bot_send") as send:
+            active_report.fire_active_check(
+                "1", lambda: [{"url": "https://betboom.ru/freestream/1", "channel": "c"}]
+            )
+            _join_active_api()
+
+        send.assert_called_once()
+
+
+class CmdActiveRescanTests(unittest.TestCase):
+    def test_cmd_active_announces_refresh_and_hands_loader(self):
+        with patch.object(bot, "fire_active_check") as fire, \
+             patch.object(bot, "bot_send") as send:
+            bot.cmd_active("1", "")
+
+        fire.assert_called_once_with("1", bot.wheels_for_active)
+        self.assertIn("Обновляю", send.call_args.args[1])
 
 
 if __name__ == "__main__":

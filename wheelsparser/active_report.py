@@ -1,22 +1,33 @@
-"""Команда /active: проверка колёс через API и форматирование ответа.
+"""Команда /active: внеплановый обход каналов, проверка колёс через API и
+форматирование ответа.
 
-Проверка идёт в фоновом потоке — поток бота не блокируется, результат
-приходит отдельным сообщением. Одновременно выполняется не больше одной
-проверки.
+Всё делается в фоновом потоке — поток бота не блокируется, результат
+приходит отдельным сообщением. Порядок: сначала request_rescan будит
+поток parser на внеочередной обход всех каналов, затем свежая база
+читается через load_items и проверяется в API BetBoom. Одновременно
+выполняется не больше одной такой проверки.
 """
 
 from __future__ import annotations
 
 import html
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from .betboom import classify_wheels
-from .config import icon
+from .config import ACTIVE_MAX_AGE_HOURS, icon
+from .db import WheelEntry
 from .logging_setup import log
+from .runtime import request_rescan
 from .telegram_api import background_bot_send, bot_send
 from .timeutils import format_deadline, format_found_time
 from .urls import normalize_url
+
+# Сколько ждать внеплановый обход каналов, прежде чем строить отчёт по тому,
+# что уже есть в базе. Обход — это один цикл парсера; если он не уложился,
+# отчёт всё равно уходит (с пометкой в parser.log), а не висит бесконечно.
+RESCAN_WAIT_TIMEOUT = 180.0
 
 # Один /active за раз (non-blocking acquire).
 _active_check_lock = threading.Lock()
@@ -31,7 +42,9 @@ _last_active_lock = threading.Lock()
 _last_active_numbers: dict[int, str] = {}
 
 
-def remember_active_numbers(numbered: list[tuple[int, dict[str, Any]]]) -> None:
+def remember_active_numbers(
+    numbered: list[tuple[int, WheelEntry]] | list[tuple[int, dict[str, Any]]],
+) -> None:
     with _last_active_lock:
         _last_active_numbers.clear()
         for number, item in numbered:
@@ -146,11 +159,23 @@ def format_active_result(
     return ("\n".join(lines), _removal_keyboard(numbered))
 
 
-def fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
-    """Fire-and-forget: запускает API-проверку в daemon-потоке, немедленно возвращается.
+def _no_wheels_text() -> str:
+    return (
+        f"За последние {ACTIVE_MAX_AGE_HOURS} часов колёс не найдено. "
+        "Как только появится ссылка — пришлю её сразу."
+    )
 
-    Поток бота не блокируется. Результат придёт отдельным сообщением через
-    background_bot_send после завершения проверки в фоновом потоке.
+
+def fire_active_check(
+    chat_id: str,
+    load_items: Callable[[], list[WheelEntry]] | Callable[[], list[dict[str, Any]]],
+) -> None:
+    """Fire-and-forget: обход каналов + API-проверка в daemon-потоке.
+
+    Поток бота не блокируется. В фоне: request_rescan просит поток parser
+    сделать внеплановый обход всех каналов, затем load_items читает свежую
+    базу, и колёса проверяются через API BetBoom. Результат придёт
+    отдельным сообщением через background_bot_send.
     Если проверка уже идёт — бот сообщает об этом и возвращается.
     """
     if not _active_check_lock.acquire(blocking=False):
@@ -161,20 +186,34 @@ def fire_active_check(chat_id: str, unique_items: list[dict[str, Any]]) -> None:
         )
         return
 
-    total = len(unique_items)
-
     def _run_and_send() -> None:
-        active_items: list[dict[str, Any]] | None = None
-        unknown_count = 0
         try:
-            # soon-колёса (ещё не начались) в /active не показываются.
-            active_items, _soon_items, unknown_count = classify_wheels(unique_items)
-        except Exception as error:
-            log.error("active-check: проверка колёс не удалась: %s", error)
+            if not request_rescan(RESCAN_WAIT_TIMEOUT):
+                log.warning(
+                    "active-check: внеплановый обход каналов не завершился за %.0f с "
+                    "— отчёт по текущей базе, может быть неполным",
+                    RESCAN_WAIT_TIMEOUT,
+                )
+
+            unique_items = load_items()
+            total = len(unique_items)
+            if not unique_items:
+                background_bot_send(
+                    chat_id, _no_wheels_text(), reply_markup=_menu_only_keyboard()
+                )
+                return
+
+            active_items: list[dict[str, Any]] | None = None
+            unknown_count = 0
+            try:
+                # soon-колёса (ещё не начались) в /active не показываются.
+                active_items, _soon_items, unknown_count = classify_wheels(unique_items)
+            except Exception as error:
+                log.error("active-check: проверка колёс не удалась: %s", error)
+
+            text, keyboard = format_active_result(active_items, total, unknown_count)
+            background_bot_send(chat_id, text, reply_markup=keyboard)
         finally:
             _active_check_lock.release()
-
-        text, keyboard = format_active_result(active_items, total, unknown_count)
-        background_bot_send(chat_id, text, reply_markup=keyboard)
 
     threading.Thread(target=_run_and_send, daemon=True, name="active-api").start()

@@ -19,6 +19,7 @@ from .config import (
     TWITCH_ROLE_ICONS,
     icon,
 )
+from .db import WheelEntry
 from .logging_setup import log
 from .net import ACTIVE_CHECK_SESSION, BOT_SESSION, PARSER_SESSION
 from .timeutils import format_deadline, format_found_at
@@ -69,7 +70,10 @@ def delivery_unknown(error: requests.RequestException) -> bool:
     )
 
 
-def _mark_delivery(entries: list[dict[str, Any]], error: requests.RequestException) -> None:
+def _mark_delivery(
+    entries: list[Any],
+    error: requests.RequestException,
+) -> None:
     if not delivery_unknown(error):
         return
     for entry in entries:
@@ -104,7 +108,7 @@ def _post_message(
 
 
 def send_telegram_notification(
-    entry: dict[str, Any], session: requests.Session | None = None
+    entry: WheelEntry | dict[str, Any], session: requests.Session | None = None
 ) -> bool:
     """Уведомление об одной новой ссылке."""
     if not notifications_enabled():
@@ -119,30 +123,34 @@ def send_telegram_notification(
     referral_line = (
         f"{icon('warn')} Колесо для рефералов\n" if entry.get("referral") else ""
     )
+    channel = entry.get("channel", "")
+    message_url = entry.get("message_url", "")
+    url = entry.get("url", "")
+    found_at = entry.get("found_at", "")
     if entry.get("source") == "twitch":
         badge_icons = "".join(
             TWITCH_ROLE_ICONS.get(role, "")
             for role in entry.get("author_roles", [])
         )
         origin_line = (
-            f"Канал: twitch.tv/{entry['channel']} "
+            f"Канал: twitch.tv/{channel} "
             f"(сообщение от {badge_icons}@{entry.get('author', '?')})\n"
         )
-        post_line = f"Чат: {entry['message_url']}"
+        post_line = f"Чат: {message_url}"
     elif entry.get("source") == "predictive":
         # У находки сканера нет ни канала, ни поста: адрес угадан по серии
         # (см. predictive.py). Показывать «Канал: @zonertg / Пост: <url>»
         # было бы враньём — такого канала и поста не существует.
-        origin_line = f"{icon('scan')} Найдено перебором серии «{entry['channel']}»\n"
-        post_line = f"Страница: {entry['message_url']}"
+        origin_line = f"{icon('scan')} Найдено перебором серии «{channel}»\n"
+        post_line = f"Страница: {message_url}"
     else:
-        origin_line = f"Канал: @{entry['channel']}\n"
-        post_line = f"Пост: {entry['message_url']}"
+        origin_line = f"Канал: @{channel}\n"
+        post_line = f"Пост: {message_url}"
     text = (
         f"{icon('start')} Новая ссылка WheelsParser{source_note}\n"
         f"{origin_line}"
-        f"Найдено: {format_found_at(entry['found_at'])}\n"
-        f"Ссылка: {entry['url']}\n"
+        f"Найдено: {format_found_at(found_at)}\n"
+        f"Ссылка: {url}\n"
         f"{referral_line}"
         f"{status_line}"
         f"{deadline_line}"
@@ -158,7 +166,8 @@ def send_telegram_notification(
 
 
 def send_multi_telegram_notification(
-    entries: list[dict[str, Any]], session: requests.Session | None = None
+    entries: list[WheelEntry] | list[dict[str, Any]],
+    session: requests.Session | None = None,
 ) -> bool:
     """Одно уведомление о нескольких новых ссылках из ОДНОГО поста.
 
@@ -172,10 +181,13 @@ def send_multi_telegram_notification(
         return False
     first = entries[0]
     source_note = " (пост отредактирован)" if first.get("edited") else ""
+    first_channel = first.get("channel", "")
+    first_found_at = first.get("found_at", "")
+    first_msg_url = first.get("message_url", "")
     lines = [
         f"{icon('start')} Новая ссылка WheelsParser{source_note}",
-        f"Канал: @{first['channel']}",
-        f"Найдено: {format_found_at(first['found_at'])}",
+        f"Канал: @{first_channel}",
+        f"Найдено: {format_found_at(first_found_at)}",
         f"{icon('warn')} В посте несколько ссылок — уточните вручную, какая актуальна:",
     ]
     for entry in entries:
@@ -186,8 +198,8 @@ def send_multi_telegram_notification(
         if deadline:
             note = f"{note}, до {deadline}" if note else f"до {deadline}"
         suffix = f" ({note})" if note else ""
-        lines.append(f"{entry['url']}{suffix}")
-    lines.append(f"Пост: {first['message_url']}")
+        lines.append(f"{entry.get('url', '')}{suffix}")
+    lines.append(f"Пост: {first_msg_url}")
     try:
         _post_message(
             session or PARSER_SESSION, TELEGRAM_CHAT_ID, "\n".join(lines)
@@ -201,7 +213,7 @@ def send_multi_telegram_notification(
         return False
 
 
-def send_keyword_notification(entry: dict[str, Any]) -> bool:
+def send_keyword_notification(entry: WheelEntry | dict[str, Any]) -> bool:
     """Уведомление о посте с ключевыми словами (вызывается из parser-потока).
 
     Возвращает признак доставки: пост обрабатывается по хэшу один раз,
@@ -214,12 +226,16 @@ def send_keyword_notification(entry: dict[str, Any]) -> bool:
     preview_html = str(entry.get("preview_html") or "").strip()
     if not preview_html:
         preview_html = html.escape(plain_preview)
+    keywords = entry.get("keywords") or []
+    channel = entry.get("channel", "")
+    found_at = entry.get("found_at", "")
+    message_url = entry.get("message_url", "")
     header = (
-        f"{icon('bell')} Ключевые слова: {', '.join(entry['keywords'])}\n"
-        f"Канал: @{entry['channel']}\n"
-        f"Найдено: {format_found_at(entry['found_at'])}\n"
+        f"{icon('bell')} Ключевые слова: {', '.join(keywords)}\n"
+        f"Канал: @{channel}\n"
+        f"Найдено: {format_found_at(found_at)}\n"
     )
-    footer = f"\nПост: {entry['message_url']}"
+    footer = f"\nПост: {message_url}"
     html_text = f"{html.escape(header)}Текст: {preview_html}{html.escape(footer)}"
     try:
         response = _post_message(

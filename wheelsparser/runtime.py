@@ -18,6 +18,61 @@ from .logging_setup import log
 # (parser, bot, twitch) проверяют флаг и завершаются сами.
 STOP_EVENT = threading.Event()
 
+# --- Внеплановый обход каналов по запросу бота (/active) --------------------
+# Поток parser в норме спит CHECK_INTERVAL между циклами. Команда /active
+# будит его досрочно, ждёт завершения цикла и только потом строит отчёт по
+# свежей базе. Три события вместо Condition: Event.wait не умеет ждать
+# несколько событий сразу, поэтому и остановка, и запрос /active дёргают
+# общий _WAKE_PARSER, а своё состояние держат в отдельных флагах.
+_WAKE_PARSER = threading.Event()
+_RESCAN_REQUESTED = threading.Event()
+_RESCAN_DONE = threading.Event()
+_RESCAN_DONE.set()
+
+
+def request_rescan(timeout: float) -> bool:
+    """Запросить внеплановый обход каналов и дождаться его конца.
+
+    Вызывается из фонового потока /active. Возвращает True, если поток
+    parser принял запрос и прогнал внеплановый цикл за timeout секунд;
+    False — обход не завершился вовремя или процесс останавливается.
+    Запрос при этом не теряется: ближайший штатный цикл его подхватит.
+    """
+    if STOP_EVENT.is_set():
+        return False
+    _RESCAN_DONE.clear()
+    _RESCAN_REQUESTED.set()
+    _WAKE_PARSER.set()
+    _RESCAN_DONE.wait(timeout)
+    # Обход выполнен, только если поток parser принял запрос
+    # (take_rescan_request снял _RESCAN_REQUESTED) и дошёл до mark_rescan_done.
+    # На остановке request_stop дёргает _RESCAN_DONE, чтобы не держать этот
+    # поток до таймаута, но запрос остаётся непринятым — честный False.
+    return not _RESCAN_REQUESTED.is_set() and _RESCAN_DONE.is_set()
+
+
+def wait_before_next_cycle(timeout: float) -> None:
+    """Пауза потока parser между циклами.
+
+    Прерывается досрочно остановкой процесса или запросом /active — как
+    STOP_EVENT.wait, но ещё и на внеплановый обход.
+    """
+    _WAKE_PARSER.wait(timeout)
+    _WAKE_PARSER.clear()
+
+
+def take_rescan_request() -> bool:
+    """True, если /active просил внеплановый обход; сбрасывает запрос."""
+    if _RESCAN_REQUESTED.is_set():
+        _RESCAN_REQUESTED.clear()
+        return True
+    return False
+
+
+def mark_rescan_done() -> None:
+    """Сообщить ожидающему /active, что внеплановый обход завершён."""
+    _RESCAN_DONE.set()
+
 
 def request_stop(_signum: int, _frame: Any) -> None:
     if STOP_EVENT.is_set():
@@ -26,6 +81,8 @@ def request_stop(_signum: int, _frame: Any) -> None:
         log.warning("%s Повторный Ctrl+C — принудительный выход", icon("stop"))
         os._exit(1)
     STOP_EVENT.set()
+    _WAKE_PARSER.set()  # разбудить поток parser из паузы между циклами
+    _RESCAN_DONE.set()  # не держать фоновый поток /active на request_rescan
     log.info(
         "Получен сигнал остановки; завершаю текущий цикл "
         "(ещё раз Ctrl+C — немедленный выход)"
@@ -44,12 +101,18 @@ def install_signal_handlers() -> None:
 # («бот молчит, парсер жив»). supervise() оборачивает тело потока и
 # перезапускает его после сбоя с экспоненциальной паузой.
 
-# Поток, отработавший дольше этого времени, считается «здоровым»: пауза
-# перезапуска сбрасывается на начальную, и о следующем сбое снова уведомляем.
-# Иначе редкие сбои раз в сутки копили бы backoff до максимума.
+# Поток, отработавший дольше этого времени, считается «оправившимся»: пауза
+# перезапуска сбрасывается на начальную. Иначе редкие сбои раз в сутки
+# копили бы backoff до максимума.
 HEALTHY_RUN_SECONDS = 60.0
 RESTART_BACKOFF_SECONDS = 5.0
 RESTART_BACKOFF_MAX_SECONDS = 300.0
+
+# Повторно уведомлять о падении разрешаем только после заметно более долгого
+# чистого прогона, чем нужен для сброса backoff. Иначе поток, стабильно
+# живущий чуть дольше HEALTHY_RUN_SECONDS и снова падающий, шлёт сервисное
+# уведомление на каждый цикл — тот самый «поток сообщений в Telegram».
+HEALTHY_RENOTIFY_SECONDS = RESTART_BACKOFF_MAX_SECONDS
 
 
 def supervise(
@@ -79,9 +142,13 @@ def supervise(
             except Exception as error:
                 if STOP_EVENT.is_set():
                     return
-                if time.monotonic() - started >= HEALTHY_RUN_SECONDS:
-                    # Сбой после долгой нормальной работы — считаем разовым.
+                healthy_for = time.monotonic() - started
+                if healthy_for >= HEALTHY_RUN_SECONDS:
+                    # Сбой после нормальной работы — пауза перезапуска с нуля.
                     backoff = RESTART_BACKOFF_SECONDS
+                if healthy_for >= HEALTHY_RENOTIFY_SECONDS:
+                    # Достаточно долгий чистый прогон — новую серию сбоев
+                    # снова считаем достойной сервисного уведомления.
                     notified = False
                 log.exception(
                     "%s Поток «%s» аварийно завершился — перезапуск через %.0f с",

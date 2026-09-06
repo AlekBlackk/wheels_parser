@@ -90,8 +90,28 @@ class FrontierFromHistoryTests(unittest.TestCase):
 
         self.assertEqual(predictive.frontier_from_history(), {})
 
+    def test_validates_prefix_regex(self):
+        # 1-буквенный префикс или недопустимые символы отбрасываются
+        self._store(
+            "a1",
+            "bad!slug2",
+            "ok_prefix-12",
+            "verylongprefixthatexceedsthirtytwocharacters1",
+        )
+
+        frontier = predictive.frontier_from_history()
+
+        self.assertIn("ok_prefix-", frontier)
+        self.assertNotIn("a", frontier)
+        self.assertNotIn("bad!slug", frontier)
+        self.assertNotIn("verylongprefixthatexceedsthirtytwocharacters", frontier)
+
 
 class MergeFrontiersTests(unittest.TestCase):
+    def setUp(self):
+        predictive._RETIRED_SERIES.clear()
+        self.addCleanup(predictive._RETIRED_SERIES.clear)
+
     def test_takes_the_larger_index(self):
         stored = {"zonertg": {"index": 9, "width": 1, "pending": []}}
         history = {"zonertg": {"index": 7, "width": 1, "pending": []}}
@@ -114,6 +134,22 @@ class MergeFrontiersTests(unittest.TestCase):
             {"b": {"index": 2, "width": 1, "pending": []}},
         )
         self.assertEqual(sorted(merged), ["a", "b"])
+
+    def test_retired_series_is_ignored_if_history_not_advanced(self):
+        predictive._RETIRED_SERIES["zonertg"] = 10
+        stored = {}
+        history = {"zonertg": {"index": 10, "width": 1, "pending": []}}
+        merged = predictive.merge_frontiers(stored, history)
+        self.assertNotIn("zonertg", merged)
+
+    def test_retired_series_is_reinstated_if_history_advances(self):
+        predictive._RETIRED_SERIES["zonertg"] = 10
+        stored = {}
+        history = {"zonertg": {"index": 11, "width": 1, "pending": []}}
+        merged = predictive.merge_frontiers(stored, history)
+        self.assertIn("zonertg", merged)
+        self.assertEqual(merged["zonertg"]["index"], 11)
+        self.assertNotIn("zonertg", predictive._RETIRED_SERIES)
 
 
 class BudgetTests(unittest.TestCase):
@@ -151,6 +187,25 @@ class ProbeSlugTests(unittest.TestCase):
                 outcome, *_ = predictive.probe_slug("zonertg9", session)
             self.assertEqual(outcome, predictive.BLOCKED)
             precheck.assert_not_called()
+
+    def test_request_exception_with_429_response_reports_blocked(self):
+        # Если requests бросает RequestException с прикреплённым 429/403,
+        # сканер всё равно обязан определить BLOCKED.
+        for code in (403, 429):
+            session = Mock()
+            err = predictive.requests.RequestException("rate limited")
+            err.response = page(code)
+            session.get.side_effect = err
+            outcome, *_ = predictive.probe_slug("zonertg9", session)
+            self.assertEqual(outcome, predictive.BLOCKED)
+
+    def test_predictive_session_excludes_429_from_retries(self):
+        # 429 не должен ретраиться urllib3, иначе сканер долбит сервер
+        # 5 запросами на слаг и падает в RetryError вместо BLOCKED.
+        predictive.PREDICTIVE_SESSION = None
+        session = predictive._session()
+        adapter = session.adapters["https://"]
+        self.assertNotIn(429, adapter.max_retries.status_forcelist)
 
     def test_network_error_reports_error(self):
         session = Mock()
@@ -231,6 +286,17 @@ class NotifyFoundWheelTests(unittest.TestCase):
 
         (entry,) = self.queued()
         self.assertFalse(entry["notified"])
+
+    def test_cooldown_claimed_by_scanner_blocks_subsequent_claims(self):
+        with patch.object(
+            predictive, "send_telegram_notification", return_value=True
+        ) as send:
+            predictive.notify_found_wheel("zonertg", "zonertg10", "active", False, "")
+
+        send.assert_called_once()
+        with patch.object(predictive, "send_telegram_notification") as send2:
+            predictive.notify_found_wheel("zonertg", "zonertg10", "active", False, "")
+        send2.assert_not_called()
 
 
 class ScanSeriesTests(unittest.TestCase):
@@ -417,13 +483,40 @@ class ScanSeriesTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(probe.call_count, 1)
 
+    def test_increments_empty_scans_on_unfruitful_scan(self):
+        with patch.object(
+            predictive, "probe_slug",
+            return_value=(predictive.MISSING, "", False, ""),
+        ):
+            updated, _ = predictive.scan_series(
+                "zonertg", self._series(), predictive.Budget(10), self.session
+            )
+        self.assertEqual(updated.get("empty_scans"), 1)
+
+    def test_resets_empty_scans_when_wheel_found(self):
+        outcomes = [
+            (predictive.FOUND, "active", False, "срок"),
+            (predictive.MISSING, "", False, ""),
+        ]
+        with patch.object(predictive, "probe_slug", side_effect=outcomes):
+            updated, _ = predictive.scan_series(
+                "zonertg", {"index": 7, "width": 1, "pending": [], "empty_scans": 3},
+                predictive.Budget(10), self.session
+            )
+        self.assertNotIn("empty_scans", updated)
+
 
 class ScanOnceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="wheelsparser-predictive-"))
         self._start(patch.object(storage, "STREAMERS_FILE", self.tmp / "streamers.json"))
+        self._start(
+            patch.object(storage, "RETIRED_STREAMERS_FILE", self.tmp / "retired_streamers.json")
+        )
         self._start(patch.object(predictive, "_pause_between_requests"))
         self._start(patch.object(predictive, "notify_found_wheel"))
+        predictive._RETIRED_SERIES.clear()
+        self.addCleanup(predictive._RETIRED_SERIES.clear)
         self.session = Mock()
 
     def _start(self, patcher):
@@ -458,6 +551,60 @@ class ScanOnceTests(unittest.TestCase):
                  return_value=(predictive.BLOCKED, "", False, ""),
              ):
             self.assertFalse(predictive.scan_once(predictive.Budget(10), self.session))
+
+    def test_series_exceeding_max_empty_scans_is_retired(self):
+        history = {
+            "deadseries": {
+                "index": 5,
+                "width": 1,
+                "pending": [],
+                "empty_scans": predictive.PREDICTIVE_MAX_EMPTY_SCANS - 1,
+            }
+        }
+        with patch.object(predictive, "frontier_from_history", return_value=history), \
+             patch.object(
+                 predictive, "probe_slug",
+                 return_value=(predictive.MISSING, "", False, ""),
+             ):
+            predictive.scan_once(predictive.Budget(10), self.session)
+
+        frontier = storage.load_streamer_frontier()
+        self.assertNotIn("deadseries", frontier)
+        self.assertEqual(predictive._RETIRED_SERIES.get("deadseries"), 5)
+        # Сохранилось на диск в retired_streamers.json
+        self.assertEqual(storage.load_retired_series().get("deadseries"), 5)
+
+    def test_empty_scans_accumulates_across_multiple_scans(self):
+        history = {"zonertg": {"index": 7, "width": 1, "pending": []}}
+        missing_probe = (predictive.MISSING, "", False, "")
+        found_probe = (predictive.FOUND, "expired", False, "")
+        with patch.object(predictive, "frontier_from_history", return_value=history), \
+             patch.object(predictive, "probe_slug", return_value=missing_probe):
+            # 1-й проход: пустой скан
+            predictive.scan_once(predictive.Budget(10), self.session)
+            f1 = storage.load_streamer_frontier()
+            self.assertEqual(f1["zonertg"]["empty_scans"], 1)
+
+            # 2-й проход: снова пустой скан -> счётчик увеличивается
+            predictive.scan_once(predictive.Budget(10), self.session)
+            f2 = storage.load_streamer_frontier()
+            self.assertEqual(f2["zonertg"]["empty_scans"], 2)
+
+        # 3-й проход: найдено колесо -> счётчик сбрасывается
+        with patch.object(predictive, "frontier_from_history", return_value={}), \
+             patch.object(predictive, "probe_slug", return_value=found_probe):
+            predictive.scan_once(predictive.Budget(10), self.session)
+            f3 = storage.load_streamer_frontier()
+            self.assertNotIn("empty_scans", f3["zonertg"])
+
+    def test_blocked_does_not_increment_empty_scans(self):
+        history = {"zonertg": {"index": 7, "width": 1, "pending": []}}
+        blocked_probe = (predictive.BLOCKED, "", False, "")
+        with patch.object(predictive, "frontier_from_history", return_value=history), \
+             patch.object(predictive, "probe_slug", return_value=blocked_probe):
+            predictive.scan_once(predictive.Budget(10), self.session)
+            frontier = storage.load_streamer_frontier()
+            self.assertNotIn("empty_scans", frontier["zonertg"])
 
 
 class StubGuardIsolationTests(unittest.TestCase):

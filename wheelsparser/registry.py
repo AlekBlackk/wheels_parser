@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from pathlib import Path
 
 from .config import (
     CHANNELS_FILE,
@@ -227,11 +228,18 @@ def twitch_channels_snapshot() -> list[str]:
 # Запись файлов
 # ----------------------------------------------------------------------------
 
+def atomic_write_text(path: Path, content: str) -> None:
+    """Атомарно записывает текст в файл через временный файл + замену."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
 def save_channels_file() -> None:
     with CHANNELS_LOCK:
         lines = ["# Один публичный Telegram-канал на строку. Символ @ необязателен."]
         lines.extend(CHANNELS)
-    CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(CHANNELS_FILE, "\n".join(lines) + "\n")
 
 
 def save_keywords_file() -> None:
@@ -242,11 +250,11 @@ def save_keywords_file() -> None:
             "# *слово* — поиск по подстроке (найдёт и «суперколесо»).",
         ]
         lines.extend(KEYWORDS)
-    KEYWORDS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(KEYWORDS_FILE, "\n".join(lines) + "\n")
 
 
 def save_twitch_channels_file() -> None:
     with TWITCH_CHANNELS_LOCK:
         lines = ["# Один Twitch-канал (логин) на строку, без @ и без #."]
         lines.extend(TWITCH_CHANNELS)
-    TWITCH_CHANNELS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(TWITCH_CHANNELS_FILE, "\n".join(lines) + "\n")

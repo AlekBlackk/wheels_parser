@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import re
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
 
+from .alerts import claim_url_alert, release_url_alert
 from .config import (
     ACTION_SIGNATURE_TTL_SECONDS,
     ACTIVE_CHECK_CONCURRENCY,
@@ -23,12 +25,15 @@ from .config import (
     EXPIRED_CACHE_TTL_SECONDS,
     HEADERS,
     MSK_TZ,
+    PRECHECK_WHEELS,
+    REALERT_COOLDOWN_MINUTES,
     REQUEST_TIMEOUT,
     STREAMER_WHEEL_INFO_API,
     icon,
 )
+from .db import WheelEntry, make_wheel_entry
 from .logging_setup import log
-from .net import PARSER_SESSION, build_session
+from .net import PARSER_SESSION, ThreadLocalSession, build_session
 from .timeutils import now_msk
 from .urls import normalize_url
 
@@ -279,14 +284,6 @@ def fetch_wheel_info(
         return None
 
 
-def check_wheel_status(url: str, session: requests.Session) -> str:
-    """Статус одного колеса: 'active', 'soon', 'expired' или 'unknown'."""
-    info = fetch_wheel_info(url, session)
-    if info is None:
-        return "unknown"
-    return _apply_stub_guard(api_info_to_status(info))
-
-
 def _prune_expired_cache() -> None:
     """Убирает записи старше EXPIRED_CACHE_TTL_SECONDS — иначе кэш растёт бессрочно."""
     cutoff = timedelta(seconds=EXPIRED_CACHE_TTL_SECONDS)
@@ -423,13 +420,94 @@ def precheck_wheel(
     return status, referral, wheel_ends_at(info)
 
 
+def process_candidate_wheel(
+    url: str,
+    channel: str,
+    now: datetime,
+    *,
+    post_text: str = "",
+    session: requests.Session | None = None,
+    last_found: dict[str, datetime] | None = None,
+    source: str = "telegram",
+    author: str = "",
+    author_roles: list[str] | None = None,
+    msg_id: str = "",
+    message_url: str = "",
+    preview: str = "",
+    preview_html: str = "",
+    is_edited: bool = False,
+    source_label: str = "",
+    precheck_fn: Callable[..., tuple[str, bool, str]] | None = None,
+) -> tuple[WheelEntry | None, str, bool]:
+    """Единый конвейер обработки найденной ссылки (кулдаун, precheck, WheelEntry).
+
+    Возвращает (entry, status, retry_needed):
+    - При активном кулдауне: (None, "cooldown", False)
+    - При 'expired' или 'soon': кулдаун сбрасывается, (None, status, True)
+    - При 'active' или 'unknown': (entry, status, False)
+    """
+    label = source_label or (f"@{channel}" if source == "telegram" else f"{source} #{channel}")
+    if not claim_url_alert(url, now, last_found):
+        log.info(
+            "%s Пропускаю %s [%s]: недавно уже оповещали (кулдаун %s мин)",
+            icon("bell"),
+            url,
+            label,
+            REALERT_COOLDOWN_MINUTES,
+        )
+        return None, "cooldown", False
+
+    check_fn = precheck_fn or precheck_wheel
+    if PRECHECK_WHEELS:
+        status, referral, ends_at = check_fn(
+            url, session, post_text=post_text
+        )
+    else:
+        status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
+
+    if status in ("expired", "soon"):
+        release_url_alert(url, now)
+        log.info(
+            "%s Пропускаю %s [%s]: %s (API BetBoom)",
+            icon("warn"),
+            url,
+            label,
+            "колесо уже завершилось" if status == "expired" else "розыгрыш ещё не начался",
+        )
+        return None, status, True
+
+    entry = make_wheel_entry(
+        url=url,
+        channel=channel,
+        found_at=now.isoformat(timespec="seconds"),
+        source=source,
+        author=author,
+        author_roles=author_roles,
+        msg_id=msg_id,
+        message_url=message_url,
+        preview=preview,
+        preview_html=preview_html,
+        edited=is_edited,
+        status=status,
+        referral=referral,
+        ends_at=ends_at,
+        notified=False,
+    )
+    return entry, status, False
+
+
 def classify_wheels(
-    items: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    items: list[WheelEntry] | list[dict[str, Any]],
+    feed_stub_guard: bool = False,
+) -> tuple[list[Any], list[Any], int]:
     """Проверяет список колёс через BetBoom API параллельно.
 
     Использует ThreadPoolExecutor с ACTIVE_CHECK_CONCURRENCY потоками.
     Кэширует expired-статусы на REALERT_COOLDOWN_MINUTES.
+    feed_stub_guard=False (по умолчанию) исключает результат из счётчика
+    заглушки: /active — массовый обход колёс за сутки, где серия expired
+    подряд — нормальное состояние к вечеру, и она не должна ложно
+    срывать стоп-гвард в fail-open для рабочих потоков (parser, twitch).
     Возвращает кортеж (active_items, soon_items, unknown_count):
       - active_items  — колёса со статусом active (в исходном порядке);
       - soon_items    — колёса, розыгрыш которых ещё не начался (soon);
@@ -437,53 +515,47 @@ def classify_wheels(
     """
     _prune_expired_cache()
 
-    # requests.Session не потокобезопасна, поэтому общая сессия на все
-    # рабочие потоки ThreadPoolExecutor недопустима: у каждого потока —
-    # своя сессия через threading.local (создаётся лениво при первом запросе).
-    thread_local = threading.local()
+    with ThreadLocalSession(session_factory=build_session) as worker_session:
+        results: list[tuple[int, str]] = []  # (original_index, status)
+        lock = threading.Lock()
 
-    def worker_session() -> requests.Session:
-        session = getattr(thread_local, "session", None)
-        if session is None:
-            session = build_session()
-            thread_local.session = session
-        return session
-
-    results: list[tuple[int, str]] = []  # (original_index, status)
-    lock = threading.Lock()
-
-    def check(index: int, item: dict[str, Any]) -> None:
-        url = normalize_url(str(item.get("url", "")))
-        if not url:
+        def check(index: int, item: dict[str, Any]) -> None:
+            url = normalize_url(str(item.get("url", "")))
+            if not url:
+                with lock:
+                    results.append((index, "unknown"))
+                return
+            if _is_cached_expired(url):
+                log.info(
+                    "active-check [cache]: %s → expired (кэш %sс)",
+                    url,
+                    EXPIRED_CACHE_TTL_SECONDS,
+                )
+                with lock:
+                    results.append((index, "expired"))
+                return
+            info = fetch_wheel_info(url, worker_session())
+            if info is None:
+                status = "unknown"
+            else:
+                status = api_info_to_status(info)
+                if feed_stub_guard:
+                    status = _apply_stub_guard(status)
+            # Реф-флаг и дедлайн обновляются по свежему info: старые записи
+            # (до появления этих полей) получают их прямо при /active.
+            if not item.get("referral") and is_referral_wheel(url, info):
+                item["referral"] = True
+            ends_at = wheel_ends_at(info)
+            if ends_at:
+                item["ends_at"] = ends_at
+            log.info("active-check [api]: %s → %s", url, status)
+            if status == "expired":
+                _cache_expired(url)
             with lock:
-                results.append((index, "unknown"))
-            return
-        if _is_cached_expired(url):
-            log.info(
-                "active-check [cache]: %s → expired (кэш %sс)",
-                url,
-                EXPIRED_CACHE_TTL_SECONDS,
-            )
-            with lock:
-                results.append((index, "expired"))
-            return
-        info = fetch_wheel_info(url, worker_session())
-        status = "unknown" if info is None else _apply_stub_guard(api_info_to_status(info))
-        # Реф-флаг и дедлайн обновляются по свежему info: старые записи
-        # (до появления этих полей) получают их прямо при /active.
-        if not item.get("referral") and is_referral_wheel(url, info):
-            item["referral"] = True
-        ends_at = wheel_ends_at(info)
-        if ends_at:
-            item["ends_at"] = ends_at
-        log.info("active-check [api]: %s → %s", url, status)
-        if status == "expired":
-            _cache_expired(url)
-        with lock:
-            results.append((index, status))
+                results.append((index, status))
 
-    with ThreadPoolExecutor(max_workers=ACTIVE_CHECK_CONCURRENCY) as pool:
-        list(pool.map(lambda args: check(*args), enumerate(items)))
+        with ThreadPoolExecutor(max_workers=ACTIVE_CHECK_CONCURRENCY) as pool:
+            list(pool.map(lambda args: check(*args), enumerate(items)))
 
     results.sort(key=lambda pair: pair[0])
     active_items = [items[i] for i, status in results if status == "active"]

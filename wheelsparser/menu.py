@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections.abc import Callable
@@ -22,6 +23,11 @@ from . import registry, storage
 from .active_report import lookup_active_number
 from .config import icon
 from .telegram_api import answer_callback_query, edit_message_text
+
+
+def word_hash(word: str) -> str:
+    """Короткий 8-символьный хэш слова для защиты от удаления не того слова при сдвиге индексов."""
+    return hashlib.sha256(word.encode("utf-8")).hexdigest()[:8]
 
 BACK_BUTTON = {"text": "← Назад", "callback_data": "m:root"}
 
@@ -96,7 +102,7 @@ def twitch_section_text() -> str:
 
 def words_list_keyboard() -> dict[str, Any]:
     rows = [
-        [{"text": f"{word} ❌", "callback_data": f"wd:rm:{index}"}]
+        [{"text": f"{word} ❌", "callback_data": f"wd:rm:{index}:{word_hash(word)}"}]
         for index, word in enumerate(registry.keywords_snapshot())
     ]
     rows.append([BACK_BUTTON])
@@ -251,15 +257,19 @@ def handle_callback(chat_id: str, message_id: int, callback_id: str, data: str) 
 # ----------------------------------------------------------------------------
 
 def _cb_remove_channel(chat_id: str, message_id: int, callback_id: str, channel: str) -> None:
+    already_removed = False
     with registry.CHANNELS_LOCK:
         if channel not in registry.CHANNELS:
-            answer_callback_query(callback_id, "Уже удалён")
-            edit_message_text(
-                chat_id, message_id, channels_section_text(), channels_list_keyboard()
-            )
-            return
-        registry.CHANNELS.remove(channel)
-        registry.save_channels_file()
+            already_removed = True
+        else:
+            registry.CHANNELS.remove(channel)
+            registry.save_channels_file()
+    if already_removed:
+        answer_callback_query(callback_id, "Уже удалён")
+        edit_message_text(
+            chat_id, message_id, channels_section_text(), channels_list_keyboard()
+        )
+        return
     remember_deletion("channel", channel)
     answer_callback_query(callback_id, f"@{channel} удалён")
     edit_message_text(
@@ -284,13 +294,17 @@ def _cb_undo_channel(chat_id: str, message_id: int, callback_id: str) -> None:
 
 
 def _cb_remove_twitch(chat_id: str, message_id: int, callback_id: str, channel: str) -> None:
+    already_removed = False
     with registry.TWITCH_CHANNELS_LOCK:
         if channel not in registry.TWITCH_CHANNELS:
-            answer_callback_query(callback_id, "Уже удалён")
-            edit_message_text(chat_id, message_id, twitch_section_text(), twitch_list_keyboard())
-            return
-        registry.TWITCH_CHANNELS.remove(channel)
-        registry.save_twitch_channels_file()
+            already_removed = True
+        else:
+            registry.TWITCH_CHANNELS.remove(channel)
+            registry.save_twitch_channels_file()
+    if already_removed:
+        answer_callback_query(callback_id, "Уже удалён")
+        edit_message_text(chat_id, message_id, twitch_section_text(), twitch_list_keyboard())
+        return
     registry.TWITCH_RELOAD.set()
     remember_deletion("twitch", channel)
     answer_callback_query(callback_id, f"twitch.tv/{channel} удалён")
@@ -323,23 +337,39 @@ _PREFIX_HANDLERS["tw:rm:"] = _cb_remove_twitch
 
 
 # ----------------------------------------------------------------------------
-# Удаление / восстановление ключевых слов (по индексу — слово может быть
-# длиннее, чем позволяет 64-байтный лимит callback_data)
+# Удаление / восстановление ключевых слов (по индексу с хэшем для защиты
+# от сдвига списка — callback_data: wd:rm:{index}:{hash8})
 # ----------------------------------------------------------------------------
 
-def _cb_remove_word(chat_id: str, message_id: int, callback_id: str, raw_index: str) -> None:
+def _cb_remove_word(chat_id: str, message_id: int, callback_id: str, payload: str) -> None:
+    expected_hash: str | None = None
+    if ":" in payload:
+        raw_index, expected_hash = payload.split(":", 1)
+    else:
+        raw_index = payload
+
     try:
         index = int(raw_index)
     except ValueError:
         answer_callback_query(callback_id, "Некорректный номер", show_alert=True)
         return
+
+    list_changed = False
+    word: str | None = None
     with registry.KEYWORDS_LOCK:
         if index < 0 or index >= len(registry.KEYWORDS):
-            answer_callback_query(callback_id, "Список изменился — обновляю", show_alert=True)
-            edit_message_text(chat_id, message_id, words_section_text(), words_list_keyboard())
-            return
-        word = registry.KEYWORDS.pop(index)
-        registry.save_keywords_file()
+            list_changed = True
+        elif expected_hash is not None and word_hash(registry.KEYWORDS[index]) != expected_hash:
+            list_changed = True
+        else:
+            word = registry.KEYWORDS.pop(index)
+            registry.save_keywords_file()
+
+    if list_changed or word is None:
+        answer_callback_query(callback_id, "Список изменился — обновляю", show_alert=True)
+        edit_message_text(chat_id, message_id, words_section_text(), words_list_keyboard())
+        return
+
     remember_deletion("word", word)
     answer_callback_query(callback_id, f"«{word}» удалено")
     edit_message_text(

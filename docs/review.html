@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Ревизия WheelsParser</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Public+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f2f4f8; --surface:#ffffff; --surface-2:#e9ecf2; --surface-3:#eef1f6;
+  --border:#dbe0e8;
+  --ink:#171b26; --ink-muted:#5c6474; --ink-faint:#8891a1;
+  --accent:#33499e; --accent-ink:#ffffff; --accent-tint:#e6eafb; --accent-border:#c3cdf0;
+  --critical:#b23327; --critical-strong:#8a2620; --critical-tint:#fbe7e4; --critical-border:#f0c3bc;
+  --important:#a06712; --important-strong:#7d4f0d; --important-tint:#f7ecd9; --important-border:#ecd3a3;
+  --minor:#3f5f7a; --minor-strong:#2f4a60; --minor-tint:#e6edf2; --minor-border:#c7d5e0;
+  --good:#2c7a4f; --good-strong:#206139; --good-tint:#e1f2e8; --good-border:#b9dcc6;
+  --shadow:0 1px 2px rgba(23,27,38,.05), 0 10px 28px -14px rgba(23,27,38,.16);
+  --focus:#33499e;
+  --serif:"Zilla Slab", Georgia, "Times New Roman", serif;
+  --sans:"Public Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1219; --surface:#161a23; --surface-2:#1d222c; --surface-3:#191d26;
+    --border:#2b3140;
+    --ink:#e8eaf0; --ink-muted:#9aa2b4; --ink-faint:#6b7386;
+    --accent:#8ca0f0; --accent-ink:#12162a; --accent-tint:#1c2540; --accent-border:#37447a;
+    --critical:#e2685c; --critical-strong:#f4a89c; --critical-tint:#34201f; --critical-border:#55322f;
+    --important:#d9a44c; --important-strong:#eec27f; --important-tint:#332815; --important-border:#524121;
+    --minor:#86a7c4; --minor-strong:#aac3da; --minor-tint:#1b2530; --minor-border:#33465a;
+    --good:#63c08c; --good-strong:#93d9b3; --good-tint:#16281f; --good-border:#285139;
+    --shadow:0 1px 0 rgba(0,0,0,.5);
+    --focus:#8ca0f0;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1219; --surface:#161a23; --surface-2:#1d222c; --surface-3:#191d26;
+  --border:#2b3140;
+  --ink:#e8eaf0; --ink-muted:#9aa2b4; --ink-faint:#6b7386;
+  --accent:#8ca0f0; --accent-ink:#12162a; --accent-tint:#1c2540; --accent-border:#37447a;
+  --critical:#e2685c; --critical-strong:#f4a89c; --critical-tint:#34201f; --critical-border:#55322f;
+  --important:#d9a44c; --important-strong:#eec27f; --important-tint:#332815; --important-border:#524121;
+  --minor:#86a7c4; --minor-strong:#aac3da; --minor-tint:#1b2530; --minor-border:#33465a;
+  --good:#63c08c; --good-strong:#93d9b3; --good-tint:#16281f; --good-border:#285139;
+  --shadow:0 1px 0 rgba(0,0,0,.5);
+  --focus:#8ca0f0;
+}
+
+*{box-sizing:border-box;}
+body{background:var(--bg); color:var(--ink); font-family:var(--sans); line-height:1.55;}
+h1,h2,h3{font-family:var(--serif); text-wrap:balance; color:var(--ink); margin:0;}
+a{color:var(--accent);}
+::selection{background:var(--accent-tint); color:var(--ink);}
+:focus-visible{outline:2px solid var(--focus); outline-offset:2px; border-radius:4px;}
+code, .mono{font-family:var(--mono);}
+.tabular{font-variant-numeric:tabular-nums;}
+
+.page{max-width:1180px; margin:0 auto; padding:40px 24px 80px;}
+
+/* ---------- Header ---------- */
+.hero{max-width:760px; margin:0 0 40px;}
+.eyebrow{
+  font-family:var(--mono); font-size:.78rem; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--ink-faint); margin:0 0 10px;
+}
+.hero h1{font-size:clamp(1.9rem, 1.55rem + 1.4vw, 2.6rem); font-weight:700; margin-bottom:12px;}
+.lede{font-size:1.05rem; color:var(--ink-muted); max-width:62ch; margin:0 0 22px;}
+
+.console{display:flex; flex-wrap:wrap; gap:8px;}
+.chip{
+  display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:.8rem;
+  padding:6px 11px; border-radius:7px; border:1px solid var(--border); background:var(--surface);
+  color:var(--ink-muted); white-space:nowrap;
+}
+.chip--good{color:var(--good-strong); background:var(--good-tint); border-color:var(--good-border);}
+.chip--good::before{content:"✓"; font-family:var(--sans); font-weight:700;}
+.chip--neutral{color:var(--ink-muted);}
+
+/* ---------- Layout ---------- */
+.layout{display:grid; grid-template-columns:224px 1fr; gap:36px; align-items:start;}
+@media (max-width:900px){ .layout{grid-template-columns:1fr;} }
+
+.rail{position:sticky; top:24px; display:flex; flex-direction:column; gap:18px;}
+@media (max-width:900px){
+  .rail{position:static; order:-1; flex-direction:row; flex-wrap:wrap; align-items:center;
+        background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px;}
+  .rail-progress{flex:1 1 200px;}
+  .rail ul{flex:2 1 320px;}
+}
+
+.rail-progress-label{display:block; font-size:.72rem; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-faint); margin-top:2px;}
+.rail-progress-num{font-family:var(--mono); font-size:1.5rem; font-weight:600;}
+.rail-progress-bar{height:6px; border-radius:4px; background:var(--surface-2); margin-top:10px; overflow:hidden;}
+.rail-progress-fill{height:100%; width:0%; background:var(--good); transition:width .3s ease;}
+
+.rail ul{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px;}
+.rail li a{
+  display:flex; justify-content:space-between; gap:10px; text-decoration:none; color:var(--ink);
+  font-size:.9rem; font-weight:500; padding:8px 10px; border-radius:7px;
+}
+.rail li a:hover{background:var(--surface-2);}
+.rail li a b{font-family:var(--mono); font-weight:500; color:var(--ink-faint); font-size:.82rem;}
+
+.reset-btn{
+  font-family:var(--sans); font-size:.82rem; color:var(--ink-muted); background:none;
+  border:1px solid var(--border); border-radius:7px; padding:8px 10px; cursor:pointer; text-align:left;
+}
+.reset-btn:hover{background:var(--surface-2); color:var(--ink);}
+
+.content{min-width:0;}
+
+/* ---------- Tier sections ---------- */
+.tier{margin-bottom:52px; scroll-margin-top:20px;}
+.tier-head{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:6px;}
+.tier-head h2{font-size:1.5rem; font-weight:700;}
+.tier-tag{
+  font-family:var(--mono); font-size:.78rem; padding:3px 9px; border-radius:99px; font-weight:600;
+}
+.tier--critical .tier-tag{background:var(--critical-tint); color:var(--critical-strong); border:1px solid var(--critical-border);}
+.tier--important .tier-tag{background:var(--important-tint); color:var(--important-strong); border:1px solid var(--important-border);}
+.tier-note{color:var(--ink-muted); max-width:66ch; margin:6px 0 24px; font-size:.96rem;}
+
+/* ---------- Finding card ---------- */
+.finding{
+  position:relative; background:var(--surface); border:1px solid var(--border);
+  border-radius:10px; padding:18px 20px 20px 26px; margin-bottom:14px; box-shadow:var(--shadow);
+}
+.finding::before{
+  content:""; position:absolute; left:0; top:0; bottom:0; width:4px; border-radius:10px 0 0 10px;
+  background:var(--stripe, var(--ink-faint));
+}
+.finding[data-group="p0"]{--stripe:var(--critical);}
+.finding[data-group="p1"]{--stripe:var(--important);}
+
+.finding-head{display:flex; align-items:flex-start; gap:12px;}
+.finding-check{
+  appearance:none; width:20px; height:20px; margin-top:2px; flex:none;
+  border:2px solid var(--ink-faint); border-radius:6px; cursor:pointer; position:relative;
+  background:var(--surface);
+}
+.finding-check:checked{background:var(--good); border-color:var(--good);}
+.finding-check:checked::after{
+  content:""; position:absolute; left:5px; top:1px; width:5px; height:10px;
+  border:solid var(--good-tint); border-width:0 2px 2px 0; transform:rotate(45deg);
+}
+.finding-num{
+  font-family:var(--mono); font-size:.8rem; color:var(--ink-faint); flex:none; padding-top:3px; min-width:26px;
+}
+.finding-titlewrap{flex:1; min-width:0;}
+.finding h3{font-size:1.08rem; font-weight:600; margin-bottom:6px;}
+.finding.is-done h3{color:var(--ink-faint); text-decoration:line-through; text-decoration-color:var(--ink-faint);}
+.finding.is-done{opacity:.62;}
+.finding.is-done .finding-body{display:none;}
+
+.finding-meta{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:2px;}
+.tag{
+  font-family:var(--mono); font-size:.74rem; padding:2px 8px; border-radius:5px; white-space:nowrap;
+  background:var(--surface-2); color:var(--ink-muted); border:1px solid var(--border);
+}
+.tag--path{color:var(--accent); background:var(--accent-tint); border-color:var(--accent-border);}
+.tag--verified-run{background:var(--good-tint); color:var(--good-strong); border-color:var(--good-border);}
+.tag--verified-read{background:var(--minor-tint); color:var(--minor-strong); border-color:var(--minor-border);}
+
+.finding-body{margin-top:12px; padding-left:38px;}
+.finding-body p{margin:0 0 10px; max-width:66ch; font-size:.96rem;}
+.finding-body p:last-child{margin-bottom:0;}
+.finding-body pre{
+  margin:0 0 12px; padding:12px 14px; background:var(--surface-3); border:1px solid var(--border);
+  border-radius:8px; overflow-x:auto; font-size:.82rem; line-height:1.5;
+}
+.finding-body code{color:var(--ink);}
+.fix{
+  background:var(--accent-tint); border:1px solid var(--accent-border); border-radius:8px;
+  padding:10px 14px; font-size:.9rem; margin-top:10px; max-width:66ch;
+}
+.fix b{font-family:var(--mono); font-size:.76rem; text-transform:uppercase; letter-spacing:.04em; color:var(--accent); display:block; margin-bottom:3px;}
+
+/* ---------- P2 compact rows ---------- */
+.subgroup{
+  background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  margin-bottom:14px; box-shadow:var(--shadow); overflow:hidden;
+}
+.subgroup summary{
+  list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:space-between;
+  padding:14px 18px; font-family:var(--serif); font-weight:600; font-size:1.02rem;
+}
+.subgroup summary::-webkit-details-marker{display:none;}
+.subgroup summary::after{
+  content:"⌄"; font-family:var(--sans); color:var(--ink-faint); font-size:1.1rem;
+  transition:transform .15s ease;
+}
+.subgroup[open] summary::after{transform:rotate(180deg);}
+.subgroup summary .count{
+  font-family:var(--mono); font-weight:500; font-size:.78rem; color:var(--ink-faint); margin-left:10px;
+}
+.subgroup-body{border-top:1px solid var(--border);}
+.row{
+  display:flex; align-items:flex-start; gap:12px; padding:12px 18px; border-bottom:1px solid var(--border);
+}
+.row:last-child{border-bottom:none;}
+.row-check{
+  appearance:none; width:17px; height:17px; margin-top:3px; flex:none;
+  border:2px solid var(--ink-faint); border-radius:5px; cursor:pointer; position:relative; background:var(--surface);
+}
+.row-check:checked{background:var(--good); border-color:var(--good);}
+.row-check:checked::after{
+  content:""; position:absolute; left:3.5px; top:0px; width:4px; height:8px;
+  border:solid var(--good-tint); border-width:0 2px 2px 0; transform:rotate(45deg);
+}
+.row-main{flex:1; min-width:0;}
+.row.is-done .row-title{color:var(--ink-faint); text-decoration:line-through;}
+.row.is-done .row-desc{color:var(--ink-faint);}
+.row-title-line{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.row-title{font-weight:600; font-size:.95rem;}
+.effort{
+  font-family:var(--mono); font-size:.7rem; padding:1px 6px; border-radius:99px;
+  background:var(--surface-2); color:var(--ink-muted); border:1px solid var(--border);
+}
+.row-desc{font-size:.88rem; color:var(--ink-muted); margin:4px 0 0; max-width:64ch;}
+.row-path{font-family:var(--mono); font-size:.78rem; color:var(--accent); margin-left:auto; white-space:nowrap; padding-top:1px;}
+
+/* coverage bars */
+.covbar-row{display:grid; grid-template-columns:120px 1fr 44px; align-items:center; gap:12px; padding:9px 18px; border-bottom:1px solid var(--border); font-size:.85rem;}
+.covbar-row:last-child{border-bottom:none;}
+.covbar-name{font-family:var(--mono); font-size:.8rem;}
+.covbar-track{height:7px; border-radius:4px; background:var(--surface-2); overflow:hidden;}
+.covbar-fill{height:100%; border-radius:4px; background:var(--minor);}
+.covbar-fill.low{background:var(--critical);}
+.covbar-fill.mid{background:var(--important);}
+.covbar-fill.ok{background:var(--good);}
+.covbar-pct{font-family:var(--mono); text-align:right; color:var(--ink-muted);}
+
+/* ---------- Ruled out ---------- */
+.ruled{display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(260px,1fr));}
+.ruled li{
+  list-style:none; background:var(--surface); border:1px solid var(--border); border-radius:9px;
+  padding:12px 14px; font-size:.87rem; color:var(--ink-muted); display:flex; gap:9px; box-shadow:var(--shadow);
+}
+.ruled li::before{content:"✓"; color:var(--good); font-weight:700; flex:none;}
+.ruled li b{color:var(--ink); font-weight:600; display:block; margin-bottom:2px;}
+
+footer.page-footer{margin-top:56px; padding-top:20px; border-top:1px solid var(--border); color:var(--ink-faint); font-size:.82rem; display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="hero">
+    <p class="eyebrow">Код-ревью · wheel_parser · 06.09.2026</p>
+    <h1>Ревизия WheelsParser</h1>
+    <p class="lede">Собственный обход исходников плюс три независимых прогона (безопасность, многопоточность, тесты и архитектура), каждая находка выше перепроверена запуском кода или повторным чтением. Отмечайте пункты по мере исправления — отметки сохраняются в этом браузере.</p>
+    <div class="console">
+      <span class="chip chip--good">527 тестов зелёные</span>
+      <span class="chip chip--good">ruff — чисто</span>
+      <span class="chip chip--good">mypy — чисто (22 файла)</span>
+      <span class="chip chip--neutral">покрытие 84%</span>
+      <span class="chip chip--neutral">0 трейсбеков на 4880 строк parser.log</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="rail" aria-label="Разделы отчёта">
+      <div class="rail-progress">
+        <span class="rail-progress-num tabular" id="totalProgress">40 / 40</span>
+        <span class="rail-progress-label">пунктов закрыто</span>
+        <div class="rail-progress-bar"><div class="rail-progress-fill" id="totalFill" style="width:100%"></div></div>
+      </div>
+      <ul>
+        <li><a href="#p0">P0 · критично <b class="tabular" id="cnt-p0">5/5</b></a></li>
+        <li><a href="#p1">P1 · важно <b class="tabular" id="cnt-p1">9/9</b></a></li>
+        <li><a href="#p2">P2 · улучшения <b class="tabular" id="cnt-p2">26/26</b></a></li>
+        <li><a href="#ruled-out">Проверено и снято</a></li>
+      </ul>
+      <button class="reset-btn" id="resetBtn" type="button">Сбросить все отметки</button>
+    </nav>
+
+    <main class="content">
+
+      <!-- ================= P0 ================= -->
+      <section id="p0" class="tier tier--critical">
+        <div class="tier-head">
+          <h2>P0 — чинить в первую очередь</h2>
+          <span class="tier-tag">критично</span>
+        </div>
+        <p class="tier-note">Порядок пунктов — это и есть порядок исправления: каждый следующий либо усугубляет предыдущий, либо от него не зависит.</p>
+
+        <article class="finding is-done" data-group="p0">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p0-1" checked>
+            <span class="finding-num">01</span>
+            <div class="finding-titlewrap">
+              <h3>Токен бота утекает в parser.log через traceback</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">logging_setup.py:41</span>
+                <span class="tag tag--verified-run">проверено запуском</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>RedactTokenFilter</code> правит только <code>record.msg</code>. Текст исключения форматтер дописывает отдельно из <code>record.exc_info</code>, минуя фильтр. Собственный прогон:</p>
+            <pre><code>direct: https://api.telegram.org/bot***TOKEN***/sendMessage        ← замаскировано
+ConnectionError: HTTPSConnectionPool url=/bot123456:AAFAKE_TOKEN.../  ← НЕ замаскировано</code></pre>
+            <p>Достижимо из любого <code>log.exception</code> с цепочкой к api.telegram.org: <code>runtime.py</code>, <code>app.py</code>, <code>bot.py</code>, <code>__main__.py</code>. AGENTS.md прямо требует обратного.</p>
+            <div class="fix"><b>Исправление</b>Перенести маскировку с логгера на хендлеры и переопределить <code>Formatter.format</code>, прогоняя итоговую строку (вместе с traceback) через <code>redact_token</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p0">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p0-2" checked>
+            <span class="finding-num">02</span>
+            <div class="finding-titlewrap">
+              <h3>Поток может уснуть на 6 часов внутри одного запроса</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">net.py:41</span>
+                <span class="tag tag--verified-run">проверено запуском</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>respect_retry_after_header=True</code> без потолка. В установленном urllib3 2.7.0:</p>
+            <pre><code>DEFAULT_RETRY_AFTER_MAX = 21600   # 6 часов
+RETRY_AFTER_STATUS_CODES = {413, 429, 503}</code></pre>
+            <p>urllib3 делает <code>time.sleep(retry_after)</code> напрямую — ни <code>timeout=</code>, ни <code>STOP_EVENT</code> это не прерывают. Один <code>429 Retry-After: 21600</code> — и parser/bot/twitch-worker висит часами без единой строки в логе. Даже без экстремального заголовка: 5 попыток × 15с + backoff ≈ 74с вместо заявленных 15 — из-за этого <code>app.py</code> <code>join(timeout=REQUEST_TIMEOUT+5)</code> истекает при сбое, и <code>save_seen()</code> пропускается.</p>
+            <div class="fix"><b>Исправление</b><code>Retry(..., retry_after_max=30, backoff_max=10)</code>; пересчитать бюджет join от реального потолка, а не от REQUEST_TIMEOUT.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p0">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p0-3" checked>
+            <span class="finding-num">03</span>
+            <div class="finding-titlewrap">
+              <h3>/active может сам сорвать стоп-гвард в fail-open</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">betboom.py:471</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>classify_wheels</code> кормит <code>_apply_stub_guard</code> без возможности отказаться. Но <code>/active</code> — массовый обход всех колёс за сутки (окно <code>ACTIVE_MAX_AGE_HOURS=20ч</code>). К вечеру большинство честно <code>expired</code>; восемь подряд — и гвард решает, что API отдаёт заглушку:</p>
+            <pre><code>status = "unknown" if info is None else _apply_stub_guard(api_info_to_status(info))
+# срабатывание -&gt; глобально, на все потоки, до первого настоящего active/soon</code></pre>
+            <p><code>predictive.py</code> уже решает ровно эту проблему через <code>feed_stub_guard=False</code> («серия expired подряд для сканера — норма»). <code>/active</code> имеет ту же природу, но опции не получил.</p>
+            <div class="fix"><b>Исправление</b>Не кормить гвард из <code>classify_wheels</code> — счётчик должен видеть только поток свежих находок (parser, twitch-worker).</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p0">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p0-4" checked>
+            <span class="finding-num">04</span>
+            <div class="finding-titlewrap">
+              <h3>Гонка кулдауна между parser / twitch-worker / predictive</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">parser.py:754 · twitch.py:156 · predictive.py:205</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p>Проверка и установка кулдауна — две операции, между ними стоит сеть:</p>
+            <pre><code>if cooldown_active(url, now): continue
+status, ... = precheck_wheel(url, ...)   # ← 1–74 с сети
+mark_url_alert(url, now)                 # ← метка только здесь</code></pre>
+            <p>У parser окно ещё шире: метка ставится только после <code>send_telegram_notification</code>. Штатный сценарий: стример постит ссылку в Telegram-канал и в свой Twitch-чат одновременно — оба потока видят «кулдауна нет» и оба шлют.</p>
+            <div class="fix"><b>Исправление</b>Атомарный <code>claim_url_alert(url, now)</code> в <code>alerts.py</code> — проверка и установка под одним локом, вызывать до precheck во всех трёх местах.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p0">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p0-5" checked>
+            <span class="finding-num">05</span>
+            <div class="finding-titlewrap">
+              <h3>Анти-бан сканера не работает для 429</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">predictive.py:186</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>probe_slug</code> проверяет <code>status_code in (403, 429)</code>, но 429 входит в <code>status_forcelist</code> общей сессии — urllib3 ретраит его 4 раза, бросает <code>MaxRetryError</code>, requests превращает в <code>RetryError</code>:</p>
+            <pre><code>except requests.RequestException as error:
+    return ERROR, "", False, ""   # ← 429 попадает сюда, не в BLOCKED</code></pre>
+            <p><code>_notify_blocked()</code> не срабатывает, <code>PREDICTIVE_BLOCK_COOLDOWN_MINUTES</code> не применяется — сканер делает 5 запросов на слаг именно тогда, когда его уже тормозят. Ровно риск из докстроки модуля: «бан по IP убьёт весь парсер».</p>
+            <div class="fix"><b>Исправление</b>Убрать 429 из <code>status_forcelist</code> сессии сканера (или отдельная сессия без status-ретраев).</div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ================= P1 ================= -->
+      <section id="p1" class="tier tier--important">
+        <div class="tier-head">
+          <h2>P1 — важно</h2>
+          <span class="tier-tag">важно</span>
+        </div>
+        <p class="tier-note">Не роняют парсер прямо сейчас, но каждый — реальный сценарий потери находки, дублирования уведомления или удержания ресурса.</p>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-1" checked>
+            <span class="finding-num">06</span>
+            <div class="finding-titlewrap">
+              <h3>Подменная ссылка в уведомлении по ключевым словам</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">parser.py:110 · telegram_api.py:223</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p>Превью кладёт тег со сторонним <code>href</code> и независимой подписью, и он вставляется сырым в сообщение с <code>parse_mode="HTML"</code>:</p>
+            <pre><code>f'&lt;a href="{html.escape(href, quote=True)}"&gt;{html.escape(label)}&lt;/a&gt;'</code></pre>
+            <p>Пробоя тега нет, но href и текст ссылки полностью контролирует автор поста. <code>find_disallowed_domains</code> не спасает: <code>t.me</code>, <code>vk.com</code>, <code>twitch.tv</code> в allowlist. Админ получает от собственного доверенного бота сообщение, где видимый текст — адрес колеса, а переход ведёт на чужого бота.</p>
+            <div class="fix"><b>Исправление</b>Рендерить <code>"{label} ({href})"</code> текстом, либо оставлять &lt;a&gt; только когда хост после <code>normalize_url</code> == betboom.ru.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-2" checked>
+            <span class="finding-num">07</span>
+            <div class="finding-titlewrap">
+              <h3>Тесты зависят от .env разработчика</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">tests/conftest.py:15</span>
+                <span class="tag tag--verified-run">проверено запуском</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p>conftest подменяет только <code>WHEELSPARSER_DATA_DIR</code>. Собственный прогон:</p>
+            <pre><code>$ PRECHECK_WHEELS=false pytest -q tests/test_parser.py
+8 failed  (test_expired_wheel_is_not_notified, ...)</code></pre>
+            <p>В CI зелено, у разработчика с локальным <code>.env</code> — красные тесты и час на выяснение, что код ни при чём. Хуже: заданные в <code>.env</code> <code>TELEGRAM_BOT_TOKEN</code>/<code>TELEGRAM_CHAT_ID</code> делают <code>notifications_enabled()</code> истинным в тестовом процессе — защита от отправки в реальный чат держится только на полноте моков.</p>
+            <div class="fix"><b>Исправление</b>В conftest.py жёстко задать <code>TELEGRAM_BOT_TOKEN=""</code>, <code>TELEGRAM_CHAT_ID=""</code>, <code>PRECHECK_WHEELS=true</code>, <code>REALERT_COOLDOWN_MINUTES=30</code>, <code>USE_COLORS=false</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-3" checked>
+            <span class="finding-num">08</span>
+            <div class="finding-titlewrap">
+              <h3>Сетевые вызовы под локами реестра</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">bot.py:632 и ещё ~9 мест</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <pre><code>with registry.CHANNELS_LOCK:
+    if channel in registry.CHANNELS:
+        bot_send(chat_id, "уже в списке", ...)   # ← POST под локом
+        return</code></pre>
+            <p>До ~74с удержания <code>CHANNELS_LOCK</code> блокируют <code>process_cycle</code>, <code>save_seen</code>. Для <code>KEYWORDS_LOCK</code> хуже — его берёт <code>find_keywords</code> на каждое сообщение цикла. В bot.py:604 автор сам пишет «сетевой запрос выполняем БЕЗ CHANNELS_LOCK» — правило есть, но в ранних ветках тех же функций нарушено.</p>
+            <div class="fix"><b>Исправление</b>Собирать текст под локом, отправлять после выхода из <code>with</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-4" checked>
+            <span class="finding-num">09</span>
+            <div class="finding-titlewrap">
+              <h3>Лок /active отпускается до отправки результата</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">active_report.py:175</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>_active_check_lock.release()</code> стоит в <code>finally</code> вокруг <code>classify_wheels</code>, а <code>background_bot_send</code> идёт после. Поток A висит в отправке, второй <code>/active</code> запускает поток B — и оба работают с одной <code>ACTIVE_CHECK_SESSION</code>, у которой один заявленный владелец.</p>
+            <div class="fix"><b>Исправление</b>Перенести <code>release()</code> в конец <code>_run_and_send</code>, после <code>background_bot_send</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-5" checked>
+            <span class="finding-num">10</span>
+            <div class="finding-titlewrap">
+              <h3>Утечка сокета при сбое TLS/JOIN</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">twitch.py:302</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p>Если <code>wrap_socket</code> или <code>sendall</code> бросят исключение, локальные <code>raw_socket</code>/<code>sock</code> теряются, а у вызывающего <code>sock</code> остаётся <code>None</code> — <code>finally</code> ничего не закрывает. При устойчивом сбое цикл переподключения (backoff 5→120с) повторяет это бесконечно.</p>
+            <div class="fix"><b>Исправление</b>Обернуть создание сокета и NICK/JOIN в <code>try/except BaseException: sock.close(); raise</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-6" checked>
+            <span class="finding-num">11</span>
+            <div class="finding-titlewrap">
+              <h3>Остановка не прерывает опрос каналов</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">parser.py:257</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>fetch()</code> не смотрит на <code>STOP_EVENT</code>, а <code>ThreadPoolExecutor.__exit__</code> делает <code>shutdown(wait=True)</code>, который его тоже игнорирует. Ctrl+C посреди опроса каналов — цикл дочитывает все, <code>join(timeout=20)</code> истекает, <code>save_seen</code> пропускается.</p>
+            <div class="fix"><b>Исправление</b>В начале <code>fetch()</code>: <code>if STOP_EVENT.is_set(): return channel, None</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-7" checked>
+            <span class="finding-num">12</span>
+            <div class="finding-titlewrap">
+              <h3>Неограниченное раскрытие сокращателей на одно сообщение</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">urls.py:249 · twitch.py:139</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>find_urls</code> резолвит все найденные кандидаты последовательно, без лимита. Пост с 300 ссылками на сокращатель × до 2 запросов × ретраи ≈ часы блокировки одного из 4 воркеров. Каналы чужие, стримерские — пост не обязан быть безобидным.</p>
+            <div class="fix"><b>Исправление</b>Срез <code>[:5]</code> в <code>find_shortlink_candidates</code>.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-8" checked>
+            <span class="finding-num">13</span>
+            <div class="finding-titlewrap">
+              <h3>streamers.json растёт бесконечно, наполняется из постов</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">predictive.py:332</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p>Ни <code>merge_frontiers</code>, ни <code>scan_once</code> не удаляют префиксы. Наполняется файл из <code>frontier_from_history</code> — по любой записи в базе, включая выдуманный слаг: несуществующий адрес → <code>unknown</code> → fail-open → уведомление → INSERT → новая «серия» навсегда. При ~170 префиксах один проход съедает весь <code>PREDICTIVE_DAILY_BUDGET=500</code>, а обход идёт <code>sorted(frontier)</code> — серии в конце алфавита не проверяются никогда.</p>
+            <div class="fix"><b>Исправление</b>Выбрасывать префикс после N пустых проходов подряд; валидировать <code>^[A-Za-z0-9_-]{2,32}$</code> перед записью.</div>
+          </div>
+        </article>
+
+        <article class="finding is-done" data-group="p1">
+          <div class="finding-head">
+            <input type="checkbox" class="finding-check" data-id="p1-9" checked>
+            <span class="finding-num">14</span>
+            <div class="finding-titlewrap">
+              <h3>Удаление слова из меню может удалить не то слово</h3>
+              <div class="finding-meta">
+                <span class="tag tag--path">menu.py:326</span>
+                <span class="tag tag--verified-read">проверено чтением кода</span>
+              </div>
+            </div>
+          </div>
+          <div class="finding-body">
+            <p><code>_cb_remove_word</code> проверяет только диапазон индекса. Старое сообщение <code>/words</code> в чате плюс последующий <code>/addword</code> — и клик по ❌ молча удаляет соседнее слово по смещённому индексу.</p>
+            <div class="fix"><b>Исправление</b>Короткий хэш слова в <code>callback_data</code> (<code>wd:rm:{index}:{hash8}</code>) и сверка перед <code>pop</code>.</div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ================= P2 ================= -->
+      <section id="p2" class="tier">
+        <div class="tier-head"><h2>P2 — качество и сопровождение</h2></div>
+        <p class="tier-note">Не срочно, но накопится. Сгруппировано по теме — сворачивайте закрытые разделы.</p>
+
+        <details open class="subgroup">
+          <summary>Архитектура <span class="count">2 пункта</span></summary>
+          <div class="subgroup-body">
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-arch-1">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">Разбить parser.py (1152 строки) на 4 модуля</span><span class="effort">M</span></div>
+                <p class="row-desc">Делится без пересечения состояния: <code>telegram_scrape.py</code> (BeautifulSoup + вёрстка t.me, ~230 строк), <code>channel_health.py</code> (машина на 5 глобалах, ~130), <code>retries.py</code> (две системы дозаправки, ~180), остаток — сам цикл (~450).</p>
+              </div>
+            </div>
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-arch-2">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">Разбить bot.py (883 строки)</span><span class="effort">M</span></div>
+                <p class="row-desc">Выделить <code>reports.py</code> (чистые функции «данные → текст»: help_text, status_text, top_text) отдельно от транспорта (bot_loop, диспетчеризация команд).</p>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details open class="subgroup">
+          <summary>Дублирование <span class="count">3 пункта</span></summary>
+          <div class="subgroup-body">
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-dup-1">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">Конвейер одной ссылки продублирован</span><span class="effort">M</span></div>
+                <p class="row-desc">parser.py:748 и twitch.py:154 совпадают вплоть до 10-строчного комментария. Правка политики precheck уже расходилась между ними.</p>
+              </div>
+            </div>
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-dup-2">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">Литерал entry собирается в 4 местах</span><span class="effort">S</span></div>
+                <p class="row-desc">Разный набор полей в parser/twitch/predictive. Нужна фабрика <code>make_wheel_entry</code> рядом с <code>db.COLUMNS</code>.</p>
+              </div>
+            </div>
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-dup-3">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">worker_session() продублирован символ-в-символ</span><span class="effort">S</span></div>
+                <p class="row-desc">parser.py:250 и betboom.py:445 — одна и та же идиома threading.local на 7 строк с одинаковым комментарием.</p>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details open class="subgroup">
+          <summary>Типизация <span class="count">1 пункт</span></summary>
+          <div class="subgroup-body">
+            <div class="row">
+              <input type="checkbox" class="row-check" checked data-id="p2-typing-1">
+              <div class="row-main">
+                <div class="row-title-line"><span class="row-title">TypedDict для entry</span><span class="effort">M</span></div>
+                <p class="row-desc">telegram_api.py:129 читает entry['channel'], entry['url'] без .get() — отсутствие ключа даёт KeyError в момент отправки, то есть теряет находку молча.</p>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="subgroup">
+          <summary>CI и инструментарий <span class="count">5 пунктов</span></summary>
+          <div class="subgroup-body">
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-ci-1"><div class="row-main"><div class="row-title-line"><span class="row-title">Coverage gate</span><span class="effort">S</span></div><p class="row-desc"><code>pytest-cov</code> + <code>--cov-fail-under=80</code> на одной ячейке матрицы — иначе покрытие тихо просядет.</p></div></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-ci-2"><div class="row-main"><div class="row-title-line"><span class="row-title">Пины версий ruff/mypy</span><span class="effort">S</span></div><p class="row-desc"><code>ruff&gt;=0.5</code>, <code>mypy&gt;=1.10</code> — в .venv уже mypy 2.3.0. Мажорная версия ничем не удержана, зелёный main может покраснеть без единого коммита.</p></div></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-ci-4"><div class="row-main"><div class="row-title-line"><span class="row-title">Dependabot</span><span class="effort">S</span></div><p class="row-desc">Weekly для pip и github-actions.</p></div></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-ci-5"><div class="row-main"><div class="row-title-line"><span class="row-title">permissions и concurrency в workflow</span><span class="effort">S</span></div><p class="row-desc"><code>permissions: contents: read</code> сужает токен; <code>concurrency: cancel-in-progress</code> экономит минуты на повторных push.</p></div></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-ci-6"><div class="row-main"><div class="row-title-line"><span class="row-title">Python 3.13 в матрице</span><span class="effort">S</span></div><p class="row-desc">requires-python обещает 3.13+, проверяются только 3.10 и 3.12.</p></div></div>
+          </div>
+        </details>
+
+        <details class="subgroup">
+          <summary>Пробелы в покрытии <span class="count">83% в среднем</span></summary>
+          <div class="subgroup-body">
+            <div class="covbar-row"><span class="covbar-name">app.py</span><div class="covbar-track"><div class="covbar-fill low" style="width:20%"></div></div><span class="covbar-pct tabular">20%</span></div>
+            <div class="covbar-row"><span class="covbar-name">logging_setup.py</span><div class="covbar-track"><div class="covbar-fill low" style="width:37%"></div></div><span class="covbar-pct tabular">37%</span></div>
+            <div class="covbar-row"><span class="covbar-name">runtime.py</span><div class="covbar-track"><div class="covbar-fill mid" style="width:66%"></div></div><span class="covbar-pct tabular">66%</span></div>
+            <div class="covbar-row"><span class="covbar-name">bot.py</span><div class="covbar-track"><div class="covbar-fill mid" style="width:73%"></div></div><span class="covbar-pct tabular">73%</span></div>
+            <div class="covbar-row"><span class="covbar-name">twitch.py</span><div class="covbar-track"><div class="covbar-fill mid" style="width:75%"></div></div><span class="covbar-pct tabular">75%</span></div>
+            <div class="covbar-row"><span class="covbar-name">active_report.py</span><div class="covbar-track"><div class="covbar-fill mid" style="width:76%"></div></div><span class="covbar-pct tabular">76%</span></div>
+            <div class="covbar-row"><span class="covbar-name">registry.py</span><div class="covbar-track"><div class="covbar-fill mid" style="width:77%"></div></div><span class="covbar-pct tabular">77%</span></div>
+            <div class="covbar-row"><span class="covbar-name">predictive.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:87%"></div></div><span class="covbar-pct tabular">87%</span></div>
+            <div class="covbar-row"><span class="covbar-name">betboom.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:90%"></div></div><span class="covbar-pct tabular">90%</span></div>
+            <div class="covbar-row"><span class="covbar-name">storage.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:90%"></div></div><span class="covbar-pct tabular">90%</span></div>
+            <div class="covbar-row"><span class="covbar-name">telegram_api.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:92%"></div></div><span class="covbar-pct tabular">92%</span></div>
+            <div class="covbar-row"><span class="covbar-name">parser.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:92%"></div></div><span class="covbar-pct tabular">92%</span></div>
+            <div class="covbar-row"><span class="covbar-name">menu.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:93%"></div></div><span class="covbar-pct tabular">93%</span></div>
+            <div class="covbar-row"><span class="covbar-name">db.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:96%"></div></div><span class="covbar-pct tabular">96%</span></div>
+            <div class="covbar-row"><span class="covbar-name">urls.py</span><div class="covbar-track"><div class="covbar-fill ok" style="width:96%"></div></div><span class="covbar-pct tabular">96%</span></div>
+          </div>
+        </details>
+
+        <details class="subgroup">
+          <summary>Гигиена репозитория <span class="count">9 пунктов</span></summary>
+          <div class="subgroup-body">
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-1"><div class="row-main"><div class="row-title-line"><span class="row-title">py.typed объявлен в package-data, файла нет</span></div></div><span class="row-path">pyproject.toml:35</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-2"><div class="row-main"><div class="row-title-line"><span class="row-title">license = MIT, файла LICENSE нет</span></div></div><span class="row-path">pyproject.toml:9</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-3"><div class="row-main"><div class="row-title-line"><span class="row-title">urllib3 используется, но не объявлен в зависимостях</span></div></div><span class="row-path">net.py:32</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-4"><div class="row-main"><div class="row-title-line"><span class="row-title">115 КБ чужого минифицированного фронтенда закоммичены как исходники</span></div></div><span class="row-path">mf-wheel-chunk.js</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-5"><div class="row-main"><div class="row-title-line"><span class="row-title">docs/ в .gitignore — планы не версионируются</span></div></div><span class="row-path">.gitignore</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-6"><div class="row-main"><div class="row-title-line"><span class="row-title">Диаграмма слоёв устарела — нет menu.py и predictive.py</span></div></div><span class="row-path">AGENTS.md:54</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-7"><div class="row-main"><div class="row-title-line"><span class="row-title">Докстрока: «файлы состояния в корне» — фактически в data/</span></div></div><span class="row-path">__init__.py:12</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-8"><div class="row-main"><div class="row-title-line"><span class="row-title">mkdtemp в тестах без удаления — каталоги копятся</span></div></div><span class="row-path">conftest.py:15</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-hyg-9"><div class="row-main"><div class="row-title-line"><span class="row-title">check_wheel_status — 16 вызовов в тестах, 0 в проде</span></div></div><span class="row-path">betboom.py:282</span></div>
+          </div>
+        </details>
+
+        <details class="subgroup">
+          <summary>Мелочи <span class="count">6 пунктов</span></summary>
+          <div class="subgroup-body">
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-1"><div class="row-main"><div class="row-title-line"><span class="row-title">RETRY_ATTEMPT_COUNTS чистится только при успешной доставке</span></div></div><span class="row-path">parser.py:512</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-2"><div class="row-main"><div class="row-title-line"><span class="row-title">Очереди Twitch/predictive без maxsize</span></div></div><span class="row-path">twitch.py:60</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-3"><div class="row-main"><div class="row-title-line"><span class="row-title">supervise сбрасывает notified вместе с backoff</span></div></div><span class="row-path">runtime.py:82</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-4"><div class="row-main"><div class="row-title-line"><span class="row-title">registry.save_*_file пишет неатомарно</span></div></div><span class="row-path">registry.py:230</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-5"><div class="row-main"><div class="row-title-line"><span class="row-title">Авторизация по chat_id, не по from.id</span></div></div><span class="row-path">bot.py:839</span></div>
+            <div class="row"><input type="checkbox" class="row-check" checked data-id="p2-misc-6"><div class="row-main"><div class="row-title-line"><span class="row-title">Сессии воркеров пересоздаются каждый цикл, не закрываются</span></div></div><span class="row-path">parser.py:248</span></div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ================= Ruled out ================= -->
+      <section id="ruled-out" class="tier">
+        <div class="tier-head"><h2>Проверено и снято</h2></div>
+        <p class="tier-note">Гипотезы, которые не подтвердились при проверке — чтобы не тратить на них время повторно.</p>
+        <ul class="ruled">
+          <li><b>SQL-инъекции</b>Все запросы в db.py параметризованы через `?`.</li>
+          <li><b>SSRF в resolve_shortlink</b>Каждый хоп перепроверяет хост; `vk.cc@127.0.0.1` не проходит.</li>
+          <li><b>Обход FREESTREAM_RE</b>`evil.com@betboom.ru` не матчится, только буквальный домен.</li>
+          <li><b>Catastrophic backtracking</b>Все regex линейны, без вложенных квантификаторов.</li>
+          <li><b>Path traversal</b>Имена каналов/слагов нигде не используются как компонент пути.</li>
+          <li><b>Экранирование в командах бота</b>html.escape перед parse_mode=HTML — везде, кроме находки №6.</li>
+          <li><b>Подделка ролей в Twitch</b>Бейджи ставит сам Twitch поверх TLS, зритель их не контролирует.</li>
+          <li><b>Циклы в импортах</b>Граф по AST циклов не показал, слои соблюдены.</li>
+          <li><b>Итерация по мутируемым словарям</b>Везде материализован список внутри лока перед pop.</li>
+          <li><b>Дедлоки по порядку захвата</b>Не найдены; вложенных чужих локов нет.</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="page-footer">
+    <span>Ревью: собственное чтение + 3 субагента (безопасность / многопоточность / тесты и архитектура)</span>
+    <span>Отметки хранятся только в этом браузере</span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  var STORE_KEY = "wheelsparser-review-v2";
+  var defaultState = {
+    "p0-1": true, "p0-2": true, "p0-3": true, "p0-4": true, "p0-5": true,
+    "p1-1": true, "p1-2": true, "p1-3": true, "p1-4": true, "p1-5": true,
+    "p1-6": true, "p1-7": true, "p1-8": true, "p1-9": true,
+    "p2-arch-1": true,
+    "p2-arch-2": true,
+    "p2-dup-1": true,
+    "p2-dup-2": true,
+    "p2-dup-3": true,
+    "p2-typing-1": true,
+    "p2-ci-1": true,
+    "p2-ci-2": true,
+    "p2-ci-4": true,
+    "p2-ci-5": true,
+    "p2-ci-6": true,
+    "p2-hyg-1": true,
+    "p2-hyg-2": true,
+    "p2-hyg-3": true,
+    "p2-hyg-4": true,
+    "p2-hyg-5": true,
+    "p2-hyg-6": true,
+    "p2-hyg-7": true,
+    "p2-hyg-8": true,
+    "p2-hyg-9": true,
+    "p2-misc-1": true,
+    "p2-misc-2": true,
+    "p2-misc-3": true,
+    "p2-misc-4": true,
+    "p2-misc-5": true,
+    "p2-misc-6": true
+  };
+  var state = Object.assign({}, defaultState);
+  try {
+    var stored = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+    if (stored) {
+      for (var k in stored) { state[k] = stored[k]; }
+    }
+  } catch(e) {}
+
+  function save(){
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch(e) {}
+  }
+
+  function allChecks(){
+    return Array.prototype.slice.call(document.querySelectorAll('[data-id]'));
+  }
+
+  function applyState(){
+    allChecks().forEach(function(el){
+      var id = el.getAttribute('data-id');
+      var on = state[id] !== undefined ? !!state[id] : el.checked;
+      el.checked = on;
+      var card = el.closest('.finding') || el.closest('.row');
+      if (card) card.classList.toggle('is-done', on);
+    });
+    updateCounts();
+  }
+
+  function updateCounts(){
+    var groups = {p0:[0,0], p1:[0,0], p2:[0,0]};
+    allChecks().forEach(function(el){
+      var g = el.closest('[data-group]');
+      var key = g ? g.getAttribute('data-group') : 'p2';
+      if (!groups[key]) groups[key] = [0,0];
+      groups[key][1]++;
+      if (el.checked) groups[key][0]++;
+    });
+    var total = [0,0];
+    Object.keys(groups).forEach(function(k){ total[0]+=groups[k][0]; total[1]+=groups[k][1]; });
+
+    var p0el = document.getElementById('cnt-p0');
+    var p1el = document.getElementById('cnt-p1');
+    var p2el = document.getElementById('cnt-p2');
+    if (p0el) p0el.textContent = groups.p0[0] + '/' + groups.p0[1];
+    if (p1el) p1el.textContent = groups.p1[0] + '/' + groups.p1[1];
+    if (p2el) p2el.textContent = groups.p2[0] + '/' + groups.p2[1];
+
+    document.getElementById('totalProgress').textContent = total[0] + ' / ' + total[1];
+    var pct = total[1] ? Math.round(100*total[0]/total[1]) : 0;
+    document.getElementById('totalFill').style.width = pct + '%';
+  }
+
+  document.addEventListener('change', function(ev){
+    var el = ev.target;
+    if (!el.matches('[data-id]')) return;
+    var id = el.getAttribute('data-id');
+    state[id] = el.checked;
+    save();
+    var card = el.closest('.finding') || el.closest('.row');
+    if (card) card.classList.toggle('is-done', el.checked);
+    updateCounts();
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', function(){
+    state = Object.assign({}, defaultState);
+    save();
+    applyState();
+  });
+
+  document.querySelectorAll('.subgroup .row').forEach(function(row){
+    if (!row.closest('[data-group]')) row.setAttribute('data-group','p2');
+  });
+  document.querySelectorAll('[data-id]').forEach(function(el){
+    if (!el.closest('[data-group]')) {
+      var wrap = el.closest('.finding, .row');
+      if (wrap && !wrap.hasAttribute('data-group')) wrap.setAttribute('data-group','p2');
+    }
+  });
+
+  applyState();
+})();
+</script>
+</body>
+</html>

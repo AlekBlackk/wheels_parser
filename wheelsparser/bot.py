@@ -10,25 +10,23 @@ from __future__ import annotations
 import html
 import time
 from collections.abc import Callable
-from datetime import timedelta
-from typing import Any
 
 import requests
 
-from . import db, menu, registry
+from . import menu, registry
 from .active_report import (
     fire_active_check,
     lookup_active_number,
     remember_active_numbers,
 )
 from .config import (
-    ACTIVE_MAX_AGE_HOURS,
     BOT_API,
     CHECK_INTERVAL,
     FREESTREAM_RE,
     KEYWORD_MAX_LENGTH,
     REQUEST_TIMEOUT,
     STALE_COMMAND_SECONDS,
+    TELEGRAM_ADMIN_ID,
     TELEGRAM_CHAT_ID,
     TOP_PERIOD_DAYS,
     TWITCH_USERNAME_RE,
@@ -36,8 +34,21 @@ from .config import (
     WHEELS_WINDOW_MINUTES,
     icon,
 )
+from .db import WheelEntry
 from .logging_setup import log
 from .net import BOT_SESSION
+from .reports import (
+    channels_text,
+    help_text,
+    recent_wheels,
+    status_text,
+    top_text,
+    twitch_text,
+    words_text,
+)
+from .reports import (
+    wheels_for_active as _reports_wheels_for_active,
+)
 from .runtime import STOP_EVENT
 from .storage import (
     load_bot_offset,
@@ -46,8 +57,15 @@ from .storage import (
     save_bot_offset,
 )
 from .telegram_api import answer_callback_query, bot_send
-from .timeutils import format_found_time, now_msk
+from .timeutils import format_found_time
 from .urls import normalize_url
+
+
+def wheels_for_active() -> list[WheelEntry]:
+    """Уникальные колёса за сегодня — делегирует в reports.wheels_for_active."""
+    return _reports_wheels_for_active(
+        removed_wheels_fn=lambda: removed_wheels_today()
+    )
 
 BOT_COMMANDS = [
     {"command": "start", "description": "О боте"},
@@ -100,118 +118,6 @@ def check_channel_preview(channel: str) -> str:
     if "tgme_widget_message_wrap" in response.text:
         return "ok"
     return "no_preview"
-
-
-def help_text() -> str:
-    return (
-        "<b>Команды:</b>\n"
-        "/menu — то же самое, но кнопками\n"
-        f"/wheels — колёса за последние {WHEELS_WINDOW_MINUTES} минут\n"
-        "/active — живые колёса за сегодня (сброс в 00:00 МСК)\n"
-        "/removewheel номер — убрать колесо из /active до конца суток\n"
-        "    (номер — из последнего ответа /active или /wheels; можно "
-        "ссылкой или кнопкой ❌)\n"
-        "/status — статистика найденных ссылок\n"
-        f"/top — какие каналы дают колёса чаще (за {TOP_PERIOD_DAYS} дн.)\n"
-        "    (период задаётся числом дней: <code>/top 7</code>)\n"
-        "/channels — список отслеживаемых каналов\n"
-        "/add @channel — добавить канал\n"
-        "/remove @channel — убрать канал\n"
-        "/twitch — список Twitch-каналов\n"
-        "/addtwitch channel — добавить Twitch-канал\n"
-        "/removetwitch channel — убрать Twitch-канал\n"
-        "/words — список ключевых слов\n"
-        "/addword слово — добавить ключевое слово\n"
-        "    (слово — по границам слова, *слово* — по подстроке)\n"
-        "/removeword слово — убрать ключевое слово\n"
-        "/help — эта справка\n\n"
-        f"Каналов под мониторингом: {len(registry.channels_snapshot())}\n"
-        f"Twitch-каналов: {len(registry.twitch_channels_snapshot())}\n"
-        f"Ключевых слов: {len(registry.keywords_snapshot())}\n"
-        f"Интервал проверки: {CHECK_INTERVAL} сек"
-    )
-
-
-def recent_wheels(minutes: int = WHEELS_WINDOW_MINUTES) -> list[dict[str, Any]]:
-    """Колёса за последние minutes минут, от свежих к старым.
-
-    Записи без url — посты с ключевыми словами: они лежат в той же
-    таблице ради ретрая недоставленных уведомлений, но колёсами не
-    являются и в списки ссылок не попадают (их отсекает wheels_since).
-    """
-    cutoff = now_msk() - timedelta(minutes=minutes)
-    return list(reversed(db.wheels_since(cutoff)))
-
-
-def channel_label(item: dict[str, Any]) -> str:
-    """Подпись источника находки: @канал или twitch.tv/канал."""
-    channel = html.escape(str(item.get("channel", "?")))
-    if item.get("source") == "twitch":
-        return f"twitch.tv/{channel}"
-    return f"@{channel}"
-
-
-def status_text() -> str:
-    # Только находки со ссылкой: записи о ключевых словах хранятся рядом
-    # ради ретрая уведомлений, но статистика тут — про колёса.
-    stats = db.wheel_stats()
-    lines = [
-        f"🎁 Найдено ссылок всего: {stats.total}",
-        f"📅 За сегодня: {stats.today}",
-    ]
-    if stats.last is None:
-        lines.append("🕑 Последняя ссылка: пока нет")
-        return "\n".join(lines)
-    found_time = format_found_time(stats.last.get("found_at", ""))
-    url = html.escape(normalize_url(str(stats.last.get("url", ""))))
-    lines.append(
-        f"🕑 Последняя ссылка: {found_time} ({channel_label(stats.last)})"
-    )
-    if url:
-        lines.append(url)
-    return "\n".join(lines)
-
-
-def top_text(days: int = TOP_PERIOD_DAYS) -> str:
-    """Рейтинг каналов по числу найденных колёс за последние days суток."""
-    counts = db.channel_counts(now_msk() - timedelta(days=days))
-    if not counts:
-        return f"За последние {days} дн. находок пока нет."
-    lines = [f"📊 <b>Колёс за {days} дн. по каналам:</b>"]
-    lines.extend(
-        f"{position}. {channel_label({'channel': row.channel, 'source': row.source})}"
-        f" — {row.wheels}"
-        for position, row in enumerate(counts, start=1)
-    )
-    return "\n".join(lines)
-
-
-def wheels_for_active() -> list[dict[str, Any]]:
-    """Уникальные колёса за сегодня — кандидаты на проверку в /active.
-
-    Берём только записи текущих суток по Москве и не старше
-    ACTIVE_MAX_AGE_HOURS, чтобы зависшие записи не оставались в /active.
-    Дедупликация — по каноническому URL: в найденных сообщениях могут
-    отличаться query-параметры (utm и т.п.), но это всё равно одно колесо.
-    Колёса, снятые вручную через /removewheel, отбрасываются.
-    """
-    now = now_msk()
-    day_cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    age_cutoff = now - timedelta(hours=ACTIVE_MAX_AGE_HOURS)
-    fresh_items = db.wheels_since(max(day_cutoff, age_cutoff))
-
-    removed_today = removed_wheels_today()
-    seen_urls: set[str] = set()
-    unique_items: list[dict[str, Any]] = []
-    for item in reversed(fresh_items):  # сначала свежие
-        url = normalize_url(str(item.get("url", "")))
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
-        if url in removed_today:
-            continue  # удалено вручную через /removewheel
-        unique_items.append(item)
-    return unique_items
 
 
 # ----------------------------------------------------------------------------
@@ -300,24 +206,17 @@ def cmd_wheels(chat_id: str, _argument: str) -> None:
 
 
 def cmd_active(chat_id: str, _argument: str) -> None:
-    unique_items = wheels_for_active()
-    if not unique_items:
-        bot_send(
-            chat_id,
-            f"За последние {ACTIVE_MAX_AGE_HOURS} часов колёс не найдено. "
-            "Как только появится ссылка — пришлю её сразу.",
-            reply_markup=menu.root_open_keyboard(),
-        )
-        return
-    # Fire-and-forget: поток бота не блокируется.
-    # Результат придёт отдельным сообщением после проверки в фоновом потоке.
+    # Fire-and-forget: поток бота не блокируется. Фоновый поток сначала
+    # прогоняет внеплановый обход всех каналов, потом читает свежую базу
+    # (wheels_for_active) и проверяет колёса через API. Поэтому и «колёс
+    # нет», и сам результат приходят отдельным сообщением уже после обхода.
     bot_send(
         chat_id,
-        f"{icon('bell')} Проверяю {len(unique_items)} колёс за сегодня…"
+        f"{icon('scan')} Обновляю каналы и проверяю живые колёса за сегодня…"
         " Результат пришлю отдельным сообщением.",
         reply_markup=menu.root_open_keyboard(),
     )
-    fire_active_check(chat_id, unique_items)
+    fire_active_check(chat_id, wheels_for_active)
 
 
 def _resolve_wheel_to_remove(chat_id: str, raw: str) -> str | None:
@@ -391,11 +290,9 @@ def cmd_removewheel(chat_id: str, argument: str) -> None:
 
 
 def cmd_channels(chat_id: str, _argument: str) -> None:
-    channels = registry.channels_snapshot()
-    listing = "\n".join(f"• @{html.escape(channel)}" for channel in channels)
     bot_send(
         chat_id,
-        f"<b>Каналы ({len(channels)}):</b>\n{listing}",
+        channels_text(),
         reply_markup=menu.channels_list_keyboard(),
     )
 
@@ -405,14 +302,13 @@ def cmd_words(chat_id: str, _argument: str) -> None:
     if not keywords:
         bot_send(
             chat_id,
-            "Ключевых слов пока нет. Добавьте: /addword колесо",
+            words_text(keywords),
             reply_markup=menu.root_open_keyboard(),
         )
         return
-    listing = "\n".join(f"• {html.escape(keyword)}" for keyword in keywords)
     bot_send(
         chat_id,
-        f"<b>Ключевые слова ({len(keywords)}):</b>\n{listing}",
+        words_text(keywords),
         reply_markup=menu.words_list_keyboard(),
     )
 
@@ -450,18 +346,22 @@ def cmd_addword(chat_id: str, argument: str) -> None:
     keyword = _validate_keyword(chat_id, "/addword", argument)
     if keyword is None:
         return
+    already_present: str | None = None
     with registry.KEYWORDS_LOCK:
         existing = _find_keyword_casefold(keyword)
         if existing is not None:
-            bot_send(
-                chat_id,
-                f"«{html.escape(existing)}» уже в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.KEYWORDS.append(keyword)
-        registry.save_keywords_file()
-        total = len(registry.KEYWORDS)
+            already_present = existing
+        else:
+            registry.KEYWORDS.append(keyword)
+            registry.save_keywords_file()
+            total = len(registry.KEYWORDS)
+    if already_present is not None:
+        bot_send(
+            chat_id,
+            f"«{html.escape(already_present)}» уже в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     bot_send(
         chat_id,
         f"{icon('ok')} «{html.escape(keyword)}» добавлено. Слов: {total}",
@@ -474,21 +374,24 @@ def cmd_removeword(chat_id: str, argument: str) -> None:
     keyword = _validate_keyword(chat_id, "/removeword", argument)
     if keyword is None:
         return
+    removed_word: str | None = None
     with registry.KEYWORDS_LOCK:
         existing = _find_keyword_casefold(keyword)
-        if existing is None:
-            bot_send(
-                chat_id,
-                f"«{html.escape(keyword)}» нет в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.KEYWORDS.remove(existing)
-        registry.save_keywords_file()
-        total = len(registry.KEYWORDS)
+        if existing is not None:
+            registry.KEYWORDS.remove(existing)
+            registry.save_keywords_file()
+            total = len(registry.KEYWORDS)
+            removed_word = existing
+    if removed_word is None:
+        bot_send(
+            chat_id,
+            f"«{html.escape(keyword)}» нет в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     bot_send(
         chat_id,
-        f"{icon('stop')} «{html.escape(existing)}» удалено. Слов: {total}",
+        f"{icon('stop')} «{html.escape(removed_word)}» удалено. Слов: {total}",
         reply_markup=menu.root_open_keyboard(),
     )
     log.info("Бот: слово %r удалено, всего %s", keyword, total)
@@ -499,16 +402,13 @@ def cmd_twitch(chat_id: str, _argument: str) -> None:
     if not channels:
         bot_send(
             chat_id,
-            "Twitch-каналов пока нет. Добавьте: /addtwitch channel",
+            twitch_text(channels),
             reply_markup=menu.root_open_keyboard(),
         )
         return
-    listing = "\n".join(
-        f"• twitch.tv/{html.escape(channel)}" for channel in channels
-    )
     bot_send(
         chat_id,
-        f"<b>Twitch-каналы ({len(channels)}):</b>\n{listing}",
+        twitch_text(channels),
         reply_markup=menu.twitch_list_keyboard(),
     )
 
@@ -532,17 +432,21 @@ def cmd_addtwitch(chat_id: str, argument: str) -> None:
     channel = _parse_twitch_channel(chat_id, "/addtwitch", argument)
     if channel is None:
         return
+    already_present = False
     with registry.TWITCH_CHANNELS_LOCK:
         if channel in registry.TWITCH_CHANNELS:
-            bot_send(
-                chat_id,
-                f"twitch.tv/{html.escape(channel)} уже в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.TWITCH_CHANNELS.append(channel)
-        registry.save_twitch_channels_file()
-        total = len(registry.TWITCH_CHANNELS)
+            already_present = True
+        else:
+            registry.TWITCH_CHANNELS.append(channel)
+            registry.save_twitch_channels_file()
+            total = len(registry.TWITCH_CHANNELS)
+    if already_present:
+        bot_send(
+            chat_id,
+            f"twitch.tv/{html.escape(channel)} уже в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     registry.TWITCH_RELOAD.set()
     bot_send(
         chat_id,
@@ -557,17 +461,21 @@ def cmd_removetwitch(chat_id: str, argument: str) -> None:
     channel = _parse_twitch_channel(chat_id, "/removetwitch", argument)
     if channel is None:
         return
+    not_found = False
     with registry.TWITCH_CHANNELS_LOCK:
         if channel not in registry.TWITCH_CHANNELS:
-            bot_send(
-                chat_id,
-                f"twitch.tv/{html.escape(channel)} нет в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.TWITCH_CHANNELS.remove(channel)
-        registry.save_twitch_channels_file()
-        total = len(registry.TWITCH_CHANNELS)
+            not_found = True
+        else:
+            registry.TWITCH_CHANNELS.remove(channel)
+            registry.save_twitch_channels_file()
+            total = len(registry.TWITCH_CHANNELS)
+    if not_found:
+        bot_send(
+            chat_id,
+            f"twitch.tv/{html.escape(channel)} нет в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     registry.TWITCH_RELOAD.set()
     bot_send(
         chat_id,
@@ -629,17 +537,21 @@ def cmd_add(chat_id: str, argument: str) -> None:
             "(сетевая ошибка) — добавлен без проверки."
         )
     )
+    already_present = False
     with registry.CHANNELS_LOCK:
         if channel in registry.CHANNELS:
-            bot_send(
-                chat_id,
-                f"@{html.escape(channel)} уже в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.CHANNELS.append(channel)
-        registry.save_channels_file()
-        total = len(registry.CHANNELS)
+            already_present = True
+        else:
+            registry.CHANNELS.append(channel)
+            registry.save_channels_file()
+            total = len(registry.CHANNELS)
+    if already_present:
+        bot_send(
+            chat_id,
+            f"@{html.escape(channel)} уже в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     bot_send(
         chat_id,
         f"{icon('ok')} @{html.escape(channel)} добавлен. Каналов: {total}{note}",
@@ -652,17 +564,21 @@ def cmd_remove(chat_id: str, argument: str) -> None:
     channel = _parse_telegram_channel(chat_id, "/remove", argument)
     if channel is None:
         return
+    not_found = False
     with registry.CHANNELS_LOCK:
         if channel not in registry.CHANNELS:
-            bot_send(
-                chat_id,
-                f"@{html.escape(channel)} нет в списке.",
-                reply_markup=menu.root_open_keyboard(),
-            )
-            return
-        registry.CHANNELS.remove(channel)
-        registry.save_channels_file()
-        total = len(registry.CHANNELS)
+            not_found = True
+        else:
+            registry.CHANNELS.remove(channel)
+            registry.save_channels_file()
+            total = len(registry.CHANNELS)
+    if not_found:
+        bot_send(
+            chat_id,
+            f"@{html.escape(channel)} нет в списке.",
+            reply_markup=menu.root_open_keyboard(),
+        )
+        return
     bot_send(
         chat_id,
         f"{icon('stop')} @{html.escape(channel)} удалён. Каналов: {total}",
@@ -737,13 +653,17 @@ def _cb_add_suggested_channel(chat_id: str, callback_id: str, raw_channel: str) 
             show_alert=True,
         )
         return
+    already_in = False
     with registry.CHANNELS_LOCK:
         if channel.casefold() in {name.casefold() for name in registry.CHANNELS}:
-            answer_callback_query(callback_id, f"@{channel} уже в списке")
-            return
-        registry.CHANNELS.append(channel)
-        registry.save_channels_file()
-        total = len(registry.CHANNELS)
+            already_in = True
+        else:
+            registry.CHANNELS.append(channel)
+            registry.save_channels_file()
+            total = len(registry.CHANNELS)
+    if already_in:
+        answer_callback_query(callback_id, f"@{channel} уже в списке")
+        return
     answer_callback_query(callback_id, f"@{channel} добавлен")
     note = (
         ""
@@ -802,6 +722,29 @@ def handle_command(chat_id: str, text: str) -> None:
         handler(chat_id, argument)
 
 
+def is_authorized_sender(chat_id: str, from_id: str | None = None) -> bool:
+    """Проверяет авторизацию отправителя команды или callback.
+
+    Команды и callback'и принимаются только из доверенного чата TELEGRAM_CHAT_ID.
+    В групповых чатах любой участник мог бы слать команды администратора,
+    поэтому:
+    1. chat_id обязан совпадать с TELEGRAM_CHAT_ID.
+    2. Если задан TELEGRAM_ADMIN_ID, from_id обязан точно совпадать с ним.
+       Сообщения без отправителя (анонимный админ группы, автопост из
+       привязанного канала) при заданном TELEGRAM_ADMIN_ID отклоняются.
+    3. Если TELEGRAM_ADMIN_ID не задан:
+       - для личных чатов (TELEGRAM_CHAT_ID > 0) from_id обязан совпадать с TELEGRAM_CHAT_ID;
+       - для групповых чатов (TELEGRAM_CHAT_ID < 0) совпадение чата обязательно.
+    """
+    if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
+        return False
+    if TELEGRAM_ADMIN_ID:
+        return from_id == TELEGRAM_ADMIN_ID
+    if not TELEGRAM_CHAT_ID.startswith("-"):
+        return from_id is None or from_id == TELEGRAM_CHAT_ID
+    return True
+
+
 # ----------------------------------------------------------------------------
 # Цикл getUpdates
 # ----------------------------------------------------------------------------
@@ -840,9 +783,15 @@ def bot_loop() -> None:
             if callback is not None:
                 cb_message = callback.get("message") or {}
                 chat_id = str((cb_message.get("chat") or {}).get("id", ""))
-                if not chat_id or not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
+                from_user = callback.get("from") or {}
+                from_id = (
+                    str(from_user.get("id"))
+                    if from_user.get("id") is not None
+                    else None
+                )
+                if not is_authorized_sender(chat_id, from_id):
                     # Тот же принцип, что и для команд: без доверенного
-                    # chat_id callback'и не обрабатываются вовсе.
+                    # отправителя callback'и не обрабатываются вовсе.
                     continue
                 callback_id = str(callback.get("id", ""))
                 message_id = int(cb_message.get("message_id", 0))
@@ -855,12 +804,16 @@ def bot_loop() -> None:
             message = update.get("message") or {}
             text = str(message.get("text") or "")
             chat_id = str((message.get("chat") or {}).get("id", ""))
+            from_user = message.get("from") or {}
+            from_id = (
+                str(from_user.get("id"))
+                if from_user.get("id") is not None
+                else None
+            )
             if not chat_id or not text.startswith("/"):
                 continue
-            if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
-                # Команды принимаем только из доверенного чата. Пустой
-                # TELEGRAM_CHAT_ID означал бы «командовать может кто угодно»,
-                # поэтому без него команды полностью отключены.
+            if not is_authorized_sender(chat_id, from_id):
+                # Команды принимаем только из доверенного чата и от доверенного отправителя.
                 continue
             # Устаревшие команды (например, отправленные, пока парсер лежал)
             # подтверждаем сдвигом offset, но не выполняем: отвечать на

@@ -12,8 +12,6 @@ wheels.db-shm
 bot_state.json
 removed_wheels.json
 
-docs/
-
 # Секреты
 .env
 
@@ -24,6 +22,7 @@ twitch_channels.txt
 
 # Рабочие файлы superpowers subagent-driven-development (лог, брифы, ревью)
 .superpowers/
+docs/superpowers/
 
 # Python / инструменты
 __pycache__/
@@ -31,6 +30,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 *.egg-info/
 build/
 dist/

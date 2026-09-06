@@ -77,8 +77,10 @@ class WordsListKeyboardTests(unittest.TestCase):
     def test_lists_every_word_with_index_based_remove_callback(self):
         with patch.object(registry, "KEYWORDS", ["колесо", "фрибет"]):
             keyboard = menu.words_list_keyboard()
-        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "wd:rm:0")
-        self.assertEqual(keyboard["inline_keyboard"][1][0]["callback_data"], "wd:rm:1")
+        hash0 = menu.word_hash("колесо")
+        hash1 = menu.word_hash("фрибет")
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], f"wd:rm:0:{hash0}")
+        self.assertEqual(keyboard["inline_keyboard"][1][0]["callback_data"], f"wd:rm:1:{hash1}")
 
     def test_section_text_for_empty_list_points_to_add_command(self):
         with patch.object(registry, "KEYWORDS", []):
@@ -287,6 +289,36 @@ class RemoveWordCallbackTests(unittest.TestCase):
             save.assert_called_once_with()
             self.assertIn("колесо", answer.call_args.args[1])
             self.assertEqual(menu.pop_deletion("word"), "колесо")
+
+    def test_removes_word_with_matching_hash(self):
+        h = menu.word_hash("колесо")
+        with patch.object(registry, "KEYWORDS", ["колесо", "фрибет"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text"), \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", f"wd:rm:0:{h}")
+
+            self.assertTrue(handled)
+            self.assertEqual(registry.KEYWORDS, ["фрибет"])
+            save.assert_called_once_with()
+            self.assertIn("колесо", answer.call_args.args[1])
+
+    def test_mismatched_hash_aborts_deletion_and_refreshes_list(self):
+        # Если индекс сместился, хэш не совпадёт — удаление не выполняется
+        with patch.object(registry, "KEYWORDS", ["новое_слово", "колесо"]), \
+             patch.object(registry, "save_keywords_file") as save, \
+             patch.object(menu, "edit_message_text") as edit, \
+             patch.object(menu, "answer_callback_query") as answer:
+            handled = menu.handle_callback("1", 55, "cb1", "wd:rm:0:deadbeef")
+
+            self.assertTrue(handled)
+            self.assertEqual(registry.KEYWORDS, ["новое_слово", "колесо"])
+            save.assert_not_called()
+            self.assertTrue(answer.call_args.kwargs.get("show_alert"))
+            self.assertIn("Список изменился", answer.call_args.args[1])
+            edit.assert_called_once_with(
+                "1", 55, menu.words_section_text(), menu.words_list_keyboard()
+            )
 
     def test_out_of_range_index_does_not_crash_and_refreshes_list(self):
         with patch.object(registry, "KEYWORDS", ["колесо"]), \
