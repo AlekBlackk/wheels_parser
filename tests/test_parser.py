@@ -538,6 +538,42 @@ class ProcessMessageTests(unittest.TestCase):
         self.assertEqual(info["channel"], "demo")
         self.assertEqual(info["msg_id"], "demo/1")
 
+    def test_unknown_wheel_is_not_notified(self):
+        # unknown — «проверить не удалось», а не «колесо живое». Уведомление
+        # уходит только по явному active: сбой сети, протухшая подпись или
+        # заглушка API не повод рассылать ссылку неизвестного состояния.
+        message = make_message("demo/1", "колесо", ["https://betboom.ru/freestream/a"])
+        with patch.object(parser, "precheck_wheel", return_value=("unknown", False, "")):
+            self.assertEqual(self.process(message, {}), [])
+        self.single.assert_not_called()
+
+    def test_unknown_wheel_is_registered_for_retry(self):
+        # Молчание не значит потерю: ссылка ждёт в очереди и придёт сама,
+        # как только статус определится (см. retry_expired_links).
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        with patch.object(parser, "precheck_wheel", return_value=("unknown", False, "")):
+            self.process(message, {})
+
+        self.assertIn(url, parser.PENDING_EXPIRED_RETRY)
+        info = parser.PENDING_EXPIRED_RETRY[url]
+        self.assertEqual(info["channel"], "demo")
+        self.assertEqual(info["msg_id"], "demo/1")
+
+    def test_missing_wheel_is_not_notified_but_stays_for_retry(self):
+        # 404 на странице колеса чаще всего означает выдуманный слаг, но
+        # тот же ответ приходит при блокировке и сбое CDN. Уведомление не
+        # шлём, а ссылку держим в очереди: цена лишнего дешёвого GET
+        # несопоставима с ценой потерянного живого колеса. Мусорные
+        # адреса уйдут из очереди сами по NOTIFY_RETRY_WINDOW_MINUTES.
+        url = "https://betboom.ru/freestream/a"
+        message = make_message("demo/1", "колесо", [url])
+        with patch.object(parser, "precheck_wheel", return_value=("missing", False, "")):
+            self.assertEqual(self.process(message, {}), [])
+
+        self.single.assert_not_called()
+        self.assertIn(url, parser.PENDING_EXPIRED_RETRY)
+
     def test_cooldown_skip_is_logged_for_diagnostics(self):
         # Раньше подавление кулдауном было немым continue: перезапуск
         # колеса на том же URL внутри REALERT_COOLDOWN_MINUTES проходил
@@ -730,19 +766,20 @@ class RetryExpiredLinksTests(unittest.TestCase):
         self.assertFalse(alerts.cooldown_active(self.url, self.now))
 
     def test_retry_recovers_wheel_through_real_expired_cache(self):
-        """Регрессия: precheck_wheel раньше отдавал expired из кэша betboom.py
-        (TTL был = REALERT_COOLDOWN_MINUTES, 30 мин), и ретрай ни разу не
-        доходил до настоящего API, пока кэш не протухал. Здесь precheck_wheel
-        НЕ мокается — используется реальная функция с реальным кэшем, чтобы
+        """Регрессия: precheck_wheel отдавал expired из кэша betboom.py, и
+        ретрай ни разу не доходил до настоящего API, пока кэш не протухал.
+        Здесь precheck_wheel НЕ мокается — используется реальная функция с
+        реальным кэшем (TTL — EXPIRED_CACHE_TTL_SECONDS, 120 c), чтобы
         проверить интеграцию, а не только то, что retry_expired_links передаёт
         нужный флаг."""
         self._seed()
         self.addCleanup(betboom._expired_cache.clear)
-        # Полный ответ API, а не только is_ended: один флаг статусом больше
-        # не считается (заглушка API отдаёт его и для живых колёс, см.
-        # betboom.api_info_to_status).
+        # Полный ответ API, а не только is_ended: заглушку betboom опознаёт по
+        # отсутствию action_uid и отдаёт unknown, так что ответ без него
+        # статусом не считается (см. betboom.api_info_to_status).
         ended = dt.now(timezone.utc) - timedelta(hours=2)
         expired_info = {
+            "action_uid": "action-uid-1",
             "is_ended": True,
             "is_early": False,
             "start_dttm": ended.isoformat().replace("+00:00", "Z"),
@@ -754,6 +791,7 @@ class RetryExpiredLinksTests(unittest.TestCase):
 
         started = dt.now(timezone.utc) - timedelta(minutes=1)
         active_info = {
+            "action_uid": "action-uid-1",
             "is_ended": False,
             "is_early": False,
             "start_dttm": started.isoformat().replace("+00:00", "Z"),

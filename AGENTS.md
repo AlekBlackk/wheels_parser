@@ -71,7 +71,7 @@ config → logging_setup → net/runtime/registry/storage/urls/timeutils
 | `timeutils.py` | Всё время проекта — МСК, независимо от таймзоны сервера. |
 | `keywords.py` | Поиск ключевых слов с учётом русской морфологии. |
 | `alerts.py` | Кулдаун повторных уведомлений, общий для Telegram и Twitch. |
-| `betboom.py` | Клиент API BetBoom: `active` / `soon` / `expired` / `unknown`. Общая функция `process_candidate_wheel`. |
+| `betboom.py` | Клиент API BetBoom: `active` / `soon` / `expired` / `missing` / `unknown`. Уведомление уходит только по подтверждённому `active` — общая функция `process_candidate_wheel`. |
 | `telegram_api.py` | Отправка сообщений в Telegram Bot API. |
 | `telegram_scrape.py` | BeautifulSoup-парсинг HTML публичных Telegram-каналов (`fetch_channel`, превью, форварды). |
 | `channel_health.py` | Здоровье каналов: подсчёт пустых постов, серий сетевых ошибок, алерты об изменении вёрстки. |

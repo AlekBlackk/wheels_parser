@@ -2,13 +2,19 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
-from wheelsparser import betboom, config
+from wheelsparser import alerts, betboom, config
+from wheelsparser.timeutils import now_msk
 
 
 def running_info(**extra):
-    """info запущенного колеса: старт минуту назад, розыгрыш идёт полчаса."""
+    """info запущенного колеса: старт минуту назад, розыгрыш идёт полчаса.
+
+    action_uid обязателен: по его наличию настоящий ответ отличается от
+    заглушки (см. stub_info и betboom.api_info_to_status).
+    """
     started = datetime.now(timezone.utc) - timedelta(minutes=1)
     return {
+        "action_uid": "action-uid-1",
         "is_ended": False,
         "is_early": False,
         "start_dttm": started.isoformat().replace("+00:00", "Z"),
@@ -20,11 +26,12 @@ def running_info(**extra):
 def ended_info(**extra):
     """info завершённого колеса: полный ответ API, а не заглушка.
 
-    is_ended в одиночку статусом больше не считается (см. stub_info), поэтому
-    тестам про expired нужен ответ с окном розыгрыша.
+    is_ended в одиночку статусом не считается (см. stub_info), поэтому
+    тестам про expired нужен ответ с action_uid и окном розыгрыша.
     """
     started = datetime.now(timezone.utc) - timedelta(hours=2)
     return {
+        "action_uid": "action-uid-1",
         "is_ended": True,
         "is_early": False,
         "start_dttm": started.isoformat().replace("+00:00", "Z"),
@@ -36,10 +43,11 @@ def ended_info(**extra):
 def stub_info(**extra):
     """Ответ-заглушка API BetBoom: is_ended=true и ни одного пригодного поля.
 
-    Ровно такой ответ API отдаёт с августа 2026 на ЛЮБОЙ streamer_link,
-    включая живое колесо (проверено на betboom.ru/freestream/vlazhniy) и
-    заведомо несуществующий slug. start_dttm в нём — время запроса, а не
-    старт розыгрыша; duration_min и is_early из ответа исчезли.
+    Опознаётся по отсутствию action_uid/action_id — в настоящем ответе
+    идентификатор действия есть всегда. Такую заглушку API отдаёт на
+    неверный контракт запроса: без заголовка x-action-signature, с чужой
+    подписью или в старом виде {streamer_link}. start_dttm в ней — время
+    запроса, а не старт розыгрыша; duration_min и is_early отсутствуют.
     """
     return {
         "start_dttm": "2026-08-30T14:41:39.968Z",
@@ -79,16 +87,41 @@ def wheel_session(post_response=None):
 
 class ApiStatusTests(unittest.TestCase):
     def test_rejects_stub_info_without_classifiable_fields(self):
-        # is_ended=true в одиночку доверия не заслуживает: заглушка API
-        # отдаёт его для живых колёс, и вера в него означала бы fail-closed
-        # (все находки молча пропадают). unknown уходит fail-open.
+        # is_ended=true в заглушке приходит и для живого колеса, поэтому
+        # верить ему нельзя. Признак заглушки — отсутствие action_uid.
         self.assertEqual(betboom.api_info_to_status(stub_info()), "unknown")
 
-    def test_expires_ended_wheel_with_known_window(self):
-        # Настоящий ответ с окном розыгрыша: is_ended=true по-прежнему
-        # означает «завершилось» — fail-open ничего здесь не смягчает.
+    def test_treats_response_without_action_id_as_stub(self):
+        # Даже правдоподобное окно розыгрыша не делает ответ настоящим:
+        # без идентификатора действия это не info колеса.
         self.assertEqual(
             betboom.api_info_to_status({
+                "is_ended": True,
+                "is_early": False,
+                "start_dttm": "2026-08-30T10:00:00Z",
+                "duration_min": 30,
+            }),
+            "unknown",
+        )
+
+    def test_accepts_response_identified_by_action_id_alone(self):
+        # У части ответов приходит только числовой action_id — этого
+        # достаточно, чтобы считать ответ настоящим.
+        self.assertEqual(
+            betboom.api_info_to_status({
+                "action_id": 2010,
+                "is_ended": True,
+                "is_early": False,
+            }),
+            "expired",
+        )
+
+    def test_expires_ended_wheel_with_known_window(self):
+        # Настоящий ответ с окном розыгрыша: is_ended=true означает
+        # «завершилось».
+        self.assertEqual(
+            betboom.api_info_to_status({
+                "action_uid": "action-uid-1",
                 "is_ended": True,
                 "is_early": False,
                 "start_dttm": "2026-08-30T10:00:00Z",
@@ -98,16 +131,20 @@ class ApiStatusTests(unittest.TestCase):
         )
 
     def test_expires_ended_wheel_with_is_early_flag(self):
-        # Окна нет, но is_early пришёл булевым — значит ответ настоящий,
-        # и is_ended можно верить.
+        # Окна нет, но ответ настоящий (есть action_uid) — is_ended можно
+        # верить.
         self.assertEqual(
-            betboom.api_info_to_status({"is_ended": True, "is_early": False}),
+            betboom.api_info_to_status(
+                {"action_uid": "a", "is_ended": True, "is_early": False}
+            ),
             "expired",
         )
 
     def test_marks_early_wheel_soon(self):
         self.assertEqual(
-            betboom.api_info_to_status({"is_ended": False, "is_early": True}),
+            betboom.api_info_to_status(
+                {"action_uid": "a", "is_ended": False, "is_early": True}
+            ),
             "soon",
         )
 
@@ -121,9 +158,12 @@ class ApiStatusTests(unittest.TestCase):
         # Стример создал колесо, но не запустил: API отдаёт info без
         # start_dttm, на сайте «Акция скоро начнётся» и кнопки участия нет.
         self.assertEqual(
-            betboom.api_info_to_status(
-                {"is_ended": False, "is_early": False, "duration_min": 30}
-            ),
+            betboom.api_info_to_status({
+                "action_uid": "a",
+                "is_ended": False,
+                "is_early": False,
+                "duration_min": 30,
+            }),
             "soon",
         )
 
@@ -131,6 +171,7 @@ class ApiStatusTests(unittest.TestCase):
         start = datetime.now(timezone.utc) + timedelta(minutes=5)
         self.assertEqual(
             betboom.api_info_to_status({
+                "action_uid": "action-uid-1",
                 "is_ended": False,
                 "is_early": False,
                 "start_dttm": start.isoformat().replace("+00:00", "Z"),
@@ -139,12 +180,27 @@ class ApiStatusTests(unittest.TestCase):
             "soon",
         )
 
+    def test_rejects_identified_response_without_any_window(self):
+        # Идентификатор действия есть, но о состоянии колеса ответ молчит:
+        # ни окна розыгрыша, ни булева is_early. Это неудача проверки, а
+        # не «розыгрыш ещё не начался» — иначе /active перестанет считать
+        # такие колёса непроверенными, а счётчик здоровья API сбросится.
+        self.assertEqual(
+            betboom.api_info_to_status(
+                {"action_uid": "a", "is_ended": False, "title": "КОЛЕСО"}
+            ),
+            "unknown",
+        )
+
     def test_rejects_incomplete_info(self):
+        # Ни идентификатора действия, ни окна — ответ не сообщает о
+        # колесе ничего.
         self.assertEqual(betboom.api_info_to_status({"is_ended": False}), "unknown")
 
     def test_expires_wheel_whose_duration_has_passed(self):
         self.assertEqual(
             betboom.api_info_to_status({
+                "action_uid": "action-uid-1",
                 "is_ended": False,
                 "is_early": False,
                 "start_dttm": "2020-01-01T00:00:00Z",
@@ -517,32 +573,38 @@ class ExpiredCacheTests(unittest.TestCase):
         self.assertEqual(active_items, [item])
 
 
-class StubGuardTests(unittest.TestCase):
-    """Аварийный выключатель на случай новой заглушки API (см.
-    config.BETBOOM_STUB_GUARD_THRESHOLD и betboom._apply_stub_guard):
-    подряд идущие expired без единого active/soon — при живом API
-    статистически невероятная серия, поэтому после порога expired
-    считается недоверенным и подменяется на unknown (fail-open).
-    Срабатывание и снятие guard'а пишутся в parser.log один раз;
-    сервисных уведомлений в Telegram по ним намеренно нет.
+class StatusHealthTests(unittest.TestCase):
+    """Детектор «проверка статуса ослепла» (см. betboom._note_status_health).
+
+    Раньше здесь был fail-open: после порога подряд идущих expired все
+    следующие expired подменялись на unknown и уходили в Telegram. Серия
+    expired подряд — штатное состояние (колёса живут часами, а находятся
+    сутками), поэтому гвард исправно рассылал завершившиеся колёса. Теперь
+    он ничего не подменяет: считает подряд идущие unknown и один раз пишет
+    в parser.log, что проверка перестала давать результат. Сервисных
+    уведомлений в Telegram по нему по-прежнему нет.
     """
 
     def setUp(self):
         betboom._signature_cache.clear()
-        betboom._consecutive_expired = 0
-        betboom._stub_guard_active = False
+        betboom._consecutive_unknown = 0
+        betboom._blind_warning_logged = False
+        betboom._consecutive_without_live = 0
+        betboom._silence_warning_logged = False
         self.addCleanup(betboom._signature_cache.clear)
-        self.addCleanup(setattr, betboom, "_consecutive_expired", 0)
-        self.addCleanup(setattr, betboom, "_stub_guard_active", False)
+        self.addCleanup(setattr, betboom, "_consecutive_unknown", 0)
+        self.addCleanup(setattr, betboom, "_blind_warning_logged", False)
+        self.addCleanup(setattr, betboom, "_consecutive_without_live", 0)
+        self.addCleanup(setattr, betboom, "_silence_warning_logged", False)
         patcher = patch("wheelsparser.betboom.log")
         self.log = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def assert_guard_tripped_once(self):
-        """Guard сработал: одна запись в лог, ноль уведомлений в Telegram."""
+    def assert_warned_once(self):
+        """Предупреждение ушло: одна запись в лог, ноль сообщений в Telegram."""
         self.log.error.assert_called_once()
 
-    def assert_guard_silent(self):
+    def assert_silent(self):
         self.log.error.assert_not_called()
 
     def _expired_session(self):
@@ -555,139 +617,86 @@ class StubGuardTests(unittest.TestCase):
             Mock(status_code=200, json=Mock(return_value={"info": running_info()}))
         )
 
+    def _stub_session(self):
+        return wheel_session(
+            Mock(status_code=200, json=Mock(return_value={"info": stub_info()}))
+        )
+
     def _status(self, url: str, session: object) -> str:
         return betboom.precheck_wheel(url, session, use_cache=False)[0]  # type: ignore[arg-type]
 
-    def test_expired_passes_through_below_threshold(self):
+    def test_expired_series_never_warns(self):
+        # Главный регресс: серия expired — норма работы парсера, а не сбой.
         session = self._expired_session()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
-            status = self._status(
-                "https://betboom.ru/freestream/demo", session
-            )
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD * 2):
+            status = self._status(f"https://betboom.ru/freestream/demo{i}", session)
             self.assertEqual(status, "expired")
-        self.assert_guard_silent()
+        self.assert_silent()
 
-    def test_expired_downgrades_to_unknown_at_threshold(self):
-        session = self._expired_session()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
-            self._status("https://betboom.ru/freestream/demo", session)
-        self.assert_guard_silent()
+    def test_unknown_series_warns_once_at_threshold(self):
+        session = self._stub_session()
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            self.assertEqual(
+                self._status(f"https://betboom.ru/freestream/demo{i}", session),
+                "unknown",
+            )
+        self.assert_silent()
 
-        status = self._status(
-            "https://betboom.ru/freestream/demo", session
-        )
+        status = self._status("https://betboom.ru/freestream/last", session)
 
         self.assertEqual(status, "unknown")
-        self.assert_guard_tripped_once()
-        # Дальнейшие expired тоже уходят в unknown, но повторной записи
-        # в лог быть не должно — не спамим при каждой ссылке.
+        self.assert_warned_once()
+        # Статус не подменяется и после срабатывания, а в лог не спамим
+        # при каждой следующей ссылке.
         self.log.error.reset_mock()
-        status = self._status(
-            "https://betboom.ru/freestream/demo", session
+        self.assertEqual(
+            self._status("https://betboom.ru/freestream/more", session), "unknown"
         )
-        self.assertEqual(status, "unknown")
-        self.assert_guard_silent()
+        self.assert_silent()
 
-    def test_unknown_does_not_advance_or_reset_the_counter(self):
-        # Ответ без окна и без is_early — честный unknown (см.
-        # ApiStatusTests.test_rejects_incomplete_info), а не сигнал в
-        # пользу или против гипотезы о заглушке: счётчик не должен ни расти,
-        # ни сбрасываться из-за него.
-        expired_session = self._expired_session()
-        unknown_session = wheel_session(
-            Mock(
-                status_code=200,
-                json=Mock(return_value={"info": {"is_ended": False}}),
-            )
-        )
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
-            self._status(
-                "https://betboom.ru/freestream/demo", expired_session
-            )
-            status = self._status(
-                "https://betboom.ru/freestream/demo2", unknown_session
-            )
-            self.assertEqual(status, "unknown")
-        self.assert_guard_silent()
-
-        status = self._status(
-            "https://betboom.ru/freestream/demo", expired_session
-        )
-        self.assertEqual(status, "unknown")
-        self.assert_guard_tripped_once()
-
-    def test_real_active_or_soon_resets_the_counter(self):
-        expired_session = self._expired_session()
+    def test_any_determined_status_resets_the_counter(self):
+        stub_session = self._stub_session()
         active_session = self._active_session()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
-            self._status(
-                "https://betboom.ru/freestream/demo", expired_session
-            )
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            self._status(f"https://betboom.ru/freestream/demo{i}", stub_session)
 
-        status = self._status(
-            "https://betboom.ru/freestream/other", active_session
+        self.assertEqual(
+            self._status("https://betboom.ru/freestream/live", active_session),
+            "active",
         )
-        self.assertEqual(status, "active")
 
-        # Счётчик сброшен: тот же почти-порог expired снова проходит без
-        # подмены на unknown.
-        self.log.error.reset_mock()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
-            status = self._status(
-                "https://betboom.ru/freestream/demo", expired_session
-            )
-            self.assertEqual(status, "expired")
-        self.assert_guard_silent()
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD - 1):
+            self._status(f"https://betboom.ru/freestream/again{i}", stub_session)
+        self.assert_silent()
 
-    def test_recovery_after_trip_logs_once_and_reopens_guard(self):
-        expired_session = self._expired_session()
+    def test_recovery_is_logged_once_and_rearms_the_warning(self):
+        stub_session = self._stub_session()
         active_session = self._active_session()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
-            self._status(
-                "https://betboom.ru/freestream/demo", expired_session
-            )
-        self.assert_guard_tripped_once()
+        for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
+            self._status(f"https://betboom.ru/freestream/demo{i}", stub_session)
+        self.assert_warned_once()
 
         self.log.error.reset_mock()
         self.log.info.reset_mock()
-        self._status(
-            "https://betboom.ru/freestream/other", active_session
-        )
+        self._status("https://betboom.ru/freestream/live", active_session)
         self.assertTrue(
-            any("подозрение на заглушку снято" in str(c) for c in self.log.info.call_args_list)
+            any(
+                "статус снова определяется" in str(call)
+                for call in self.log.info.call_args_list
+            )
         )
 
-        # Гипотеза может подтвердиться снова: новая серия expired обязана
-        # заново сработать (guard не остаётся навсегда "уже отметил").
+        # Поломка может повториться: новая серия unknown обязана снова
+        # предупредить, а не остаться «уже отмеченной» навсегда.
         self.log.error.reset_mock()
-        for _ in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
-            self._status(
-                "https://betboom.ru/freestream/demo", expired_session
-            )
-        self.assert_guard_tripped_once()
-
-    def test_downgraded_expired_is_not_written_to_expired_cache(self):
-        # precheck_wheel кэширует expired на EXPIRED_CACHE_TTL_SECONDS —
-        # если guard подменил статус на unknown, кэшировать как expired
-        # нельзя: иначе настоящий active потом ждал бы TTL кэша вместо
-        # немедленного обнаружения. Разные URL — реальный сбой заглушки
-        # выглядит как поток РАЗНЫХ колёс подряд, а не повтор одного и
-        # того же адреса (тот уже гасится _expired_cache, см. тест ниже).
-        betboom._expired_cache.clear()
-        self.addCleanup(betboom._expired_cache.clear)
-        session = self._expired_session()
-        last_url = ""
         for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD):
-            last_url = f"https://betboom.ru/freestream/demo{i}"
-            betboom.precheck_wheel(last_url, session)
-
-        self.assertFalse(betboom._is_cached_expired(last_url))
+            self._status(f"https://betboom.ru/freestream/back{i}", stub_session)
+        self.assert_warned_once()
 
     def test_expired_cache_hit_does_not_feed_the_counter(self):
-        # Один и тот же URL, повторно найденный в нескольких постах подряд,
-        # не должен приближать порог: после первого свежего expired
-        # _expired_cache гасит все повторы без обращения к API, и они не
-        # являются новым свидетельством в пользу заглушки.
+        # Повторы одного URL из нескольких постов гасит _expired_cache без
+        # обращения к API — новым свидетельством о здоровье API они не
+        # являются и счётчик двигать не должны.
         betboom._expired_cache.clear()
         self.addCleanup(betboom._expired_cache.clear)
         session = self._expired_session()
@@ -696,26 +705,222 @@ class StubGuardTests(unittest.TestCase):
                 "https://betboom.ru/freestream/demo", session
             )
             self.assertEqual(status, "expired")
-        self.assert_guard_silent()
+        self.assert_silent()
 
-    def test_classify_wheels_does_not_advance_stub_guard(self):
-        # /active обходит старые колёса за сутки, серия expired подряд для него
-        # норма и не должна переводить глобальный гвард в fail-open.
+    def test_long_series_without_live_wheel_warns_once(self):
+        # Заглушку, которая отдаёт правдоподобный expired на каждый адрес,
+        # по форме ответа не отличить: снаружи она выглядит как парсер,
+        # который исправно работает и молчит. Единственный признак —
+        # что живого колеса не видно очень долго.
+        session = self._expired_session()
+        for i in range(betboom.NO_LIVE_WHEEL_THRESHOLD - 1):
+            self._status(f"https://betboom.ru/freestream/demo{i}", session)
+        self.assert_silent()
+
+        self._status("https://betboom.ru/freestream/last", session)
+
+        self.assert_warned_once()
+        self.log.error.reset_mock()
+        self._status("https://betboom.ru/freestream/more", session)
+        self.assert_silent()
+
+    def test_live_wheel_clears_the_silence_suspicion(self):
+        expired_session = self._expired_session()
+        active_session = self._active_session()
+        for i in range(betboom.NO_LIVE_WHEEL_THRESHOLD):
+            self._status(f"https://betboom.ru/freestream/demo{i}", expired_session)
+        self.assert_warned_once()
+
+        self.log.info.reset_mock()
+        self._status("https://betboom.ru/freestream/live", active_session)
+
+        self.assertTrue(
+            any(
+                "подозрение на заглушку снято" in str(call)
+                for call in self.log.info.call_args_list
+            )
+        )
+        self.assertEqual(betboom._consecutive_without_live, 0)
+
+    def test_missing_page_does_not_count_as_a_live_wheel(self):
+        # 404 ничего не говорит о том, способен ли API показать живое
+        # колесо, поэтому подозрение он снимать не должен.
+        missing_session = Mock()
+        missing_session.get.return_value = Mock(status_code=404, text="")
+
+        self._status("https://betboom.ru/freestream/nosuchslug", missing_session)
+
+        self.assertEqual(betboom._consecutive_without_live, 1)
+
+    def test_classify_wheels_does_not_feed_the_counter(self):
+        # /active обходит все колёса за сутки: его сбои не должны говорить
+        # за рабочие потоки (parser, twitch).
         betboom._expired_cache.clear()
         self.addCleanup(betboom._expired_cache.clear)
         items = [
-            {"url": f"https://betboom.ru/freestream/expired{i}"}
+            {"url": f"https://betboom.ru/freestream/stub{i}"}
             for i in range(config.BETBOOM_STUB_GUARD_THRESHOLD + 3)
         ]
-        with patch("wheelsparser.betboom.build_session", side_effect=self._expired_session):
+        with patch(
+            "wheelsparser.betboom.build_session", side_effect=self._stub_session
+        ):
+            active, soon, unknown = betboom.classify_wheels(items)
+
+        self.assertEqual(active, [])
+        self.assertEqual(soon, [])
+        self.assertEqual(unknown, len(items))
+        self.assertEqual(betboom._consecutive_unknown, 0)
+        self.assertFalse(betboom._blind_warning_logged)
+        self.assert_silent()
+
+
+class ClassifyMissingWheelsTests(unittest.TestCase):
+    """Колесо с исчезнувшей страницей не попадает ни в одну корзину /active."""
+
+    def setUp(self):
+        betboom._signature_cache.clear()
+        betboom._expired_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
+        self.addCleanup(betboom._expired_cache.clear)
+
+    def test_missing_wheel_is_neither_active_soon_nor_unknown(self):
+        # unknown_count — это «проверить не удалось», а про удалённое
+        # колесо всё известно: показывать его в /active незачем и
+        # пугать им человека в строке «не удалось проверить» — тоже.
+        def missing_session():
+            session = Mock()
+            session.get.return_value = Mock(status_code=404, text="")
+            return session
+
+        items = [{"url": "https://betboom.ru/freestream/gone"}]
+        with patch(
+            "wheelsparser.betboom.build_session", side_effect=missing_session
+        ):
             active, soon, unknown = betboom.classify_wheels(items)
 
         self.assertEqual(active, [])
         self.assertEqual(soon, [])
         self.assertEqual(unknown, 0)
-        self.assertFalse(betboom._stub_guard_active)
-        self.assertEqual(betboom._consecutive_expired, 0)
-        self.assert_guard_silent()
+
+
+class MissingWheelPageTests(unittest.TestCase):
+    """HTTP 404 на странице колеса — отдельный статус 'missing'.
+
+    Такой адрес не существует (опечатка, обрезанная ссылка, удалённое
+    колесо), и от 'unknown' он отличается тем, что перепроверять его
+    бессмысленно: колесо там не появится.
+    """
+
+    def setUp(self):
+        betboom._signature_cache.clear()
+        self.addCleanup(betboom._signature_cache.clear)
+
+    def _missing_session(self):
+        session = Mock()
+        session.get.return_value = Mock(status_code=404, text="")
+        return session
+
+    def test_precheck_reports_missing_for_404_page(self):
+        status, _referral, ends_at = betboom.precheck_wheel(
+            "https://betboom.ru/freestream/nosuchslug", self._missing_session()
+        )
+
+        self.assertEqual(status, "missing")
+        self.assertEqual(ends_at, "")
+
+    def test_other_page_errors_stay_unknown(self):
+        # 500 или таймаут — временный сбой, а не отсутствие колеса.
+        session = Mock()
+        session.get.return_value = Mock(status_code=500, text="")
+
+        status, *_ = betboom.precheck_wheel(
+            "https://betboom.ru/freestream/slug", session
+        )
+
+        self.assertEqual(status, "unknown")
+
+    def test_missing_page_does_not_reach_the_api(self):
+        session = self._missing_session()
+
+        betboom.precheck_wheel("https://betboom.ru/freestream/nosuchslug", session)
+
+        session.post.assert_not_called()
+
+
+class CandidateGateTests(unittest.TestCase):
+    """Уведомление уходит только по явному 'active' (белый список).
+
+    Прежний чёрный список ("expired", "soon") пропускал в Telegram всё
+    остальное, включая 'unknown' — а тот возникает при любом сбое сети,
+    протухшей подписи и несуществующем адресе. Это и давало поток
+    уведомлений о неактивных колёсах.
+    """
+
+    def setUp(self):
+        alerts.LAST_URL_ALERT.clear()
+        self.addCleanup(alerts.LAST_URL_ALERT.clear)
+
+    def _run(self, status: str):
+        url = f"https://betboom.ru/freestream/{status}slug"
+        return betboom.process_candidate_wheel(
+            url,
+            "channel",
+            now_msk(),
+            precheck_fn=lambda *args, **kwargs: (status, False, ""),
+        )
+
+    def test_active_wheel_is_notified(self):
+        entry, status, retry_needed = self._run("active")
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(status, "active")
+        self.assertFalse(retry_needed)
+
+    def test_unknown_wheel_is_not_notified_but_stays_for_retry(self):
+        entry, status, retry_needed = self._run("unknown")
+
+        self.assertIsNone(entry)
+        self.assertEqual(status, "unknown")
+        self.assertTrue(retry_needed)
+
+    def test_missing_wheel_is_not_notified_but_stays_for_retry(self):
+        # 404 бывает не только у выдуманного слага, но и у живого
+        # колеса при блокировке или сбое CDN — терять такую ссылку
+        # навсегда дороже, чем сходить по ней ещё несколько раз.
+        entry, status, retry_needed = self._run("missing")
+
+        self.assertIsNone(entry)
+        self.assertEqual(status, "missing")
+        self.assertTrue(retry_needed)
+
+    def test_expired_and_soon_stay_silent_and_retryable(self):
+        for status in ("expired", "soon", "unknown", "missing"):
+            with self.subTest(status=status):
+                entry, reported, retry_needed = self._run(status)
+                self.assertIsNone(entry)
+                self.assertEqual(reported, status)
+                self.assertTrue(retry_needed)
+
+    def test_skipped_wheel_releases_the_cooldown_claim(self):
+        # Иначе перезапуск колеса на том же адресе молчал бы весь кулдаун.
+        url = "https://betboom.ru/freestream/unknownslug"
+        self._run("unknown")
+
+        self.assertNotIn(url, alerts.LAST_URL_ALERT)
+
+    def test_disabled_precheck_still_notifies(self):
+        # PRECHECK_WHEELS=false — осознанный отказ от проверки, а не её
+        # неудача: пустой статус проходит белый список.
+        with patch.object(betboom, "PRECHECK_WHEELS", False):
+            entry, status, retry_needed = betboom.process_candidate_wheel(
+                "https://betboom.ru/freestream/anyslug",
+                "channel",
+                now_msk(),
+            )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(status, "")
+        self.assertFalse(retry_needed)
 
 
 class RegressionTests(unittest.TestCase):

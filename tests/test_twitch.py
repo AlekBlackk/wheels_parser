@@ -198,6 +198,40 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.notify.assert_called_once()
 
+    def test_unknown_status_is_not_notified_and_goes_to_retry(self):
+        # 'unknown' — это неудача проверки (сбой сети, протухшая подпись,
+        # заглушка API), а не подтверждение активного колеса. Уведомление
+        # по нему уходить не должно: ссылка ждёт перепроверки в очереди
+        # и придёт сама, когда статус определится (белый список в
+        # betboom.process_candidate_wheel).
+        with patch.object(twitch, "precheck_wheel", return_value=("unknown", False, "")):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+            )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+        self.assertIsNone(alerts.last_alert(WHEEL))
+        (job,) = self.queued_retries()
+        self.assertEqual(job["url"], WHEEL)
+        self.assertEqual(job["channel"], "demo")
+
+    def test_missing_wheel_page_is_not_notified_and_goes_to_retry(self):
+        # 'missing' — страница колеса отдала HTTP 404. Это бывает не только
+        # у выдуманного адреса, но и у живого колеса при блокировке или
+        # сбое CDN, поэтому ссылка не выбрасывается, а уходит на ретрай.
+        with patch.object(twitch, "precheck_wheel", return_value=("missing", False, "")):
+            twitch.handle_twitch_message(
+                "demo", "streamer", {"badges": "broadcaster/1"}, WHEEL
+            )
+
+        self.assertEqual(self.queued(), [])
+        self.notify.assert_not_called()
+        self.assertIsNone(alerts.last_alert(WHEEL))
+        (job,) = self.queued_retries()
+        self.assertEqual(job["url"], WHEEL)
+        self.assertEqual(job["channel"], "demo")
+
     def test_repeated_link_within_cooldown_is_sent_once(self):
         for _ in range(2):
             twitch.handle_twitch_message(

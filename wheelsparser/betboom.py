@@ -1,8 +1,14 @@
 """Клиент API BetBoom: определение статуса колеса без браузера.
 
 Статусы: 'active' (идёт), 'soon' (ещё не начался), 'expired' (завершилось),
-'unknown' (проверить не удалось). 'unknown' трактуется fail-open: лучше
-лишний раз оповестить, чем пропустить живое колесо из-за сбоя API.
+'missing' (страницы колеса нет — HTTP 404), 'unknown' (проверить не удалось).
+
+Уведомление уходит только по подтверждённому 'active' (см.
+process_candidate_wheel). Прежний fail-open — «лучше лишний раз оповестить,
+чем пропустить живое колесо» — на практике означал рассылку по любому сбою
+сети, протухшей подписи и битому адресу, потому что все они дают 'unknown'.
+Неподтверждённая ссылка не теряется: она уходит в очередь перепроверки
+(retries.retry_expired_links) и приходит сама, когда колесо запустится.
 """
 
 from __future__ import annotations
@@ -66,6 +72,16 @@ NEXT_DATA_RE = re.compile(
 )
 
 
+class WheelPageMissing(Exception):
+    """Страницы колеса по такому адресу нет: BetBoom ответил 404.
+
+    Отдельный случай от «проверить не удалось»: слаг не существует
+    (опечатка стримера, обрезанная ссылка, удалённое колесо), и
+    перепроверять его следующие часы бессмысленно — в отличие от сетевого
+    сбоя, который через минуту может пройти.
+    """
+
+
 def _cached_signature(url: str) -> tuple[str, str] | None:
     cutoff = timedelta(seconds=ACTION_SIGNATURE_TTL_SECONDS)
     now = now_msk()
@@ -93,6 +109,8 @@ def _fetch_action_signature(
         return cached
     try:
         response = session.get(url, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise WheelPageMissing(url)
         if response.status_code != 200:
             log.debug("wheel-page: HTTP %s для %s", response.status_code, url)
             return None
@@ -103,6 +121,8 @@ def _fetch_action_signature(
         page_props = json.loads(match.group(1))["props"]["pageProps"]
         action_uid = page_props.get("uid")
         signature = page_props.get("hash")
+    except WheelPageMissing:
+        raise
     except Exception as error:
         log.debug("wheel-page: не удалось разобрать %s: %s", url, error)
         return None
@@ -200,16 +220,25 @@ def api_info_to_status(info: dict[str, Any]) -> str:
     time_status: str | None = None
     start, end = wheel_window(info)
     is_early = info.get("is_early")
-    # Ответ, в котором нет ни окна розыгрыша, ни булева is_early, о колесе
-    # не сообщает ничего — верить одному is_ended в нём нельзя. С августа
-    # 2026 API отдаёт именно такую заглушку («Колесо Фрибетов», prizes [500],
-    # is_ended=true, start_dttm = время запроса) на ЛЮБОЙ streamer_link:
-    # и на живое колесо, и на несуществующий slug, и на пустое тело запроса.
-    # Раньше такой ответ давал expired, и уведомления молча пропадали все до
-    # единого — fail-closed вместо заявленного fail-open. Возвращаем unknown:
-    # лучше лишнее уведомление, чем пропущенное живое колесо. Настоящий
-    # ответ с окном или is_early обрабатывается как прежде, поэтому проверка
-    # сама себя отключит, если BetBoom вернёт поля назад.
+    # Заглушку опознаём по форме ответа: в настоящем info всегда есть
+    # идентификатор действия, а заглушка отдаёт только
+    # {title, prizes, is_ended, start_dttm = время запроса, rules_link}.
+    # Такой ответ о колесе не сообщает ничего — верить его is_ended нельзя.
+    # Прежняя проверка («нет ни окна розыгрыша, ни булева is_early») била
+    # мимо: она задевала и настоящие ответы без start_dttm, и наоборот
+    # пропустила бы заглушку, если та однажды придёт с окном.
+    # Живая проверка 2026-09-06: подписанный запрос (action_uid +
+    # x-action-signature) отдаёт action_uid по каждому адресу, а заглушка
+    # приходит только на неверный контракт — без подписи, с чужой подписью
+    # или в старом виде {streamer_link}.
+    if not (info.get("action_uid") or info.get("action_id")):
+        return "unknown"
+    # Идентификатор действия есть, но ни окна розыгрыша, ни булева
+    # is_early — такой ответ о состоянии колеса всё равно молчит.
+    # Считать его 'soon' (как получалось бы дальше по функции) —
+    # значит выдать неудачу проверки за определённый статус: в /active
+    # колесо перестанет попадать в «не удалось проверить», а счётчик
+    # здоровья API сбросится на пустом ответе.
     if start is None and not isinstance(is_early, bool):
         return "unknown"
     if is_ended:
@@ -227,8 +256,7 @@ def api_info_to_status(info: dict[str, Any]) -> str:
         return "soon"
     if time_status is not None:
         return time_status
-    # Сюда попадают колёса без пригодного start_dttm (is_early здесь уже
-    # заведомо булев — иначе ответ отсеян как заглушка выше). Розыгрыш идёт
+    # Сюда попадают колёса без пригодного start_dttm. Розыгрыш идёт
     # только с момента старта, поэтому у активного колеса время старта есть
     # всегда. Его отсутствие означает «стример создал колесо, но не запустил»:
     # на странице «Акция скоро начнётся» и кнопки участия нет — даже при
@@ -305,60 +333,113 @@ def _cache_expired(url: str) -> None:
         _expired_cache[url] = now_msk()
 
 
-# Аварийный выключатель на случай новой заглушки API BetBoom — см.
-# config.BETBOOM_STUB_GUARD_THRESHOLD. Общий на все URL и все потоки
-# (parser, twitch-worker, пул /active): признак сбоя — подряд идущие
-# expired БЕЗ единого active/soon для разных колёс, а не поведение одного
-# конкретного адреса, поэтому счётчик глобальный, а не per-URL.
-_stub_guard_lock = threading.Lock()
-_consecutive_expired = 0
-_stub_guard_active = False
+# Детектор «проверка статуса ослепла» — см. config.BETBOOM_STUB_GUARD_THRESHOLD.
+# Общий на все URL и все потоки (parser, twitch-worker, пул /active):
+# признак поломки — что статус не определяется НИ для одного колеса, а не
+# поведение одного конкретного адреса, поэтому счётчик глобальный, а не
+# per-URL.
+#
+# Раньше здесь был fail-open: после порога подряд идущих expired все
+# следующие expired подменялись на unknown, а unknown уходил в Telegram —
+# «лучше лишнее уведомление, чем пропущенное колесо». Это и оказалось
+# источником уведомлений о неактивных колёсах: серия expired подряд —
+# штатное состояние (в parser.log 84 expired против 36 active), так что
+# гвард исправно превращал завершившиеся колёса в рассылку. Теперь
+# уведомление уходит только по явному active (см. process_candidate_wheel),
+# и подменять статус незачем — вместо этого гвард пишет в parser.log.
+#
+# Наблюдаемых сбоя два, и признаки у них разные, поэтому счётчика тоже
+# два. Первый — «проверка ослепла»: подряд идущие unknown (заглушка без
+# action_uid, протухшая подпись, блокировка). Второй — «правдоподобная
+# заглушка»: ответы приходят с виду настоящие, но ни одного живого
+# колеса среди них нет. Второй случай проверкой формы ответа не ловится
+# в принципе (см. api_info_to_status), а тихо стоит он ровно так же:
+# ноль уведомлений при работающем парсере. Порог у него выше — серия
+# expired подряд бывает и в норме (ночью, к концу дня), а цена ложной
+# тревоги теперь всего одна строка в логе, не рассылка.
+_status_health_lock = threading.Lock()
+_consecutive_unknown = 0
+_blind_warning_logged = False
+_consecutive_without_live = 0
+_silence_warning_logged = False
+# Столько проверок подряд без единого active/soon считаются поводом
+# заподозрить заглушку, которую не отличить по форме ответа.
+NO_LIVE_WHEEL_THRESHOLD = BETBOOM_STUB_GUARD_THRESHOLD * 5
 
 
-def _apply_stub_guard(status: str) -> str:
-    """Подменяет 'expired' на 'unknown', если заподозрена новая заглушка API.
+def _note_status_health(status: str) -> None:
+    """Отмечает в parser.log, что статус колёс перестал определяться.
 
-    Вызывать только для СВЕЖЕГО результата api_info_to_status (не для
-    ответов из _expired_cache — повтор старого решения ничего не
-    доказывает и не опровергает). 'unknown' счётчик не трогает: сбой сети
-    или отсутствие подписи — это отдельный, уже обработанный fail-open,
-    он не говорит ничего ни за, ни против гипотезы о заглушке.
+    Вызывать только для СВЕЖЕГО результата проверки (не для ответов из
+    _expired_cache — повтор старого решения ничего не доказывает).
+    Статус не меняет: это чистое наблюдение.
 
-    Срабатывание и снятие guard'а только пишутся в parser.log — сервисных
-    уведомлений в Telegram по ним намеренно нет (слишком шумно).
+    Сервисных уведомлений в Telegram по срабатыванию намеренно нет
+    (слишком шумно), сообщения живут только в parser.log.
     """
-    global _consecutive_expired, _stub_guard_active
-    if status not in ("expired", "active", "soon"):
-        return status
-    log_recovery = False
-    log_trip = False
-    with _stub_guard_lock:
-        if status in ("active", "soon"):
-            log_recovery = _stub_guard_active
-            _consecutive_expired = 0
-            _stub_guard_active = False
+    global _consecutive_unknown, _blind_warning_logged
+    global _consecutive_without_live, _silence_warning_logged
+    log_blind = False
+    log_silent = False
+    log_blind_recovery = False
+    log_live_recovery = False
+    blind_streak = 0
+    silent_streak = 0
+    with _status_health_lock:
+        if status == "unknown":
+            _consecutive_unknown += 1
+            blind_streak = _consecutive_unknown
+            if blind_streak >= BETBOOM_STUB_GUARD_THRESHOLD:
+                log_blind = not _blind_warning_logged
+                _blind_warning_logged = True
         else:
-            _consecutive_expired += 1
-            if _consecutive_expired >= BETBOOM_STUB_GUARD_THRESHOLD:
-                log_trip = not _stub_guard_active
-                _stub_guard_active = True
-                status = "unknown"
-    if log_trip:
+            log_blind_recovery = _blind_warning_logged
+            _consecutive_unknown = 0
+            _blind_warning_logged = False
+        # active/soon — единственное доказательство, что API вообще
+        # способен показать живое колесо. expired и missing таким
+        # доказательством не являются: правдоподобная заглушка выглядит
+        # ровно как бесконечная серия expired.
+        if status in ("active", "soon"):
+            log_live_recovery = _silence_warning_logged
+            _consecutive_without_live = 0
+            _silence_warning_logged = False
+        else:
+            _consecutive_without_live += 1
+            silent_streak = _consecutive_without_live
+            if silent_streak >= NO_LIVE_WHEEL_THRESHOLD:
+                log_silent = not _silence_warning_logged
+                _silence_warning_logged = True
+    if log_blind:
         log.error(
-            "%s BetBoom API: %s подряд ответов expired без единого "
-            "active/soon — похоже на новую заглушку API. Дальнейшие "
-            "expired считаются unknown (fail-open) до первого настоящего "
-            "active/soon.",
+            "%s BetBoom API: %s проверок подряд не дали статуса — похоже, "
+            "контракт get-info снова сломан (заглушка, протухшая подпись "
+            "или блокировка). Уведомления о новых колёсах не уходят: они "
+            "требуют явного active. Ссылки ждут в очереди перепроверки.",
             icon("warn"),
-            _consecutive_expired,
+            blind_streak,
         )
-    elif log_recovery:
+    if log_silent:
+        log.error(
+            "%s BetBoom API: %s проверок подряд без единого живого колеса. "
+            "Ночью это норма, но если продолжается днём — возможно, API "
+            "отдаёт правдоподобную заглушку, и парсер молчит зря. Стоит "
+            "открыть любое известное живое колесо руками.",
+            icon("warn"),
+            silent_streak,
+        )
+    if log_blind_recovery:
         log.info(
-            "%s BetBoom API: получен настоящий active/soon — подозрение "
-            "на заглушку снято, expired снова доверяем как обычно.",
+            "%s BetBoom API: статус снова определяется — проверка колёс "
+            "восстановилась.",
             icon("ok"),
         )
-    return status
+    if log_live_recovery:
+        log.info(
+            "%s BetBoom API: снова виден живой розыгрыш — подозрение на "
+            "заглушку снято.",
+            icon("ok"),
+        )
 
 
 def precheck_wheel(
@@ -366,15 +447,16 @@ def precheck_wheel(
     session: requests.Session | None = None,
     post_text: str = "",
     use_cache: bool = True,
-    feed_stub_guard: bool = True,
+    feed_status_health: bool = True,
 ) -> tuple[str, bool, str]:
     """Статус колеса, реф-флаг и дедлайн перед отправкой уведомления.
 
-    Возвращает ('active'/'soon'/'expired'/'unknown', is_referral, ends_at),
-    где ends_at — ISO-строка МСК с концом розыгрыша или "" если срок
-    неизвестен (сбой API или колесо без start_dttm).
-    При 'unknown' уведомление всё равно отправляется (fail-open): лучше
-    лишний раз оповестить, чем пропустить живое колесо из-за сбоя API.
+    Возвращает ('active'/'soon'/'expired'/'missing'/'unknown',
+    is_referral, ends_at), где ends_at — ISO-строка МСК с концом розыгрыша
+    или "" если срок неизвестен (сбой API или колесо без start_dttm).
+    'missing' — страницы колеса по адресу нет (404), 'unknown' — проверить
+    не удалось. Уведомление уходит только по 'active'
+    (см. process_candidate_wheel).
     Реф-флаг при недоступном info считается по slug URL и тексту поста
     (post_text, см. is_referral_wheel).
     По умолчанию используется PARSER_SESSION — вызывающему из другого
@@ -384,11 +466,10 @@ def precheck_wheel(
     перепроверке ссылки, а не в ожидании EXPIRED_CACHE_TTL_SECONDS. Успешный
     результат всё равно пишется в кэш (если снова expired) — другие «хвосты»
     того же URL по-прежнему выигрывают от дедупликации.
-    feed_stub_guard=False исключает результат из счётчика заглушки
-    (см. _apply_stub_guard). Нужен перебору слагов (predictive.py): он
-    намеренно проверяет старые адреса серии, и серия expired подряд для
-    него — норма, а не признак сбоя API. Без этого сканер сам сваливал бы
-    парсер в fail-open на первом же проходе по пропущенным колёсам.
+    feed_status_health=False исключает результат из счётчика «проверка
+    ослепла» (см. _note_status_health). Нужен перебору слагов
+    (predictive.py): он намеренно ходит по чужому адресному пространству,
+    где несуществующие слаги и сбои — норма, а не признак поломки API.
     """
     canonical = normalize_url(url)
     if not canonical:
@@ -401,13 +482,15 @@ def precheck_wheel(
             EXPIRED_CACHE_TTL_SECONDS,
         )
         return "expired", is_referral_wheel(canonical, None, post_text), ""
-    info = fetch_wheel_info(canonical, session or PARSER_SESSION)
-    if info is None:
-        status = "unknown"
+    try:
+        info = fetch_wheel_info(canonical, session or PARSER_SESSION)
+    except WheelPageMissing:
+        info = None
+        status = "missing"
     else:
-        status = api_info_to_status(info)
-        if feed_stub_guard:
-            status = _apply_stub_guard(status)
+        status = "unknown" if info is None else api_info_to_status(info)
+    if feed_status_health:
+        _note_status_health(status)
     referral = is_referral_wheel(canonical, info, post_text)
     log.info(
         "precheck [api]: %s → %s%s",
@@ -418,6 +501,15 @@ def precheck_wheel(
     if status == "expired":
         _cache_expired(canonical)
     return status, referral, wheel_ends_at(info)
+
+
+# Причина пропуска для лога — по статусу прекчека.
+SKIP_REASONS = {
+    "expired": "колесо уже завершилось",
+    "soon": "розыгрыш ещё не начался",
+    "missing": "страницы колеса не существует",
+    "unknown": "статус проверить не удалось",
+}
 
 
 def process_candidate_wheel(
@@ -443,8 +535,13 @@ def process_candidate_wheel(
 
     Возвращает (entry, status, retry_needed):
     - При активном кулдауне: (None, "cooldown", False)
-    - При 'expired' или 'soon': кулдаун сбрасывается, (None, status, True)
-    - При 'active' или 'unknown': (entry, status, False)
+    - При любом статусе кроме 'active': кулдаун сбрасывается,
+      (None, status, True) — ссылку стоит перепроверить позже.
+      'missing' тоже: 404 бывает не только у выдуманного слага, но и
+      у живого колеса при блокировке или сбое CDN, а цена ошибки
+      несимметрична — лишние дешёвые GET против потерянного колеса.
+      Мусорные адреса из очереди уходят сами по NOTIFY_RETRY_WINDOW_MINUTES.
+    - При 'active' и при выключенном PRECHECK_WHEELS: (entry, status, False)
     """
     label = source_label or (f"@{channel}" if source == "telegram" else f"{source} #{channel}")
     if not claim_url_alert(url, now, last_found):
@@ -465,14 +562,26 @@ def process_candidate_wheel(
     else:
         status, referral, ends_at = "", is_referral_wheel(url, None, post_text), ""
 
-    if status in ("expired", "soon"):
+    # Белый список: уведомление уходит только по явному 'active'. Пустой
+    # статус — это выключенный PRECHECK_WHEELS, то есть осознанный отказ от
+    # проверки, а не её неудача, поэтому он проходит.
+    # Раньше здесь стоял чёрный список ("expired", "soon"), и всё
+    # остальное — в первую очередь 'unknown' — уходило в Telegram по
+    # принципу «лучше лишнее уведомление, чем пропущенное колесо». На
+    # практике это и давало поток уведомлений о неактивных колёсах:
+    # 'unknown' возникает при любом сбое сети, протухшей подписи и 404 на
+    # слаг. Молчание надёжнее мусора: неопределившиеся ссылки уходят в
+    # очередь перепроверки (retry_needed) и приходят сами, как только
+    # колесо действительно запустится — см. retries.retry_expired_links,
+    # окно NOTIFY_RETRY_WINDOW_MINUTES.
+    if status not in ("active", ""):
         release_url_alert(url, now)
         log.info(
             "%s Пропускаю %s [%s]: %s (API BetBoom)",
             icon("warn"),
             url,
             label,
-            "колесо уже завершилось" if status == "expired" else "розыгрыш ещё не начался",
+            SKIP_REASONS.get(status, status),
         )
         return None, status, True
 
@@ -498,16 +607,16 @@ def process_candidate_wheel(
 
 def classify_wheels(
     items: list[WheelEntry] | list[dict[str, Any]],
-    feed_stub_guard: bool = False,
+    feed_status_health: bool = False,
 ) -> tuple[list[Any], list[Any], int]:
     """Проверяет список колёс через BetBoom API параллельно.
 
     Использует ThreadPoolExecutor с ACTIVE_CHECK_CONCURRENCY потоками.
-    Кэширует expired-статусы на REALERT_COOLDOWN_MINUTES.
-    feed_stub_guard=False (по умолчанию) исключает результат из счётчика
-    заглушки: /active — массовый обход колёс за сутки, где серия expired
-    подряд — нормальное состояние к вечеру, и она не должна ложно
-    срывать стоп-гвард в fail-open для рабочих потоков (parser, twitch).
+    Кэширует expired-статусы на EXPIRED_CACHE_TTL_SECONDS.
+    feed_status_health=False (по умолчанию) исключает результат из счётчика
+    «проверка ослепла» (см. _note_status_health): /active — массовый обход
+    колёс за сутки, и его сбои не должны говорить за рабочие потоки
+    (parser, twitch).
     Возвращает кортеж (active_items, soon_items, unknown_count):
       - active_items  — колёса со статусом active (в исходном порядке);
       - soon_items    — колёса, розыгрыш которых ещё не начался (soon);
@@ -534,13 +643,15 @@ def classify_wheels(
                 with lock:
                     results.append((index, "expired"))
                 return
-            info = fetch_wheel_info(url, worker_session())
-            if info is None:
-                status = "unknown"
+            try:
+                info = fetch_wheel_info(url, worker_session())
+            except WheelPageMissing:
+                info = None
+                status = "missing"
             else:
-                status = api_info_to_status(info)
-                if feed_stub_guard:
-                    status = _apply_stub_guard(status)
+                status = "unknown" if info is None else api_info_to_status(info)
+            if feed_status_health:
+                _note_status_health(status)
             # Реф-флаг и дедлайн обновляются по свежему info: старые записи
             # (до появления этих полей) получают их прямо при /active.
             if not item.get("referral") and is_referral_wheel(url, info):

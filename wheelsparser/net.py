@@ -11,10 +11,9 @@ requests.Session НЕ потокобезопасна, поэтому одна о
                            :mod:`wheelsparser.twitch`);
     ACTIVE_CHECK_SESSION — фоновый поток active-api: отправка результата /active;
     SUPERVISOR_SESSION   — сервисные уведомления не из своего потока (падение
-                           рабочего потока, см. runtime.supervise; срабатывание
-                           betboom._apply_stub_guard): у сессии нет одного
-                           владельца, поэтому обращения к ней сериализуются
-                           локом SUPERVISOR_LOCK ниже.
+                           рабочего потока, см. runtime.supervise): у сессии
+                           нет одного владельца, поэтому обращения к ней
+                           сериализуются локом SUPERVISOR_LOCK ниже.
 
 Рабочие потоки пулов (обход каналов в parser, проверка колёс в /active)
 берут сессии из :class:`ThreadLocalSession` ниже: та же схема «одна сессия

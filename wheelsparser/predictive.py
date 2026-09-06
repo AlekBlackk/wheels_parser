@@ -211,11 +211,11 @@ def probe_slug(
         return BLOCKED, "", False, ""
     if response.status_code != 200:
         return MISSING, "", False, ""
-    # feed_stub_guard=False: серия expired подряд для сканера — норма
-    # (он намеренно проверяет старые адреса), и его находки не должны
-    # сваливать парсер в fail-open (см. betboom._apply_stub_guard).
+    # feed_status_health=False: сбои и 404 для сканера — норма (он намеренно
+    # ходит по чужому адресному пространству), и его результаты не должны
+    # выдавать поломку API там, где её нет (см. betboom._note_status_health).
     status, referral, ends_at = precheck_wheel(
-        url, session, use_cache=False, feed_stub_guard=False
+        url, session, use_cache=False, feed_status_health=False
     )
     return FOUND, status, referral, ends_at
 

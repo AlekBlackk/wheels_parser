@@ -81,8 +81,12 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 def env_bool(name: str, default: bool = False) -> bool:
+    # Пустое значение — это «не задано», а не False. В env.example ключи
+    # объявлены именно так (`PRECHECK_WHEELS=`), и копия env.example в .env
+    # молча выключала бы прекчек: статус колеса не проверялся бы вовсе, а
+    # уведомления уходили по всем найденным ссылкам подряд.
     value = os.getenv(name)
-    if value is None:
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -128,18 +132,17 @@ REALERT_COOLDOWN_MINUTES = env_int("REALERT_COOLDOWN_MINUTES", 30, 1)
 # всегда обходит этот кэш (precheck_wheel(..., use_cache=False)) — его смысл
 # как раз в честной перепроверке, а не в ожидании TTL.
 EXPIRED_CACHE_TTL_SECONDS = env_int("EXPIRED_CACHE_TTL_SECONDS", 120, 5)
-# Аварийный выключатель на случай новой заглушки API BetBoom (см.
-# betboom-api-stub-breaks-precheck в памяти проекта): прошлая заглушка
-# (is_ended=true без окна розыгрыша и без is_early) уже распознаётся и
-# гасится в api_info_to_status как unknown, но если BetBoom когда-нибудь
-# отдаст заглушку с правдоподобным окном, api_info_to_status честно
-# ответит 'expired' на каждый запрос, и парсер снова замолчит целиком —
-# тем же способом, что уже случался (2321 проверка, 1792 пропуска, 0
-# уведомлений за 35 часов). Единственный внешний признак такого сбоя —
-# подряд идущие expired БЕЗ единого active/soon для разных колёс: у живого
-# API такая серия статистически невероятна. Столько подряд expired
-# переводит все следующие в unknown (fail-open) до первого настоящего
-# active/soon — см. betboom._apply_stub_guard.
+# Столько подряд идущих 'unknown' означают, что проверка статуса ослепла:
+# заглушка API, протухшая подпись, блокировка. У живого API такая серия по
+# разным колёсам невероятна — статус хоть иногда, да определяется.
+# Срабатывание один раз пишется в parser.log (сервисного уведомления в
+# Telegram намеренно нет — слишком шумно), статус при этом НЕ подменяется:
+# уведомление и так требует явного active, а неподтверждённые ссылки ждут
+# в очереди перепроверки — см. betboom._note_status_health.
+# Раньше счётчик считал подряд идущие 'expired' и переводил их в 'unknown'
+# (fail-open). Это оказалось источником уведомлений о завершившихся
+# колёсах: серия expired подряд — штатное состояние парсера, а не признак
+# сбоя API.
 BETBOOM_STUB_GUARD_THRESHOLD = env_int("BETBOOM_STUB_GUARD_THRESHOLD", 8, 2)
 # Проверять колесо через API BetBoom перед отправкой уведомления. Посты
 # нередко содержат «хвосты» — старые href на прошлые колёса, невидимые

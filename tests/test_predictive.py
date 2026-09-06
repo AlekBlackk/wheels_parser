@@ -228,9 +228,10 @@ class ProbeSlugTests(unittest.TestCase):
             predictive.FOUND, "active", True, "срок"
         ))
         # Кэш expired обходится (перебор — честная проверка), а счётчик
-        # заглушки не трогается: серия expired подряд для сканера — норма.
+        # «проверка ослепла» не трогается: несуществующие слаги для сканера
+        # — норма, а не признак сломанного API.
         self.assertEqual(precheck.call_args.kwargs["use_cache"], False)
-        self.assertEqual(precheck.call_args.kwargs["feed_stub_guard"], False)
+        self.assertEqual(precheck.call_args.kwargs["feed_status_health"], False)
 
 
 class NotifyFoundWheelTests(unittest.TestCase):
@@ -607,38 +608,43 @@ class ScanOnceTests(unittest.TestCase):
             self.assertNotIn("empty_scans", frontier["zonertg"])
 
 
-class StubGuardIsolationTests(unittest.TestCase):
-    """Сканер намеренно ходит по старым адресам серии, и серия expired
-    подряд для него — норма. Без исключения из счётчика он сам сваливал бы
-    парсер в fail-open на первом же проходе по пропущенным колёсам."""
+class StatusHealthIsolationTests(unittest.TestCase):
+    """Сканер намеренно ходит по чужому адресному пространству, где
+    несуществующие слаги и сбои — норма, а не признак сломанного API.
+    Поэтому его результаты не должны двигать счётчик «проверка ослепла»
+    (betboom._note_status_health): иначе один проход по пропущенным колёсам
+    сам поднимал бы тревогу за рабочие потоки."""
 
     def setUp(self):
         betboom._signature_cache.clear()
         betboom._expired_cache.clear()
-        betboom._consecutive_expired = 0
-        betboom._stub_guard_active = False
+        betboom._consecutive_unknown = 0
+        betboom._blind_warning_logged = False
         self.addCleanup(betboom._signature_cache.clear)
         self.addCleanup(betboom._expired_cache.clear)
-        self.addCleanup(setattr, betboom, "_consecutive_expired", 0)
-        self.addCleanup(setattr, betboom, "_stub_guard_active", False)
+        self.addCleanup(setattr, betboom, "_consecutive_unknown", 0)
+        self.addCleanup(setattr, betboom, "_blind_warning_logged", False)
 
-    def test_scanner_probes_do_not_advance_the_stub_guard(self):
+    def test_scanner_probes_do_not_advance_the_status_health_counter(self):
         from tests.test_betboom import ended_info, wheel_session
 
+        # action_uid обязателен: без него betboom считает ответ заглушкой
+        # и отдаёт unknown вместо expired.
+        info = ended_info(action_uid="action-uid-1")
         session = wheel_session(
-            Mock(status_code=200, json=Mock(return_value={"info": ended_info()}))
+            Mock(status_code=200, json=Mock(return_value={"info": info}))
         )
         for index in range(betboom.BETBOOM_STUB_GUARD_THRESHOLD * 2):
             status, *_ = betboom.precheck_wheel(
                 f"https://betboom.ru/freestream/probe{index}",
                 session,
                 use_cache=False,
-                feed_stub_guard=False,
+                feed_status_health=False,
             )
             self.assertEqual(status, "expired")
 
-        self.assertEqual(betboom._consecutive_expired, 0)
-        self.assertFalse(betboom._stub_guard_active)
+        self.assertEqual(betboom._consecutive_unknown, 0)
+        self.assertFalse(betboom._blind_warning_logged)
 
 
 if __name__ == "__main__":
