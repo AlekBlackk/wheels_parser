@@ -15,9 +15,9 @@ import requests
 from bs4 import BeautifulSoup
 
 from .config import (
+    CHANNEL_FETCH_TIMEOUT,
     MESSAGES_PER_CHANNEL,
     PREVIEW_CHAR_LIMIT,
-    REQUEST_TIMEOUT,
     USERNAME_RE,
 )
 from .logging_setup import log
@@ -130,11 +130,14 @@ def fetch_channel(
     По умолчанию используется PARSER_SESSION — параллельный опрос каналов
     (см. _fetch_all_channels) передаёт сессию своего воркера, так как
     requests.Session не потокобезопасна.
+
+    Таймаут здесь свой, короткий (CHANNEL_FETCH_TIMEOUT): непрочитанный
+    канал не теряется — его страница будет перечитана в следующем цикле.
     """
     url = f"https://t.me/s/{channel}"
     http_session = session or PARSER_SESSION
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=CHANNEL_FETCH_TIMEOUT)
         if response.status_code == 404:
             log.warning("[%s] канал не найден или приватный (404)", channel)
             return None

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -39,7 +41,7 @@ from .config import (
 from .db import WheelEntry, make_wheel_entry
 from .keywords import find_keywords
 from .logging_setup import log
-from .net import PARSER_SESSION, ThreadLocalSession, build_session
+from .net import PARSER_SESSION, ThreadLocalSession, build_channel_session
 from .predictive import drain_predictive_entries
 from .retries import (
     _RETRY_CANDIDATE_POOL_MULTIPLIER,
@@ -140,14 +142,19 @@ __all__ = [
 
 def _fetch_all_channels(
     channels: list[str],
-) -> list[tuple[str, list[dict[str, Any]] | None]]:
-    """Скачивает страницы всех каналов параллельно, возвращая результаты
-    в исходном порядке channels (не в порядке завершения запросов).
+) -> Generator[tuple[str, list[dict[str, Any]] | None], None, None]:
+    """Скачивает страницы всех каналов параллельно, отдавая результат канала
+    сразу по готовности — в порядке завершения запросов, а не в порядке
+    channels.
+
+    Порядок именно такой, чтобы обработка (а с ней и уведомление) начиналась
+    с первой же скачанной страницы: раньше цикл ждал, пока скачаются все
+    каналы, и один медленный канал задерживал уведомления по всем остальным.
 
     Одновременно выполняется не больше CHANNEL_FETCH_CONCURRENCY запросов.
     Использует ThreadLocalSession, гарантирующий закрытие сессий воркеров (p2-misc-6, p2-dup-3).
     """
-    with ThreadLocalSession(session_factory=build_session) as worker_session:
+    with ThreadLocalSession(session_factory=build_channel_session) as worker_session:
         def fetch(channel: str) -> tuple[str, list[dict[str, Any]] | None]:
             if STOP_EVENT.is_set():
                 return channel, None
@@ -158,7 +165,9 @@ def _fetch_all_channels(
                 return channel, None
 
         with ThreadPoolExecutor(max_workers=CHANNEL_FETCH_CONCURRENCY) as pool:
-            return list(pool.map(fetch, channels))
+            futures = [pool.submit(fetch, channel) for channel in channels]
+            for future in as_completed(futures):
+                yield future.result()
 
 
 def drain_twitch_entries() -> list[WheelEntry]:
@@ -431,34 +440,35 @@ def process_cycle(
     empty_channels: list[str] = []
     checked_channels: list[str] = []
 
-    fetched = [] if STOP_EVENT.is_set() else _fetch_all_channels(channels)
-
-    for channel, messages in fetched:
-        if STOP_EVENT.is_set():
-            break
-        checked_channels.append(channel)
-        if messages is None:
-            failed_channels.append(channel)
-            messages = []
-        elif not messages:
-            empty_channels.append(channel)
-        channel_seen = seen.setdefault(channel, {})
-        channel_baseline = baseline or (not channel_seen and not ALERT_ON_FIRST_RUN)
-        for message in messages:
-            entries = process_message(
-                message, channel, channel_seen, channel_baseline, now, last_found
-            )
-            try:
-                db.insert_entries(entries)
-            except Exception:
-                log.exception(
-                    "%s Не удалось записать находку в базу [@%s, %s]",
-                    icon("warn"),
-                    channel,
-                    message.get("id"),
+    # closing(): при досрочном выходе из цикла (STOP_EVENT) генератор
+    # закрывается явно — иначе сессии воркеров ждали бы сборщика мусора.
+    with closing(_fetch_all_channels(channels)) as fetched:
+        for channel, messages in fetched:
+            if STOP_EVENT.is_set():
+                break
+            checked_channels.append(channel)
+            if messages is None:
+                failed_channels.append(channel)
+                messages = []
+            elif not messages:
+                empty_channels.append(channel)
+            channel_seen = seen.setdefault(channel, {})
+            channel_baseline = baseline or (not channel_seen and not ALERT_ON_FIRST_RUN)
+            for message in messages:
+                entries = process_message(
+                    message, channel, channel_seen, channel_baseline, now, last_found
                 )
-            else:
-                new_entries.extend(entries)
+                try:
+                    db.insert_entries(entries)
+                except Exception:
+                    log.exception(
+                        "%s Не удалось записать находку в базу [@%s, %s]",
+                        icon("warn"),
+                        channel,
+                        message.get("id"),
+                    )
+                else:
+                    new_entries.extend(entries)
 
     update_channel_fail_streaks(checked_channels, failed_channels)
     update_channel_empty_streaks(checked_channels, failed_channels, empty_channels)

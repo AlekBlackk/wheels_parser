@@ -30,7 +30,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .config import HEADERS, REQUEST_TIMEOUT
+from .config import CHANNEL_FETCH_TIMEOUT, HEADERS, REQUEST_TIMEOUT
 
 HTTP_TOTAL_RETRIES = 4
 HTTP_RETRY_AFTER_MAX = 30
@@ -42,9 +42,26 @@ MAX_REQUEST_DURATION = (
     + HTTP_TOTAL_RETRIES * HTTP_RETRY_AFTER_MAX
 )
 
+# Обход каналов повторяет запрос почти без настойчивости: страница
+# t.me/s/<channel> перечитывается каждый CHECK_INTERVAL, поэтому пропустить
+# зависший канал до следующего цикла дешевле, чем ждать его. С общим
+# профилем ретраев один «висящий» канал занимал воркер пула до
+# MAX_REQUEST_DURATION и растягивал весь цикл (в логах — 140с при
+# обычных 6с), задерживая уведомления по всем остальным каналам.
+CHANNEL_TOTAL_RETRIES = 1
+CHANNEL_RETRY_AFTER_MAX = 5
+CHANNEL_BACKOFF_MAX = 2
+MAX_CHANNEL_FETCH_DURATION = (
+    (1 + CHANNEL_TOTAL_RETRIES) * CHANNEL_FETCH_TIMEOUT
+    + CHANNEL_TOTAL_RETRIES * CHANNEL_RETRY_AFTER_MAX
+)
+
 
 def build_session(
     status_forcelist: tuple[int, ...] = (429, 500, 502, 503, 504),
+    total_retries: int = HTTP_TOTAL_RETRIES,
+    retry_after_max: int = HTTP_RETRY_AFTER_MAX,
+    backoff_max: int = HTTP_BACKOFF_MAX,
 ) -> requests.Session:
     # allowed_methods только для GET: повтор POST — это повторная отправка
     # сообщения в Telegram. Ни read-таймаут, ни 5xx/429 не доказывают, что
@@ -53,16 +70,16 @@ def build_session(
     # код видит успех последней попытки). Ошибки соединения urllib3 повторяет
     # независимо от allowed_methods, и это безопасно: запрос не был отправлен.
     retry = Retry(
-        total=HTTP_TOTAL_RETRIES,
-        connect=HTTP_TOTAL_RETRIES,
-        read=HTTP_TOTAL_RETRIES,
-        status=HTTP_TOTAL_RETRIES,
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        status=total_retries,
         backoff_factor=1.0,
         status_forcelist=status_forcelist,
         allowed_methods=frozenset({"GET"}),
         respect_retry_after_header=True,
-        retry_after_max=HTTP_RETRY_AFTER_MAX,
-        backoff_max=HTTP_BACKOFF_MAX,
+        retry_after_max=retry_after_max,
+        backoff_max=backoff_max,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session = requests.Session()
@@ -70,6 +87,15 @@ def build_session(
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def build_channel_session() -> requests.Session:
+    """Сессия воркера, читающего страницы каналов (см. parser._fetch_all_channels)."""
+    return build_session(
+        total_retries=CHANNEL_TOTAL_RETRIES,
+        retry_after_max=CHANNEL_RETRY_AFTER_MAX,
+        backoff_max=CHANNEL_BACKOFF_MAX,
+    )
 
 
 PARSER_SESSION = build_session()

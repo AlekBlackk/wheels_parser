@@ -15,7 +15,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
-from wheelsparser.net import build_session
+from wheelsparser.net import (
+    HTTP_RETRY_AFTER_MAX,
+    HTTP_TOTAL_RETRIES,
+    build_session,
+)
 
 
 class _CountingHandler(BaseHTTPRequestHandler):
@@ -122,6 +126,20 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertEqual(retry.backoff_max, HTTP_BACKOFF_MAX)
         self.assertEqual(retry.backoff_max, 10)
         self.assertGreater(MAX_REQUEST_DURATION, 0)
+
+    def test_channel_session_fails_fast(self):
+        # Обход каналов не должен застревать на одном «висящем» канале:
+        # его страница будет перечитана уже в следующем цикле.
+        from wheelsparser.net import (
+            MAX_CHANNEL_FETCH_DURATION,
+            MAX_REQUEST_DURATION,
+            build_channel_session,
+        )
+
+        retry = build_channel_session().adapters["https://"].max_retries
+        self.assertLess(retry.total, HTTP_TOTAL_RETRIES)
+        self.assertLess(retry.retry_after_max, HTTP_RETRY_AFTER_MAX)
+        self.assertLess(MAX_CHANNEL_FETCH_DURATION, MAX_REQUEST_DURATION)
 
     def test_custom_status_forcelist(self):
         session = build_session(status_forcelist=(500, 502))

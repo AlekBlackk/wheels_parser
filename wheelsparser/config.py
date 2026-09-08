@@ -91,7 +91,14 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, 10)
+# Пауза между обходами каналов. Задержка обнаружения ссылки — это в
+# среднем половина интервала плюс длительность цикла, и при 60с именно
+# ожидание, а не работа, съедало почти всё время: обход 35 каналов
+# укладывается в единицы секунд (см. CHANNEL_FETCH_CONCURRENCY).
+# 10с — нижняя граница, которую выдерживает t.me: это ~3.4 запроса в
+# секунду при 34 каналах (проверено нагрузочным прогоном, 429 не было).
+# Если в parser.log пойдут 429 по каналам — поднимите значение в .env.
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 10, 10)
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 15, 5)
 MESSAGES_PER_CHANNEL = env_int("MESSAGES_PER_CHANNEL", 50, 10)
 # Длина превью текста поста/сообщения в уведомлениях и истории находок
@@ -102,7 +109,12 @@ PREVIEW_CHAR_LIMIT = 200
 # по одному с паузой между ними — при полусотне каналов цикл не укладывался
 # в CHECK_INTERVAL, и реальная задержка обнаружения ссылки росла вместе со
 # списком. У каждого воркера своя requests.Session (см. parser._fetch_all_channels).
-CHANNEL_FETCH_CONCURRENCY = env_int("CHANNEL_FETCH_CONCURRENCY", 4, 1)
+CHANNEL_FETCH_CONCURRENCY = env_int("CHANNEL_FETCH_CONCURRENCY", 8, 1)
+# Таймаут одного запроса страницы канала — короче REQUEST_TIMEOUT: страница
+# t.me отдаётся за доли секунды, а всё, что тянется дольше, дешевле бросить
+# и перечитать в следующем цикле (он начнётся через CHECK_INTERVAL), чем
+# держать воркер пула и задерживать уведомления по остальным каналам.
+CHANNEL_FETCH_TIMEOUT = env_int("CHANNEL_FETCH_TIMEOUT", 8, 2)
 MAX_SEEN_PER_CHANNEL = env_int("MAX_SEEN_PER_CHANNEL", 2000, 100)
 # Максимум записей истории в wheels.db: без лимита база растёт бесконечно.
 # При превышении старые записи удаляются в конце цикла с находкой.

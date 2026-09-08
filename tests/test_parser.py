@@ -1,6 +1,8 @@
 import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import closing
 from datetime import datetime as dt
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -58,7 +60,7 @@ class FetchChannelTests(unittest.TestCase):
             messages = parser.fetch_channel("demo")
 
         get.assert_called_once_with(
-            "https://t.me/s/demo", timeout=config.REQUEST_TIMEOUT
+            "https://t.me/s/demo", timeout=config.CHANNEL_FETCH_TIMEOUT
         )
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["id"], "demo/42")
@@ -1531,10 +1533,29 @@ class FetchChannelsParallelTests(unittest.TestCase):
     def test_fetch_aborts_immediately_when_stop_event_is_set(self):
         with patch.object(parser.STOP_EVENT, "is_set", return_value=True), \
              patch.object(parser, "fetch_channel") as fetch:
-            results = parser._fetch_all_channels(["ch1", "ch2"])
+            results = list(parser._fetch_all_channels(["ch1", "ch2"]))
 
         fetch.assert_not_called()
-        self.assertEqual(results, [("ch1", None), ("ch2", None)])
+        self.assertEqual(sorted(results), [("ch1", None), ("ch2", None)])
+
+    def test_ready_channel_is_yielded_before_slow_one_finishes(self):
+        # Смысл потоковой отдачи: обработка (и уведомление) по быстрому
+        # каналу не ждёт, пока догрузится медленный.
+        released = threading.Event()
+
+        def fetch(channel, session=None):
+            if channel == "slow":
+                released.wait(5)
+            return []
+
+        with patch.object(parser, "fetch_channel", side_effect=fetch):
+            with closing(parser._fetch_all_channels(["slow", "fast"])) as stream:
+                first_channel, _ = next(stream)
+                released.set()
+                rest = [channel for channel, _ in stream]
+
+        self.assertEqual(first_channel, "fast")
+        self.assertEqual(rest, ["slow"])
 
 
 if __name__ == "__main__":
