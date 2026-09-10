@@ -103,7 +103,21 @@ def extract_urls(
     node: Any, text: str, normalizer: Callable[[str], str]
 ) -> list[str]:
     """Ссылки на колёса из HTML-узла и текста, приведённые normalizer."""
-    candidates = [link.get("href", "") for link in node.find_all("a", href=True)]
+    candidates: list[str] = []
+    if node is not None and hasattr(node, "find_all"):
+        for link in node.find_all("a", href=True):
+            if (
+                hasattr(link, "find_parent")
+                and (
+                    link.find_parent(class_="tgme_widget_message_reply") is not None
+                    or link.find_parent(class_="js-message_reply_text") is not None
+                    or link.find_parent(class_="tgme_widget_message_reply_text") is not None
+                )
+            ):
+                continue
+            href = link.get("href", "")
+            if href:
+                candidates.append(href)
     candidates.extend(FREESTREAM_RE.findall(text))
     urls: list[str] = []
     for candidate in candidates:
@@ -133,16 +147,26 @@ def find_shortlink_candidates(node: Any, text: str) -> list[str]:
 
     Источники те же, что у extract_urls: <a href> и голый текст."""
     candidates = find_shortlink_candidates_in_text(text)
-    for link in node.find_all("a", href=True):
-        href = str(link.get("href", "")).strip()
-        match = SHORTENER_CANDIDATE_RE.match(href)
-        if not match:
-            continue
-        normalized = match.group(0)
-        if not _SCHEME_RE.match(normalized):
-            normalized = f"https://{normalized}"
-        if normalized not in candidates:
-            candidates.append(normalized)
+    if node is not None and hasattr(node, "find_all"):
+        for link in node.find_all("a", href=True):
+            if (
+                hasattr(link, "find_parent")
+                and (
+                    link.find_parent(class_="tgme_widget_message_reply") is not None
+                    or link.find_parent(class_="js-message_reply_text") is not None
+                    or link.find_parent(class_="tgme_widget_message_reply_text") is not None
+                )
+            ):
+                continue
+            href = str(link.get("href", "")).strip()
+            match = SHORTENER_CANDIDATE_RE.match(href)
+            if not match:
+                continue
+            normalized = match.group(0)
+            if not _SCHEME_RE.match(normalized):
+                normalized = f"https://{normalized}"
+            if normalized not in candidates:
+                candidates.append(normalized)
     return candidates[:MAX_SHORTLINKS_PER_MESSAGE]
 
 
@@ -273,6 +297,31 @@ def find_urls(node: Any, text: str, session: requests.Session | None = None) -> 
     return urls
 
 
+# Распространённые расширения файлов, которые не являются TLD, но могут
+# ошибочно совпасть с доменами при поиске в сыром тексте (например, photo.png, rules.pdf).
+_COMMON_FILE_EXTENSIONS = frozenset({
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff",
+    "mp4", "mkv", "avi", "mov", "webm", "wav", "mp3", "ogg", "flac",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv",
+    "zip", "rar", "7z", "tar", "gz", "iso", "dmg", "apk", "exe",
+})
+
+
+# Поиск URL (https?://...) и голых доменов в тексте.
+# Домен: последовательность меток (буквы, цифры, дефисы), разделённых точками,
+# и TLD от 2 до 24 латинских букв. Перед доменом не должно быть символов слова,
+# точки, дефиса или @.
+_RAW_URL_OR_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_@.-])"
+    r"(?:https?://)?"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}"
+    r"(?![0-9A-Za-zА-Яа-яЁё_.-])"
+    r"(?::\d+)?"
+    r"(?:/[^\s<>\"'()]*)*",
+    re.IGNORECASE,
+)
+
+
 def find_disallowed_domains(
     node: Any, text: str, session: requests.Session | None = None
 ) -> list[str]:
@@ -285,6 +334,10 @@ def find_disallowed_domains(
     на свой сайт — без проверки такой пост уходил бы алертом наравне с
     настоящим колесом (пример: канал слал колесо и рекламу казино вперемешку,
     оба текста содержат слово «колесо»).
+
+    Ищет ссылки как в тегах <a href>, так и в сыром тексте (text и node.get_text()),
+    так как в цитатах и тексте Telegram ссылки не всегда оборачиваются в <a>.
+    Поддерживает полные URL (https?://...) и голые домены.
     session, если передан, раскрывает известные сокращатели и проверяет уже
     конечный домен (см. resolve_shortlink): сам сокращатель в
     ALLOWED_KEYWORD_DOMAINS попадать не должен — им прикрывается и легитимная
@@ -292,29 +345,83 @@ def find_disallowed_domains(
     напрямую нельзя. Без session или при неудачном раскрытии домен
     сокращателя остаётся как есть — fail-secure: расценивается как
     подозрительный, а не как разрешённый.
-    Смотрим только <a href> — веб-превью t.me/s автоматически превращает
-    голые URL в посте в такие ссылки, отдельный regex по тексту не нужен.
     Порядок сохраняется, дубликаты домена схлопываются.
     """
+    candidates: list[str] = []
+
+    # 1. Ссылки из тегов <a href>
+    if node is not None and hasattr(node, "find_all"):
+        for link in node.find_all("a", href=True):
+            href = str(link.get("href", "")).strip()
+            if href and href not in candidates:
+                candidates.append(href)
+
+    # 2. Поиск URL и доменов в сыром тексте (text и node.get_text())
+    texts_to_scan: list[str] = []
+    if text:
+        texts_to_scan.append(text)
+    if node is not None and hasattr(node, "get_text"):
+        node_text = node.get_text(" ", strip=True)
+        if node_text and node_text != text:
+            texts_to_scan.append(node_text)
+
+    for content in texts_to_scan:
+        for match in _RAW_URL_OR_DOMAIN_RE.finditer(content):
+            raw = match.group(0).strip().rstrip(TRAILING_PUNCTUATION)
+            if raw and raw not in candidates:
+                candidates.append(raw)
+
     domains: list[str] = []
-    for link in node.find_all("a", href=True):
-        href = str(link.get("href", "")).strip()
-        if not href:
+    for candidate in candidates:
+        cleaned = candidate.strip().rstrip(TRAILING_PUNCTUATION)
+        if not cleaned:
             continue
-        normalized_href = normalize_url(href)
-        domain = urlsplit(normalized_href).netloc
-        if domain and session is not None and _is_shortener_domain(domain):
+
+        # Проверяем схему: отсекаем не-веб протоколы (mailto:, tg://, javascript:, tel: и т.п.)
+        if "://" in cleaned:
+            scheme = cleaned.split("://", 1)[0].lower()
+            if scheme not in ("http", "https"):
+                continue
+            url_to_parse = cleaned
+        else:
+            # Для строк без "://" проверяем, не является ли это схемой вроде mailto: или tel:
+            # Схема не содержит точек (в отличие от домена с портом вроде welvura.com:8080)
+            colon_match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", cleaned)
+            if colon_match and "." not in colon_match.group(1):
+                continue
+            url_to_parse = f"https://{cleaned}"
+
+        normalized_href = normalize_url(url_to_parse)
+        parsed = urlsplit(normalized_href)
+        domain = parsed.hostname or parsed.netloc
+        if not domain or "." not in domain:
+            continue
+        domain = domain.lower()
+
+        # Отсекаем совпадения с именами файлов (photo.png, rules.pdf и т.п.),
+        # у которых расширение не является интернет-TLD
+        tld = domain.rsplit(".", 1)[-1]
+        if tld in _COMMON_FILE_EXTENSIONS:
+            continue
+
+        if _is_shortener_domain(domain) and session is not None:
             resolved = resolve_shortlink(normalized_href, session)
             if resolved is not None:
-                domain = urlsplit(resolved).netloc
-        if not domain or domain in domains:
+                resolved_host = urlsplit(resolved).hostname or urlsplit(resolved).netloc
+                if resolved_host and "." in resolved_host:
+                    domain = resolved_host.lower()
+
+        if not domain or "." not in domain or domain in domains:
             continue
+
         if any(
             domain == allowed or domain.endswith(f".{allowed}")
             for allowed in ALLOWED_KEYWORD_DOMAINS
         ):
             continue
+
         domains.append(domain)
+
     return domains
 
 

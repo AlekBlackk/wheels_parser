@@ -187,6 +187,10 @@ USE_ICONS = env_bool("USE_ICONS", True)
 # Верхняя граница длины ключевого слова в /addword — против случайной вставки
 # целого поста вместо слова; не настраивается через env.
 KEYWORD_MAX_LENGTH = 64
+# Требовать контекст BetBoom / фрибета для алертов по ключевым словам без
+# ссылок BetBoom (betboom, бетбум, бб, bb, фрибет, фристрим, freestream).
+# Отсекает посты про автомобильные колёса, мобильные игры и сторонние рулетки.
+KEYWORDS_REQUIRE_BETBOOM_CONTEXT = env_bool("KEYWORDS_REQUIRE_BETBOOM_CONTEXT", True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()

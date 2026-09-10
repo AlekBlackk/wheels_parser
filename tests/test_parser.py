@@ -137,6 +137,105 @@ class FetchChannelTests(unittest.TestCase):
 
         self.assertEqual(messages[0]["forwarded_from"], "origchannel")
 
+    def test_reply_quote_is_excluded_from_message_text(self):
+        # Реальный кейс: пост отвечает на чужое сообщение. Собственный текст
+        # должен браться из .js-message_text, а цитата (.js-message_reply_text)
+        # не должна попадать в text поста.
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/42">
+            <a class="tgme_widget_message_reply" href="https://t.me/demo/40">
+              <div class="tgme_widget_message_author_name">User</div>
+              <div class="tgme_widget_message_text js-message_reply_text">
+                welvura.com крути колесо
+              </div>
+            </a>
+            <div class="tgme_widget_message_text js-message_text">
+              мой собственный ответ
+            </div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response):
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "мой собственный ответ")
+        self.assertNotIn("welvura.com", messages[0]["text"])
+        # При этом домен из цитаты в html-узле выявляется как подозрительный
+        self.assertEqual(messages[0]["disallowed_domains"], ["welvura.com"])
+
+    def test_media_reply_without_caption_has_empty_text(self):
+        # Видеокружок/фото без подписи в ответ на сообщение со скам-ссылкой
+        # (случай со скриншота t.me/amam0610/72524): собственного текста нет,
+        # цитата ответа не должна утекать в text сообщения.
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/43">
+            <a class="tgme_widget_message_reply" href="https://t.me/demo/40">
+              <div class="tgme_widget_message_author_name">User</div>
+              <div class="tgme_widget_message_text js-message_reply_text">
+                welvura.com крути колесо
+              </div>
+            </a>
+            <div class="tgme_widget_message_roundvideo"></div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response):
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "")
+        self.assertEqual(messages[0]["preview_html"], "")
+
+    def test_fallback_for_reply_without_js_classes(self):
+        # Fallback для тестов и разметки без класса js-message_text
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/44">
+            <div class="tgme_widget_message_reply">
+              <div class="tgme_widget_message_text">цитата ответа</div>
+            </div>
+            <div class="tgme_widget_message_text">собственный текст без js-класса</div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response):
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "собственный текст без js-класса")
+
+    def test_fallback_for_media_reply_without_js_classes(self):
+        # Fallback: только цитата внутри ответа, собственного текста нет
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.content = """
+        <div class="tgme_widget_message_wrap">
+          <div class="tgme_widget_message" data-post="demo/45">
+            <div class="tgme_widget_message_reply">
+              <div class="tgme_widget_message_text">цитата ответа</div>
+            </div>
+          </div>
+        </div>
+        """.encode()
+
+        with patch.object(parser.PARSER_SESSION, "get", return_value=response):
+            messages = parser.fetch_channel("demo")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "")
+
     def test_returns_none_instead_of_raising_on_parse_crash(self):
         # Ошибка разбора одного канала (не requests.RequestException) не
         # должна вылетать наружу: у fetch_channel есть свой try/except,
@@ -287,8 +386,16 @@ class SuggestForwardSourceTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return mock
 
-    def _message(self, forwarded_from="origchannel", urls=None, text="колесо"):
-        message = make_message("watched/1", text, urls or [])
+    def _message(
+        self,
+        forwarded_from="origchannel",
+        urls=None,
+        text="колесо",
+        disallowed_domains=(),
+    ):
+        message = make_message(
+            "watched/1", text, urls or [], disallowed_domains=disallowed_domains
+        )
         message["forwarded_from"] = forwarded_from
         return message
 
@@ -306,9 +413,27 @@ class SuggestForwardSourceTests(unittest.TestCase):
         )
 
     def test_suggests_source_of_a_keyword_only_repost(self):
-        parser.suggest_forward_source(self._message(text="розыгрыш колесо"), "watched")
+        parser.suggest_forward_source(
+            self._message(text="розыгрыш колесо на бб"), "watched"
+        )
 
         self.notify.assert_called_once()
+
+    def test_keyword_repost_without_betboom_context_is_not_suggested(self):
+        parser.suggest_forward_source(self._message(text="розыгрыш колесо"), "watched")
+
+        self.notify.assert_not_called()
+
+    def test_keyword_repost_with_disallowed_domain_is_not_suggested(self):
+        parser.suggest_forward_source(
+            self._message(
+                text="розыгрыш колесо на бб",
+                disallowed_domains=["welvura.com"],
+            ),
+            "watched",
+        )
+
+        self.notify.assert_not_called()
 
     def test_post_without_wheel_or_keyword_is_not_suggested(self):
         parser.suggest_forward_source(self._message(text="всем привет"), "watched")
@@ -627,7 +752,7 @@ class ProcessMessageTests(unittest.TestCase):
     def test_keywords_are_checked_only_for_messages_without_links(self):
         with patch.object(registry, "KEYWORDS", ["колесо"]), \
              patch.object(parser, "send_keyword_notification") as notify:
-            self.process(make_message("demo/1", "будет колесо", []), {})
+            self.process(make_message("demo/1", "будет колесо на бб", []), {})
             notify.assert_called_once()
 
             notify.reset_mock()
@@ -662,7 +787,7 @@ class ProcessMessageTests(unittest.TestCase):
         # находка по ключевому слову терялась бы навсегда.
         with patch.object(registry, "KEYWORDS", ["колесо"]), \
              patch.object(parser, "send_keyword_notification", return_value=False):
-            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+            entries = self.process(make_message("demo/1", "будет колесо на бб", []), {})
 
         self.assertEqual(len(entries), 1)
         self.assertFalse(entries[0]["notified"])
@@ -673,9 +798,47 @@ class ProcessMessageTests(unittest.TestCase):
     def test_delivered_keyword_notification_is_marked_notified(self):
         with patch.object(registry, "KEYWORDS", ["колесо"]), \
              patch.object(parser, "send_keyword_notification", return_value=True):
-            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+            entries = self.process(make_message("demo/1", "будет колесо на бб", []), {})
 
         self.assertTrue(entries[0]["notified"])
+
+    def test_keyword_alert_dropped_without_betboom_context(self):
+        # Широкое ключевое слово без упоминания BetBoom / фрибета
+        # должно отсекаться (защита от колёс авто, мобилок, сторонних казино).
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "send_keyword_notification") as notify:
+            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+
+        notify.assert_not_called()
+        self.assertEqual(entries, [])
+
+    def test_keyword_alert_allowed_when_context_disabled(self):
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(config, "KEYWORDS_REQUIRE_BETBOOM_CONTEXT", False), \
+             patch.object(parser, "send_keyword_notification", return_value=True) as notify:
+            entries = self.process(make_message("demo/1", "будет колесо", []), {})
+
+        notify.assert_called_once()
+        self.assertEqual(len(entries), 1)
+
+    def test_keyword_alert_sent_with_betboom_context_variants(self):
+        variants = (
+            "колесо бетбум",
+            "колесо в бетбуме",
+            "колесо фрибет",
+            "колесо фрибеты",
+            "колесо freestream",
+            "колесо фристрим",
+            "колесо bb",
+            "раздача на бб, крутим колесо",
+        )
+        for text in variants:
+            with self.subTest(text=text), \
+                 patch.object(registry, "KEYWORDS", ["колесо"]), \
+                 patch.object(parser, "send_keyword_notification", return_value=True) as notify:
+                entries = self.process(make_message("demo/1", text, []), {})
+                notify.assert_called_once()
+                self.assertEqual(len(entries), 1)
 
     def test_keyword_alert_dropped_for_third_party_link(self):
         # Скам-казино: пост со словом «колесо», но ссылка ведёт не на
@@ -685,7 +848,7 @@ class ProcessMessageTests(unittest.TestCase):
             entries = self.process(
                 make_message(
                     "demo/1",
-                    "Колесо на 60000$",
+                    "Колесо на 60000$ на бб",
                     [],
                     disallowed_domains=["mellehdw.life"],
                 ),
@@ -694,6 +857,24 @@ class ProcessMessageTests(unittest.TestCase):
 
         notify.assert_not_called()
         self.assertEqual(entries, [])
+
+    def test_keyword_alert_sent_when_post_mentions_files(self):
+        # Упоминание файлов (proof.png, rules.pdf) не должно расцениваться как
+        # подозрительные домены и блокировать легитимный алерт
+        with patch.object(registry, "KEYWORDS", ["колесо"]), \
+             patch.object(parser, "send_keyword_notification", return_value=True) as notify:
+            entries = self.process(
+                make_message(
+                    "demo/1",
+                    "Колесо на бб! Скриншот proof.png",
+                    [],
+                    disallowed_domains=[],
+                ),
+                {},
+            )
+
+        notify.assert_called_once()
+        self.assertEqual(len(entries), 1)
 
 
 class RetryExpiredLinksTests(unittest.TestCase):

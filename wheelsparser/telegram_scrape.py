@@ -96,6 +96,64 @@ def message_preview_html(text_element: Any, limit: int = PREVIEW_CHAR_LIMIT) -> 
     return " ".join(parts)
 
 
+_REPLY_TEXT_CLASSES = frozenset({"js-message_reply_text", "tgme_widget_message_reply_text"})
+
+
+def _is_reply_element(element: Any) -> bool:
+    """Проверяет, является ли элемент цитатой ответа или находится внутри неё."""
+    if element is None:
+        return False
+    classes = element.get("class", []) if hasattr(element, "get") else []
+    if isinstance(classes, str):
+        classes = classes.split()
+    if any(cls in _REPLY_TEXT_CLASSES for cls in classes):
+        return True
+    if hasattr(element, "find_parent"):
+        if element.find_parent(class_="tgme_widget_message_reply") is not None:
+            return True
+        for reply_cls in _REPLY_TEXT_CLASSES:
+            if element.find_parent(class_=reply_cls) is not None:
+                return True
+    return False
+
+
+def extract_message_text_element(message: Any) -> Any:
+    """Извлекает элемент с собственным текстом сообщения, исключая цитаты ответов.
+
+    В веб-превью Telegram собственный текст сообщения размещается в
+    .tgme_widget_message_text.js-message_text, а цитата ответа — в
+    .js-message_reply_text внутри .tgme_widget_message_reply.
+    Для медиа-ответов без подписи (видеокружки, фото, стикеры) собственный
+    текст отсутствует (возвращается None), цитата ответа не должна утекать
+    в текст сообщения.
+    Для тестов и нестандартной вёрстки без .js-message_text предусмотрен
+    fallback: берётся .tgme_widget_message_text, не являющийся цитатой ответа
+    и не лежащий внутри .tgme_widget_message_reply.
+    """
+    if message is None:
+        return None
+
+    # Если передан сам элемент текста (например, в тестах или хелперах)
+    if hasattr(message, "get"):
+        classes = message.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if "tgme_widget_message_text" in classes and not _is_reply_element(message):
+            return message
+
+    # 1. Поиск по стандартному классу собственного текста сообщения Telegram
+    for candidate in message.select(".tgme_widget_message_text.js-message_text"):
+        if not _is_reply_element(candidate):
+            return candidate
+
+    # 2. Fallback для тестов и разметки без класса js-message_text
+    for candidate in message.select(".tgme_widget_message_text"):
+        if not _is_reply_element(candidate):
+            return candidate
+
+    return None
+
+
 def forwarded_from_channel(message: Any) -> str:
     """Юзернейм канала-первоисточника репоста или "" если его нет.
 
@@ -166,7 +224,7 @@ def fetch_channel(
             message_id = str(bubble.get("data-post", "")).strip()
             if not message_id:
                 continue
-            text_element = message.select_one(".tgme_widget_message_text")
+            text_element = extract_message_text_element(message)
             text = text_element.get_text(" ", strip=True) if text_element else ""
             # session передаётся дальше, чтобы раскрыть известные
             # сокращатели (vk.cc и т.п., см. urls.resolve_shortlink) —

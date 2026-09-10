@@ -160,6 +160,37 @@ class FindUrlsTests(unittest.TestCase):
             [],
         )
 
+    def test_extract_urls_ignores_links_in_reply_quote(self):
+        # Ссылки из цитируемого сообщения не должны приписываться текущему посту
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_wrap">'
+            '<div class="tgme_widget_message_reply">'
+            '<a href="https://betboom.ru/freestream/old_reply">старое колесо</a>'
+            '</div>'
+            '<div class="tgme_widget_message_text">'
+            '<a href="https://betboom.ru/freestream/current_post">настоящее колесо</a>'
+            '</div>'
+            '</div>',
+            "html.parser",
+        )
+        found = urls.extract_urls(html, "текст поста", urls.normalize_url)
+        self.assertEqual(found, ["https://betboom.ru/freestream/current_post"])
+
+    def test_find_shortlink_candidates_ignores_links_in_reply_quote(self):
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_wrap">'
+            '<div class="tgme_widget_message_reply">'
+            '<a href="https://vk.cc/oldReply">сокращатель в цитате</a>'
+            '</div>'
+            '<div class="tgme_widget_message_text">'
+            '<a href="https://vk.cc/newPost">сокращатель в тексте</a>'
+            '</div>'
+            '</div>',
+            "html.parser",
+        )
+        candidates = urls.find_shortlink_candidates(html, "текст поста")
+        self.assertEqual(candidates, ["https://vk.cc/newPost"])
+
 
 class FindDisallowedDomainsTests(unittest.TestCase):
     def test_allows_betboom_and_telegram_links(self):
@@ -205,6 +236,77 @@ class FindDisallowedDomainsTests(unittest.TestCase):
         html = BeautifulSoup("<div>просто текст про колесо</div>", "html.parser")
         self.assertEqual(
             urls.find_disallowed_domains(html, html.get_text(" ", strip=True)), []
+        )
+
+    def test_flags_bare_domain_in_raw_text(self):
+        # Голый домен без тега <a> (например, упоминание welvura.com)
+        html = BeautifulSoup("<div>Колесо на welvura.com крути</div>", "html.parser")
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["welvura.com"],
+        )
+
+    def test_flags_full_url_in_raw_text_without_anchor_tag(self):
+        html = BeautifulSoup(
+            "<div>Колесо https://welvura.live/bonus</div>", "html.parser"
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["welvura.live"],
+        )
+
+    def test_allows_allowed_domains_in_raw_text(self):
+        html = BeautifulSoup(
+            "<div>Колесо t.me/channel vk.com/group twitch.tv/streamer betboom.ru</div>",
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            [],
+        )
+
+    def test_flags_disallowed_domain_in_reply_quote(self):
+        # Домен в цитате ответа, даже если собственный текст чистый
+        html = BeautifulSoup(
+            '<div class="tgme_widget_message_wrap">'
+            '<div class="tgme_widget_message_reply">welvura.com крути колесо</div>'
+            '<div class="tgme_widget_message_text">мой ответ</div>'
+            '</div>',
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, "мой ответ"),
+            ["welvura.com"],
+        )
+
+    def test_strips_trailing_punctuation_from_domain_in_text(self):
+        html = BeautifulSoup(
+            "<div>Заходи на welvura.com! Или (welvura.com), крути...</div>",
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["welvura.com"],
+        )
+
+    def test_flags_domain_with_port(self):
+        # Домен с портом (welvura.com:8080) не должен теряться из-за двоеточия
+        html = BeautifulSoup("<div>Колесо на welvura.com:8080 крути</div>", "html.parser")
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            ["welvura.com"],
+        )
+
+    def test_does_not_flag_common_file_extensions_in_text(self):
+        # Имена файлов (proof.png, rules.pdf и т.п.) в тексте не должны приниматься за домены
+        html = BeautifulSoup(
+            "<div>Колесо на бб! Скриншот proof.png, видео clip.mp4, "
+            "правила rules.pdf, info.txt</div>",
+            "html.parser",
+        )
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True)),
+            [],
         )
 
 
@@ -434,6 +536,26 @@ class FindDisallowedDomainsShortlinkIntegrationTests(unittest.TestCase):
         self.assertEqual(
             urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
             ["vk.cc"],
+        )
+
+    def test_shortlink_in_raw_text_resolving_to_scam_is_flagged(self):
+        html = BeautifulSoup(
+            "<div>Колесо на 60000$ vk.cc/aB3xZ тут</div>", "html.parser"
+        )
+        session = redirecting_session("https://mellehdw.life/?open=register")
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
+            ["mellehdw.life"],
+        )
+
+    def test_shortlink_in_raw_text_resolving_to_legit_is_allowed(self):
+        html = BeautifulSoup("<div>Колесо тут vk.cc/aB3xZ</div>", "html.parser")
+        session = redirecting_session("https://vk.com/somepost")
+
+        self.assertEqual(
+            urls.find_disallowed_domains(html, html.get_text(" ", strip=True), session),
+            [],
         )
 
 

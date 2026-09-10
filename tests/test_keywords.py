@@ -43,5 +43,95 @@ class KeywordMatchingTests(unittest.TestCase):
         self.assertEqual(self.find(""), [])
 
 
+class BetboomContextTests(unittest.TestCase):
+    def test_positive_betboom_mentions(self):
+        cases = (
+            "будет betboom колесо",
+            "Сегодня BetBoom запустил раздачу",
+            "Заходите в BETBOOM",
+            "Ссылка на bet-boom",
+            "Раздача в bet boom",
+            "колесо в бетбум",
+            "выиграл в бетбуме фрибет",
+            "новости бетбума",
+            "на бет-бум колесо",
+            "в бет бум раздача",
+            "колесо в бэтбум",
+            "выиграл в бэтбуме фрибет",
+            "новости бэтбума",
+            "на бэт-бум колесо",
+            "в бэт бум раздача",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(keywords.has_betboom_context(text))
+
+    def test_positive_freebet_mentions(self):
+        cases = (
+            "раздаём фрибет за колесо",
+            "получи фрибеты",
+            "много фрибетов",
+            "бонус фрибетом",
+            "забирайте фрибетами",
+            "freebet wheel",
+            "get freebets",
+            "free-bet promo",
+            "free bet bonus",
+            "раздача фри бет",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(keywords.has_betboom_context(text))
+
+    def test_positive_freestream_mentions(self):
+        cases = (
+            "запущен фристрим",
+            "в фристриме новое колесо",
+            "freestream wheel",
+            "free-stream link",
+            "free stream online",
+            "фри стрим на канале",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(keywords.has_betboom_context(text))
+
+    def test_positive_abbreviation_mentions(self):
+        cases = (
+            "раздача на бб",
+            "колесо на bb",
+            "крутим (бб)",
+            "раздача «бб»",
+            "#бб колесо",
+            "заходи на бб!",
+            "колесо на ббшке",
+            "раздача на bbшке",
+            "колесо на ббхе",
+            "выиграл на ббшку",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(keywords.has_betboom_context(text))
+
+    def test_negative_unrelated_texts(self):
+        cases = (
+            "поменял колесо на машине",
+            "новое колесо удачи в игре",
+            "крутите колесо на welvura.com",
+            "бобёр построил плотину",
+            "я люблю эту песню",
+            "идём на bbq сегодня",
+            "смотрим bbc news",
+            "версия subb обновлена",
+            "новое хобби",
+            "суббота выходной",
+            "просто текст без ключевых слов",
+            "",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertFalse(keywords.has_betboom_context(text))
+
+
 if __name__ == "__main__":
     unittest.main()

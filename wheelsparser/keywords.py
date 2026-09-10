@@ -68,3 +68,29 @@ def find_keywords(text: str) -> list[str]:
         for keyword in registry.keywords_snapshot()
         if keyword_regex(keyword).search(normalized)
     ]
+
+
+# Регэксп для проверки контекста BetBoom / фрибета в тексте поста.
+# Ищет упоминания BetBoom (betboom, бетбум/бэтбум с окончаниями), фрибета (фрибет, freebet),
+# фристрима (фристрим, freestream) и сокращений (бб/ббшка, bb/bbшка).
+_BETBOOM_CONTEXT_RE = re.compile(
+    r"(?<![0-9a-zа-я_])(?:"
+    r"bet[-\s]?boom|б[еэ]т[-\s]?бум(?:[а-я]+)?"
+    r"|free[-\s]?bets?|фри[-\s]?бет(?:[а-я]+)?"
+    r"|free[-\s]?streams?|фри[-\s]?стрим(?:[а-я]+)?"
+    r"|бб(?:[а-я]+)?|bb(?:[а-я]+)?"
+    r")(?![0-9a-zа-я_])"
+)
+
+
+def has_betboom_context(text: str) -> bool:
+    """Проверяет наличие контекста BetBoom / фрибета в тексте сообщения.
+
+    Ищет упоминания: betboom, бетбум, бб, bb, фрибет, фристрим, freestream.
+    Используется для фильтрации ложных срабатываний по широким ключевым
+    словам (например, «колесо» в отрыве от ссылок BetBoom).
+    """
+    if not text:
+        return False
+    normalized = normalize_for_match(text)
+    return bool(_BETBOOM_CONTEXT_RE.search(normalized))

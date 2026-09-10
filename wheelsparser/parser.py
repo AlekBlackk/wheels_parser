@@ -10,7 +10,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import db, menu, registry
+from . import config, db, menu, registry
 from .betboom import (
     precheck_wheel,
     process_candidate_wheel,
@@ -39,7 +39,7 @@ from .config import (
     icon,
 )
 from .db import WheelEntry, make_wheel_entry
-from .keywords import find_keywords
+from .keywords import find_keywords, has_betboom_context
 from .logging_setup import log
 from .net import PARSER_SESSION, ThreadLocalSession, build_channel_session
 from .predictive import drain_predictive_entries
@@ -72,6 +72,7 @@ from .telegram_api import (
 from .telegram_scrape import (
     _TELEGRAM_HOSTS,
     FORWARD_SOURCE_SELECTOR,
+    extract_message_text_element,
     fetch_channel,
     forwarded_from_channel,
     message_preview_html,
@@ -112,11 +113,13 @@ __all__ = [
     "collect_pending_entries",
     "drain_twitch_entries",
     "drain_twitch_retry_registrations",
+    "extract_message_text_element",
     "extract_urls",
     "fetch_channel",
     "find_disallowed_domains",
     "find_urls",
     "forwarded_from_channel",
+    "has_betboom_context",
     "index_last_found",
     "is_betboom_host",
     "legacy_normalize_url",
@@ -320,6 +323,18 @@ def notify_keywords(message: dict[str, Any], channel: str) -> list[WheelEntry]:
             ", ".join(disallowed_domains),
         )
         return []
+    if config.KEYWORDS_REQUIRE_BETBOOM_CONTEXT:
+        has_context = has_betboom_context(message["text"]) or any(
+            is_betboom_host(u) for u in message.get("urls", [])
+        )
+        if not has_context:
+            log.info(
+                "%s Пропускаю ключевые слова (%s) [@%s]: нет контекста BetBoom / фрибета",
+                icon("warn"),
+                ", ".join(matched),
+                channel,
+            )
+            return []
     entry = make_wheel_entry(
         found_at=now_msk().isoformat(timespec="seconds"),
         channel=channel,
@@ -354,7 +369,13 @@ def suggest_forward_source(message: dict[str, Any], channel: str) -> None:
     monitored = {name.casefold() for name in registry.channels_snapshot()}
     if source_key in monitored:
         return
-    if not (message["urls"] or find_keywords(message["text"])):
+    has_keywords = bool(find_keywords(message["text"]))
+    if not message["urls"] and has_keywords:
+        if message.get("disallowed_domains"):
+            return
+        if config.KEYWORDS_REQUIRE_BETBOOM_CONTEXT and not has_betboom_context(message["text"]):
+            return
+    if not (message["urls"] or has_keywords):
         return
     if not mark_channel_suggested(source_key):
         return
