@@ -25,13 +25,19 @@ class SplitSlugTests(unittest.TestCase):
         prefix, _index, _width = predictive.split_slug("LOLLY12")
         self.assertEqual(prefix, "LOLLY")
 
-    def test_slug_without_number_is_not_a_series(self):
-        self.assertIsNone(predictive.split_slug("aunkereref"))
-        self.assertIsNone(predictive.split_slug("same"))
+    def test_slug_without_number_is_the_base_of_a_series(self):
+        # Половина слагов в истории — без числового хвоста (jester, nix,
+        # solo, bolt). Раньше они серию не заводили вообще, и следующие
+        # адреса стримера не проверялись никогда.
+        self.assertEqual(predictive.split_slug("nix"), ("nix", 0, 0))
+        self.assertEqual(predictive.split_slug("aunkereref"), ("aunkereref", 0, 0))
 
     def test_slug_of_only_digits_is_not_a_series(self):
         # Префикс обязан быть непустым: иначе «1234» дало бы серию без имени.
         self.assertIsNone(predictive.split_slug("1234"))
+
+    def test_empty_slug_is_not_a_series(self):
+        self.assertIsNone(predictive.split_slug(""))
 
 
 class BuildSlugTests(unittest.TestCase):
@@ -45,8 +51,13 @@ class BuildSlugTests(unittest.TestCase):
     def test_unpadded_series_grows_into_two_digits(self):
         self.assertEqual(predictive.build_slug("zonertg", 10, 1), "zonertg10")
 
+    def test_zero_width_builds_the_bare_address(self):
+        # Голый адрес серии — не выдумка: zonertg и over существуют и
+        # переиспользуются наравне с нумерованными.
+        self.assertEqual(predictive.build_slug("zonertg", 0, 0), "zonertg")
+
     def test_round_trip_through_split(self):
-        for slug in ("zonertg4", "LOLLY08", "LOLLY13", "zonertg10"):
+        for slug in ("zonertg4", "LOLLY08", "LOLLY13", "zonertg10", "nix"):
             prefix, index, width = predictive.split_slug(slug)
             self.assertEqual(predictive.build_slug(prefix, index, width), slug)
 
@@ -85,10 +96,19 @@ class FrontierFromHistoryTests(unittest.TestCase):
         self.assertEqual(sorted(frontier), ["LOLLY", "zonertg"])
         self.assertEqual(frontier["LOLLY"]["width"], 2)
 
-    def test_ignores_slugs_without_a_number(self):
-        self._store("aunkereref")
+    def test_slug_without_a_number_seeds_the_series_at_its_base(self):
+        # 52 адреса из 212 в проде — без числа. Раньше такой стример
+        # не заводил серию вовсе, и nix1/bolt1 не проверялись никогда.
+        self._store("nix")
 
-        self.assertEqual(predictive.frontier_from_history(), {})
+        frontier = predictive.frontier_from_history()
+
+        self.assertEqual(frontier["nix"], {"index": 0, "width": 0, "pending": []})
+
+    def test_numbered_find_wins_over_the_base_of_the_same_series(self):
+        self._store("nix", "nix3")
+
+        self.assertEqual(predictive.frontier_from_history()["nix"]["index"], 3)
 
     def test_validates_prefix_regex(self):
         # 1-буквенный префикс или недопустимые символы отбрасываются
@@ -606,6 +626,43 @@ class ScanOnceTests(unittest.TestCase):
             predictive.scan_once(predictive.Budget(10), self.session)
             frontier = storage.load_streamer_frontier()
             self.assertNotIn("empty_scans", frontier["zonertg"])
+
+
+class ScanCycleTests(unittest.TestCase):
+    """Порядок трат бюджета: наблюдатель за известными адресами идёт
+    первым — он покрывает 73% колёс, разведка вперёд остальные 27%."""
+
+    def test_watcher_runs_before_the_forward_scan(self):
+        order = []
+        with patch.object(predictive, "REARM_ENABLED", True), \
+             patch.object(
+                 predictive.rearm, "watch_once",
+                 side_effect=lambda *a, **k: order.append("watch") or True,
+             ), \
+             patch.object(
+                 predictive, "scan_once",
+                 side_effect=lambda *a, **k: order.append("scan") or True,
+             ):
+            predictive.scan_cycle(predictive.Budget(100), Mock())
+
+        self.assertEqual(order, ["watch", "scan"])
+
+    def test_blocked_watcher_skips_the_forward_scan(self):
+        with patch.object(predictive, "REARM_ENABLED", True), \
+             patch.object(predictive.rearm, "watch_once", return_value=False), \
+             patch.object(predictive, "scan_once") as scan:
+            allowed = predictive.scan_cycle(predictive.Budget(100), Mock())
+
+        self.assertFalse(allowed)
+        scan.assert_not_called()
+
+    def test_watcher_can_be_switched_off(self):
+        with patch.object(predictive, "REARM_ENABLED", False), \
+             patch.object(predictive.rearm, "watch_once") as watch, \
+             patch.object(predictive, "scan_once", return_value=True):
+            predictive.scan_cycle(predictive.Budget(100), Mock())
+
+        watch.assert_not_called()
 
 
 class StatusHealthIsolationTests(unittest.TestCase):

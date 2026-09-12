@@ -52,6 +52,9 @@ SUGGESTED_CHANNELS_FILE = DATA_DIR / "suggested_channels.json"
 STREAMERS_FILE = DATA_DIR / "streamers.json"
 # Серии слагов, отправленные в отставку после исчерпания пустых проверок.
 RETIRED_STREAMERS_FILE = DATA_DIR / "retired_streamers.json"
+# Последний известный action_uid по каждому наблюдаемому адресу колеса.
+# Смена uid на том же адресе = стартовал новый розыгрыш (см. rearm.py).
+WATCHED_WHEELS_FILE = DATA_DIR / "watched_wheels.json"
 LOG_FILE = DATA_DIR / "parser.log"
 LOCK_FILE = DATA_DIR / "wheelsparser.lock"
 
@@ -260,7 +263,7 @@ PREDICTIVE_REQUEST_DELAY_SECONDS = env_int("PREDICTIVE_REQUEST_DELAY_SECONDS", 2
 PREDICTIVE_LOOKAHEAD = env_int("PREDICTIVE_LOOKAHEAD", 3, 1)
 # Потолок запросов в сутки (МСК). Страховка от разрастания: серий может
 # стать много, и без лимита сканер незаметно превратился бы в долбёжку.
-PREDICTIVE_DAILY_BUDGET = env_int("PREDICTIVE_DAILY_BUDGET", 500, 10)
+PREDICTIVE_DAILY_BUDGET = env_int("PREDICTIVE_DAILY_BUDGET", 3000, 10)
 # Пауза после явного отказа (403/429) — сканер замолкает, а админ получает
 # уведомление. Бан по IP убил бы весь парсер, а не только сканер.
 PREDICTIVE_BLOCK_COOLDOWN_MINUTES = env_int("PREDICTIVE_BLOCK_COOLDOWN_MINUTES", 60, 5)
@@ -268,6 +271,19 @@ PREDICTIVE_BLOCK_COOLDOWN_MINUTES = env_int("PREDICTIVE_BLOCK_COOLDOWN_MINUTES",
 # нового колеса), после которого серия считается завершённой и удаляется
 # из streamers.json, освобождая бюджет сканера.
 PREDICTIVE_MAX_EMPTY_SCANS = env_int("PREDICTIVE_MAX_EMPTY_SCANS", 8, 1)
+# Сколько суток серия остаётся в отставке, прежде чем вернуться в перебор.
+# Отставка навсегда была ошибкой: стример, притихший на неделю, исчезал
+# из сканера окончательно — на проде так потерялось 29 серий из 35.
+PREDICTIVE_RETIRE_DAYS = env_int("PREDICTIVE_RETIRE_DAYS", 7, 1)
+# Наблюдатель за известными адресами (rearm.py). На проде 73% колёс — это
+# перезапуск адреса, который уже есть в истории, а не новый адрес; перебор
+# вперёд до таких колёс не достаёт принципиально.
+REARM_ENABLED = env_bool("REARM_ENABLED", True)
+# Глубина окна истории, из которого берутся наблюдаемые адреса, суток.
+REARM_WINDOW_DAYS = env_int("REARM_WINDOW_DAYS", 30, 1)
+# Сколько адресов максимум обходить за проход. Потолок на случай, если
+# история разрастётся: бюджет тратится сверху вниз по «горячести».
+REARM_MAX_ADDRESSES = env_int("REARM_MAX_ADDRESSES", 120, 1)
 # Допустимый формат префикса серии слагов: от 2 до 32 символов (латиница,
 # цифры, дефис, подчёркивание). Защищает frontier от мусора и опечаток.
 PREDICTIVE_PREFIX_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")

@@ -43,6 +43,7 @@ from .keywords import find_keywords, has_betboom_context
 from .logging_setup import log
 from .net import PARSER_SESSION, ThreadLocalSession, build_channel_session
 from .predictive import drain_predictive_entries
+from .rearm import drain_rearm_entries
 from .retries import (
     _RETRY_CANDIDATE_POOL_MULTIPLIER,
     PENDING_EXPIRED_RETRY,
@@ -433,7 +434,9 @@ def process_cycle(
     channels = registry.channels_snapshot()
     log.info("%s Начинаю проверку · каналов %s", icon("scan"), len(channels))
     now = now_msk()
-    twitch_entries = drain_twitch_entries() + drain_predictive_entries()
+    twitch_entries = (
+        drain_twitch_entries() + drain_predictive_entries() + drain_rearm_entries()
+    )
     drain_twitch_retry_registrations()
     try:
         db.insert_entries(twitch_entries)

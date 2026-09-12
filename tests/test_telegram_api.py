@@ -176,6 +176,26 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("https://betboom.ru/freestream/a (колесо активно)", text)
         self.assertIn("https://betboom.ru/freestream/b (уже завершилось)", text)
 
+    def test_rearm_notification_says_it_is_a_restart_not_a_post(self):
+        # Наблюдатель ловит смену action_uid на самой странице колеса:
+        # ссылку никто не публиковал, канала и поста у находки нет.
+        session = fake_session()
+        entry = {
+            "url": "https://betboom.ru/freestream/over",
+            "found_at": "2026-09-12T19:10:00+03:00",
+            "channel": "over",
+            "source": "rearm",
+            "message_url": "https://betboom.ru/freestream/over",
+            "status": "active",
+        }
+
+        telegram_api.send_telegram_notification(entry, session)
+
+        text = self.sent_text(session)
+        self.assertIn("Перезапуск", text)
+        self.assertNotIn("Канал: @", text)
+        self.assertNotIn("Пост:", text)
+
     def test_predictive_notification_does_not_invent_a_channel_or_post(self):
         # У находки сканера нет ни канала, ни поста: адрес угадан по серии.
         # «Канал: @zonertg / Пост: <url>» было бы враньём.

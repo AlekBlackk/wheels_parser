@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -312,6 +313,27 @@ class StreamerFrontierTests(TempDirTestCase):
             self.assertEqual(loaded["valid_series"]["pending"], [11])
             self.assertEqual(loaded["valid_series"]["empty_scans"], 3)
 
+    def test_series_at_its_base_survives_a_restart(self):
+        # Голый адрес серии — width 0. Пока загрузчик требовал width >= 1,
+        # такая серия молча исчезала при перезапуске.
+        path = self.tmp / "streamers.json"
+        with patch.object(storage, "STREAMERS_FILE", path):
+            storage.save_streamer_frontier({"nix": {"index": 0, "width": 0, "pending": []}})
+
+            loaded = storage.load_streamer_frontier()
+
+            self.assertEqual(loaded["nix"], {"index": 0, "width": 0, "pending": []})
+
+    def test_negative_width_is_still_rejected(self):
+        path = self.tmp / "streamers.json"
+        with patch.object(storage, "STREAMERS_FILE", path):
+            path.write_text(
+                json.dumps({"nix": {"index": 0, "width": -1, "pending": []}}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(storage.load_streamer_frontier(), {})
+
     def test_invalid_prefix_regex_filtered_on_load_and_save(self):
         path = self.tmp / "streamers.json"
         with patch.object(storage, "STREAMERS_FILE", path):
@@ -344,6 +366,62 @@ class RetiredSeriesTests(TempDirTestCase):
             storage.save_retired_series(data)
             loaded = storage.load_retired_series()
             self.assertEqual(loaded, {"dead_streamer": 15, "valid_2": 8})
+
+    def test_retirement_expires_after_the_configured_window(self):
+        # Отставка навсегда означала, что серия, притихшая на неделю,
+        # не вернётся никогда. На проде так потерялось 29 серий из 35.
+        path = self.tmp / "retired_streamers.json"
+        stale = (storage.now_msk() - timedelta(days=storage.PREDICTIVE_RETIRE_DAYS + 1))
+        with patch.object(storage, "RETIRED_STREAMERS_FILE", path):
+            path.write_text(
+                json.dumps({
+                    "long_gone": {"index": 15, "retired_at": stale.isoformat()},
+                    "just_retired": {
+                        "index": 4, "retired_at": storage.now_msk().isoformat()
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            loaded = storage.load_retired_series()
+
+            self.assertNotIn("long_gone", loaded)
+            self.assertEqual(loaded["just_retired"], 4)
+
+    def test_legacy_plain_index_is_treated_as_expired(self):
+        # Старый формат — голое число без даты. Срок по нему не восстановить,
+        # а политика сменилась, поэтому такие серии возвращаются в перебор.
+        path = self.tmp / "retired_streamers.json"
+        with patch.object(storage, "RETIRED_STREAMERS_FILE", path):
+            path.write_text(json.dumps({"legacy": 9}), encoding="utf-8")
+
+            self.assertEqual(storage.load_retired_series(), {})
+
+
+class WatchedWheelsTests(TempDirTestCase):
+    """Наблюдатель помнит, какой розыгрыш он последним видел по каждому
+    адресу: сменился action_uid — значит стартовал новый."""
+
+    def test_round_trip(self):
+        path = self.tmp / "watched_wheels.json"
+        with patch.object(storage, "WATCHED_WHEELS_FILE", path):
+            self.assertEqual(storage.load_watched_uids(), {})
+            storage.save_watched_uids({"https://betboom.ru/freestream/over": "uid-1"})
+
+            self.assertEqual(
+                storage.load_watched_uids(),
+                {"https://betboom.ru/freestream/over": "uid-1"},
+            )
+
+    def test_non_string_entries_are_dropped(self):
+        path = self.tmp / "watched_wheels.json"
+        with patch.object(storage, "WATCHED_WHEELS_FILE", path):
+            path.write_text(
+                json.dumps({"https://x/one": "uid", "https://x/two": 42, "3": None}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(storage.load_watched_uids(), {"https://x/one": "uid"})
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,14 +26,16 @@ from .config import (
     OUTPUT_FILE,
     PENDING_EXPIRED_FILE,
     PREDICTIVE_PREFIX_RE,
+    PREDICTIVE_RETIRE_DAYS,
     REMOVED_WHEELS_FILE,
     RETIRED_STREAMERS_FILE,
     SEEN_FILE,
     STREAMERS_FILE,
     SUGGESTED_CHANNELS_FILE,
+    WATCHED_WHEELS_FILE,
 )
 from .logging_setup import log
-from .timeutils import parse_msk, today_msk
+from .timeutils import now_msk, parse_msk, today_msk
 
 
 def ensure_data_dir() -> list[str]:
@@ -316,7 +319,8 @@ def load_streamer_frontier() -> dict[str, dict[str, Any]]:
         width = info.get("width")
         if not isinstance(index, int) or not isinstance(width, int):
             continue
-        if isinstance(index, bool) or isinstance(width, bool) or width < 1:
+        # width 0 — голый адрес серии (predictive.build_slug), это валидно.
+        if isinstance(index, bool) or isinstance(width, bool) or width < 0:
             continue
         entry: dict[str, Any] = {
             "index": index,
@@ -354,27 +358,58 @@ def save_streamer_frontier(frontier: dict[str, dict[str, Any]]) -> None:
         log.warning("Не удалось сохранить %s: %s", STREAMERS_FILE.name, error)
 
 
-def load_retired_series() -> dict[str, int]:
-    """Читает серии слагов, отправленные в отставку после пустых проходов."""
+def _retired_timestamps() -> dict[str, str]:
+    """Когда каждая серия ушла в отставку: префикс -> ISO-метка с диска.
+
+    Нужна на записи: сканер отдаёт только префикс и индекс, и без чтения
+    прошлого файла отметка обновлялась бы при каждом сохранении — срок
+    отставки не наступал бы никогда.
+    """
     raw = read_json(RETIRED_STREAMERS_FILE, {})
     if not isinstance(raw, dict):
         return {}
+    return {
+        prefix: str(info["retired_at"])
+        for prefix, info in raw.items()
+        if isinstance(prefix, str) and isinstance(info, dict) and "retired_at" in info
+    }
+
+
+def load_retired_series() -> dict[str, int]:
+    """Серии в отставке, у которых срок ещё не вышел: префикс -> индекс.
+
+    Отставка ограничена по времени (PREDICTIVE_RETIRE_DAYS). Прежняя
+    бессрочная означала, что стример, притихший на неделю, выпадал из
+    перебора навсегда. Записи старого формата (голое число без даты)
+    считаются просроченными: срок по ним не восстановить, а политика
+    сменилась — пусть серия вернётся в перебор.
+    """
+    raw = read_json(RETIRED_STREAMERS_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    cutoff = now_msk() - timedelta(days=PREDICTIVE_RETIRE_DAYS)
     retired: dict[str, int] = {}
-    for prefix, index in raw.items():
-        if (
-            isinstance(prefix, str)
-            and PREDICTIVE_PREFIX_RE.match(prefix)
-            and isinstance(index, int)
-            and not isinstance(index, bool)
-        ):
-            retired[prefix] = index
+    for prefix, info in raw.items():
+        if not isinstance(prefix, str) or not PREDICTIVE_PREFIX_RE.match(prefix):
+            continue
+        if not isinstance(info, dict):
+            continue
+        index = info.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            continue
+        retired_at = parse_msk(info.get("retired_at"))
+        if retired_at is None or retired_at <= cutoff:
+            continue
+        retired[prefix] = index
     return retired
 
 
 def save_retired_series(retired: dict[str, int]) -> None:
-    """Атомарно сохраняет серии, отправленные в отставку."""
+    """Атомарно сохраняет серии в отставке вместе с датой отставки."""
+    known = _retired_timestamps()
+    stamp = now_msk().isoformat(timespec="seconds")
     cleaned = {
-        prefix: int(index)
+        prefix: {"index": int(index), "retired_at": known.get(prefix, stamp)}
         for prefix, index in retired.items()
         if isinstance(prefix, str)
         and PREDICTIVE_PREFIX_RE.match(prefix)
@@ -385,6 +420,44 @@ def save_retired_series(retired: dict[str, int]) -> None:
         atomic_write_json(RETIRED_STREAMERS_FILE, cleaned)
     except OSError as error:
         log.warning("Не удалось сохранить %s: %s", RETIRED_STREAMERS_FILE.name, error)
+
+
+# ----------------------------------------------------------------------------
+# Наблюдаемые адреса колёс (watched_wheels.json)
+# ----------------------------------------------------------------------------
+# url -> последний известный action_uid. Наблюдатель (rearm.py) сравнивает
+# uid со страницы колеса с сохранённым: совпал — розыгрыш тот же, ничего не
+# произошло; сменился — на старом адресе стартовал новый розыгрыш, и только
+# тогда имеет смысл платить за запрос к API.
+
+
+def load_watched_uids() -> dict[str, str]:
+    raw = read_json(WATCHED_WHEELS_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        url: uid
+        for url, uid in raw.items()
+        if isinstance(url, str) and isinstance(uid, str)
+    }
+
+
+def save_watched_uids(uids: dict[str, str]) -> None:
+    """Атомарно сохраняет запомненные uid.
+
+    Файл содержит ровно то, что передали: наблюдатель каждый проход
+    пересобирает список адресов из истории находок, и адреса, выпавшие из
+    окна, должны уходить из файла вместе с ним, а не копиться вечно.
+    """
+    cleaned = {
+        url: uid
+        for url, uid in uids.items()
+        if isinstance(url, str) and isinstance(uid, str)
+    }
+    try:
+        atomic_write_json(WATCHED_WHEELS_FILE, cleaned)
+    except OSError as error:
+        log.warning("Не удалось сохранить %s: %s", WATCHED_WHEELS_FILE.name, error)
 
 
 # ----------------------------------------------------------------------------

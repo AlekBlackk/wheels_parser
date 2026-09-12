@@ -19,6 +19,7 @@ from wheelsparser import (
     db,
     menu,
     parser,
+    rearm,
     registry,
     storage,
     twitch,
@@ -1518,6 +1519,36 @@ class ProcessCycleTests(unittest.TestCase):
         self.assertEqual(entry["url"], "https://betboom.ru/freestream/new")
         self.assertEqual(entry["channel"], "demo")
         self.assertTrue(entry["notified"])
+
+    def test_watcher_findings_are_written_to_the_database(self):
+        # Наблюдатель шлёт уведомление сам, а запись в историю отдаёт
+        # parser-потоку очередью — как twitch и перебор слагов. Без слива
+        # очереди находка не попала бы ни в /wheels, ни в /active.
+        entry = db.make_wheel_entry(
+            url="https://betboom.ru/freestream/over",
+            found_at=self.now.isoformat(timespec="seconds"),
+            channel="over",
+            source="rearm",
+            msg_id="",
+            message_url="https://betboom.ru/freestream/over",
+            preview="Перезапуск колеса на адресе «over»",
+            edited=False,
+            status="active",
+            referral=False,
+            ends_at="",
+            notified=True,
+        )
+        rearm.REARM_NEW_ENTRIES.put_nowait(entry)
+        self.addCleanup(rearm.drain_rearm_entries)
+
+        with patch.object(registry, "CHANNELS", []), \
+             patch.object(parser, "fetch_channel", return_value=[]), \
+             patch.object(parser, "save_seen"):
+            parser.process_cycle({}, baseline=False)
+
+        stored = [row for row in self.stored() if row["source"] == "rearm"]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["url"], "https://betboom.ru/freestream/over")
 
     def test_one_channel_crash_does_not_abort_the_whole_cycle(self):
         # _fetch_all_channels опрашивает каналы через ThreadPoolExecutor:

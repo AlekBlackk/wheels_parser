@@ -41,7 +41,7 @@ from typing import Any
 
 import requests
 
-from . import db
+from . import db, rearm
 from .alerts import claim_url_alert, mark_url_alert
 from .betboom import precheck_wheel
 from .config import (
@@ -53,6 +53,7 @@ from .config import (
     PREDICTIVE_REQUEST_DELAY_SECONDS,
     PREDICTIVE_SCAN_INTERVAL,
     REALERT_COOLDOWN_MINUTES,
+    REARM_ENABLED,
     REQUEST_TIMEOUT,
     SLUG_SERIES_RE,
     icon,
@@ -60,6 +61,10 @@ from .config import (
 from .db import WheelEntry, make_wheel_entry
 from .logging_setup import log
 from .net import build_session
+
+# Исход проверки одного адреса определён в rearm.py — механизмы разные,
+# а классы ответа betboom.ru одни и те же, и дублировать их незачем.
+from .rearm import BLOCKED, ERROR, FOUND, MISSING
 from .runtime import STOP_EVENT
 from .storage import (
     load_retired_series,
@@ -82,29 +87,37 @@ PREDICTIVE_NEW_ENTRIES: queue.Queue[WheelEntry] = queue.Queue(maxsize=1000)
 
 WHEEL_URL_TEMPLATE = "https://betboom.ru/freestream/{slug}"
 
-# Исход проверки одного адреса.
-MISSING = "missing"  # 404 — адреса нет, серия закончилась
-BLOCKED = "blocked"  # 403/429 — нас притормаживают, немедленно замолкаем
-FOUND = "found"      # 200 — адрес существует, статус смотрели через API
-ERROR = "error"      # сеть/прочее — этот цикл для серии закончен
-
 
 def split_slug(slug: str) -> tuple[str, int, int] | None:
     """Разбирает слаг серии на (префикс, индекс, ширина числа).
 
     Ширина обязательна для обратной сборки: `LOLLY08` дополнен нулём до
     двух знаков, а `zonertg4` — нет, и `LOLLY8` вместо `LOLLY08` отдал бы
-    404. Слаг без числового хвоста (`aunkereref`) серией не считается.
+    404.
+
+    Слаг без числового хвоста — это база серии, (префикс, 0, 0). Половина
+    адресов в истории такие (`jester`, `nix`, `solo`, `bolt`), и пока они
+    серией не считались, следующие адреса этих стримеров (`nix1`, `bolt1`)
+    не проверялись никогда. Исключение — слаг из одних цифр: префикс
+    обязан быть непустым, иначе «1234» дало бы серию без имени.
     """
     match = SLUG_SERIES_RE.match(slug)
     if match is None:
-        return None
+        return (slug, 0, 0) if slug and not slug.isdigit() else None
     digits = match.group("index")
     return match.group("prefix"), int(digits), len(digits)
 
 
 def build_slug(prefix: str, index: int, width: int) -> str:
-    return f"{prefix}{index:0{width}d}"
+    """Собирает слаг обратно; (0, 0) — голый адрес серии, без числа.
+
+    Голый адрес не выдумка: `zonertg`, `over`, `kekw` существуют наравне
+    с нумерованными и переиспользуются. Ноль с ненулевой шириной — это
+    по-прежнему число (`MAGER00`), поэтому признак базы — обе нулевые.
+    """
+    if index == 0 and width == 0:
+        return prefix
+    return f"{prefix}{index:0{max(width, 1)}d}"
 
 
 def frontier_from_history(cutoff_days: int = 120) -> dict[str, dict[str, Any]]:
@@ -432,13 +445,32 @@ def _notify_blocked() -> None:
     )
 
 
+def scan_cycle(budget: Budget, session: requests.Session) -> bool:
+    """Один проход обоих механизмов. False — нас заблокировали.
+
+    Наблюдатель идёт первым не по старшинству, а по отдаче: на проде 73%
+    колёс — это перезапуск уже известного адреса, и только 27% — адрес,
+    увиденный впервые. Свою долю запросов он берёт по времени суток
+    (rearm.pass_allowance), остаток суточного потолка достаётся разведке
+    вперёд. Блокировка у любого из двух останавливает весь проход:
+    403/429 адресован не механизму, а нашему IP.
+    """
+    if REARM_ENABLED:
+        allowance = rearm.pass_allowance(
+            PREDICTIVE_DAILY_BUDGET, PREDICTIVE_SCAN_INTERVAL, now_msk()
+        )
+        if not rearm.watch_once(budget, session, allowance):
+            return False
+    return scan_once(budget, session)
+
+
 def predictive_loop() -> None:
     """Поток сканера: цикл перебора с паузой PREDICTIVE_SCAN_INTERVAL."""
     budget = Budget(PREDICTIVE_DAILY_BUDGET)
     session = _session()
     while not STOP_EVENT.is_set():
         started = time.monotonic()
-        allowed = scan_once(budget, session)
+        allowed = scan_cycle(budget, session)
         if not allowed:
             _notify_blocked()
             STOP_EVENT.wait(PREDICTIVE_BLOCK_COOLDOWN_MINUTES * 60)
@@ -466,6 +498,7 @@ __all__ = [
     "merge_frontiers",
     "predictive_loop",
     "probe_slug",
+    "scan_cycle",
     "scan_once",
     "scan_series",
     "split_slug",

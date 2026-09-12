@@ -139,6 +139,12 @@ def send_telegram_notification(
             f"(сообщение от {badge_icons}@{entry.get('author', '?')})\n"
         )
         post_line = f"Чат: {message_url}"
+    elif entry.get("source") == "rearm":
+        # Наблюдатель заметил смену action_uid на самой странице колеса
+        # (см. rearm.py): ссылку никто не публиковал, канала и поста у
+        # такой находки нет — «Канал: @over / Пост: <url>» было бы враньём.
+        origin_line = f"{icon('scan')} Перезапуск колеса на адресе «{channel}»\n"
+        post_line = f"Страница: {message_url}"
     elif entry.get("source") == "predictive":
         # У находки сканера нет ни канала, ни поста: адрес угадан по серии
         # (см. predictive.py). Показывать «Канал: @zonertg / Пост: <url>»
