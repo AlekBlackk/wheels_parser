@@ -300,15 +300,21 @@ def watch_once(budget: Any, session: requests.Session, allowance: int) -> bool:
     known = load_watched_uids()
     uids = {url: known[url] for url in targets if url in known}
     allowed = True
+    checked = alive = restarts = 0
     for step in range(min(allowance, len(targets))):
         if STOP_EVENT.is_set() or not budget.take():
             break
         url = targets[(_CURSOR + step) % len(targets)]
-        outcome, uid = watch_address(url, uids.get(url), session)
+        previous = uids.get(url)
+        outcome, uid = watch_address(url, previous, session)
+        checked += 1
         if outcome == BLOCKED:
             allowed = False
             break
         if outcome == FOUND:
+            alive += 1
+            if previous is not None and uid != previous:
+                restarts += 1
             uids[url] = uid
         elif outcome == MISSING:
             # Адреса нет — помнить его uid незачем; вернётся в историю,
@@ -317,6 +323,19 @@ def watch_once(budget: Any, session: requests.Session, allowance: int) -> bool:
         _pause_between_requests()
     _CURSOR = (_CURSOR + min(allowance, len(targets))) % len(targets)
     save_watched_uids(uids)
+    # Итог прохода в лог всегда, даже нулевой: находки наблюдатель сообщает
+    # сам, а вот работает ли он вообще, иначе видно только по mtime файла
+    # состояния — молчание неотличимо от «выключен» и от «упал».
+    log.info(
+        "%s Наблюдатель: проверено %s из %s · живых %s · перезапусков %s · бюджет %s/%s",
+        icon("scan"),
+        checked,
+        len(targets),
+        alive,
+        restarts,
+        budget.used,
+        budget.limit,
+    )
     return allowed
 
 

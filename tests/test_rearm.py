@@ -253,6 +253,10 @@ class WatchOnceTests(unittest.TestCase):
         frontier = patch.object(rearm, "load_streamer_frontier", return_value={})
         frontier.start()
         self.addCleanup(frontier.stop)
+        # Пауза между запросами реальная (2 с) — в тестах она только жжёт время.
+        pause = patch.object(rearm, "_pause_between_requests")
+        pause.start()
+        self.addCleanup(pause.stop)
 
     def _run(self, allowance, uids, watch):
         with patch.object(rearm, "load_watched_uids", return_value=dict(uids)), \
@@ -302,6 +306,37 @@ class WatchOnceTests(unittest.TestCase):
         )
 
         self.assertNotIn("https://betboom.ru/freestream/ancient", save.call_args.args[0])
+
+    def test_pass_ends_with_a_summary_line(self):
+        # Без этой строки работа наблюдателя видна только по mtime файла
+        # состояния: молчание неотличимо от «выключен» и от «упал».
+        outcomes = {
+            self.targets[0]: (rearm.FOUND, "uid-same"),
+            self.targets[1]: (rearm.FOUND, "uid-new"),
+            self.targets[2]: (rearm.MISSING, ""),
+        }
+        known = {self.targets[0]: "uid-same", self.targets[1]: "uid-old"}
+
+        with patch.object(rearm, "load_watched_uids", return_value=dict(known)), \
+             patch.object(rearm, "save_watched_uids"), \
+             patch.object(rearm, "watch_address", side_effect=lambda url, uid, s: outcomes[url]), \
+             self.assertLogs(rearm.log, level="INFO") as logs:
+            rearm.watch_once(FakeBudget(100), Mock(), allowance=3)
+
+        summary = logs.output[-1]
+        self.assertIn("проверено 3", summary)
+        self.assertIn("живых 2", summary)
+        self.assertIn("перезапусков 1", summary)
+        self.assertIn("бюджет 3/100", summary)
+
+    def test_summary_is_not_logged_when_there_is_nothing_to_watch(self):
+        with patch.object(rearm, "watch_targets", return_value=[]), \
+             patch.object(rearm, "load_watched_uids", return_value={}), \
+             patch.object(rearm, "save_watched_uids"), \
+             patch.object(rearm, "watch_address") as probe:
+            rearm.watch_once(FakeBudget(100), Mock(), allowance=3)
+
+        probe.assert_not_called()
 
     def test_exhausted_budget_stops_the_pass_without_blocking(self):
         with patch.object(rearm, "load_watched_uids", return_value={}), \
